@@ -66,8 +66,8 @@ impl WalRedoProcess {
         let pg_lib_dir_path = conf.pg_lib_dir(pg_version).context("pg_lib_dir")?;
 
         use no_leak_child::NoLeakChildCommandExt;
-        // Start postgres itself
-        let child = Command::new(pg_bin_dir_path.join("postgres"))
+        let binary = if pg_bin_dir_path.join("gaussdb").exists() { "gaussdb" } else { "postgres" };
+        let child = Command::new(pg_bin_dir_path.join(binary))
             // the first arg must be --wal-redo so the child process enters into walredo mode
             .arg("--wal-redo")
             // the child doesn't process this arg, but, having it in the argv helps indentify the
@@ -203,6 +203,13 @@ impl WalRedoProcess {
     ) -> anyhow::Result<Bytes> {
         debug_assert_current_span_has_tenant_id();
 
+        // [LAYERDBG] Log postgres walredo request
+        tracing::info!(
+            "[LAYERDBG] apply_wal_records: rel={}/{}/{}.{}, blknum={}, base_img_size={}, records_count={}",
+            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum,
+            base_img.as_ref().map(|b| b.len()).unwrap_or(0), records.len()
+        );
+
         let tag = protocol::BufferTag { rel, blknum };
 
         // Serialize all the messages to send the WAL redo process first.
@@ -219,12 +226,36 @@ impl WalRedoProcess {
         if let Some(img) = base_img {
             protocol::build_push_page_msg(tag, img, &mut writebuf);
         }
-        for (lsn, rec) in records.iter() {
+        for (idx, (lsn, rec)) in records.iter().enumerate() {
             if let NeonWalRecord::Postgres {
-                will_init: _,
+                will_init,
                 rec: postgres_rec,
             } = rec
             {
+                // [LAYERDBG] Log WAL record details before sending to walredo
+                // Parse and log XLogRecord header info
+                let header_info = if postgres_rec.len() >= 32 {
+                    let xl_tot_len = u32::from_le_bytes([postgres_rec[0], postgres_rec[1], postgres_rec[2], postgres_rec[3]]);
+                    // xl_info is at offset 24 (after xl_tot_len(4) + xl_term(4) + xl_xid(8) + xl_prev(8))
+                    let xl_info = postgres_rec[24];
+                    let xl_rmid = postgres_rec[25];
+                    // Parse first block header if exists (after XLogRecord header at offset 32)
+                    let (block_id, fork_flags) = if postgres_rec.len() >= 34 {
+                        (postgres_rec[32], postgres_rec[33])
+                    } else {
+                        (0xFF, 0)
+                    };
+                    format!("xl_tot_len={}, xl_info=0x{:02X}, xl_rmid={}, block_id={}, fork_flags=0x{:02X} (has_image={})",
+                            xl_tot_len, xl_info, xl_rmid, block_id, fork_flags, (fork_flags & 0x10) != 0)
+                } else {
+                    "record too short".to_string()
+                };
+                tracing::info!(
+                    "[LAYERDBG] apply_wal_records: sending WAL record {} to walredo: \
+                     lsn={}, will_init={}, rec_len={}, header=[{}], first_40_bytes={:02x?}",
+                    idx, lsn, will_init, postgres_rec.len(), header_info,
+                    &postgres_rec[..std::cmp::min(40, postgres_rec.len())]
+                );
                 protocol::build_apply_record_msg(*lsn, postgres_rec, &mut writebuf);
             } else {
                 anyhow::bail!("tried to pass neon wal record to postgres WAL redo");
@@ -236,13 +267,43 @@ impl WalRedoProcess {
         let Ok(res) =
             tokio::time::timeout(wal_redo_timeout, self.apply_wal_records0(&writebuf)).await
         else {
+            tracing::info!(
+                "[LAYERDBG] apply_wal_records: WAL redo timed out for rel={}/{}/{}.{}, blknum={}",
+                rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum
+            );
             anyhow::bail!("WAL redo timed out");
         };
 
         if res.is_err() {
+            tracing::info!(
+                "[LAYERDBG] apply_wal_records: error for rel={}/{}/{}.{}, blknum={}: {:?}",
+                rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum, res
+            );
             // not all of these can be caused by this particular input, however these are so rare
             // in tests so capture all.
             self.record_and_log(&writebuf);
+        } else {
+            // Log success with page header info for debugging
+            let page_info = res.as_ref().map(|b| {
+                if b.len() >= 24 {
+                    // Page header: pd_lsn (8 bytes), pd_checksum (2), pd_flags (2), 
+                    // pd_lower (2), pd_upper (2), pd_special (2), pd_pagesize_version (2), pd_prune_xid (4)
+                    let lsn_hi = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    let lsn_lo = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                    let pd_lower = u16::from_le_bytes([b[12], b[13]]);
+                    let pd_upper = u16::from_le_bytes([b[14], b[15]]);
+                    format!("page_lsn={:X}/{:X}, pd_lower={}, pd_upper={}", lsn_hi, lsn_lo, pd_lower, pd_upper)
+                } else {
+                    format!("page_too_small={}", b.len())
+                }
+            }).unwrap_or_else(|_| "no_result".to_string());
+            
+            tracing::info!(
+                "[LAYERDBG] apply_wal_records: success for rel={}/{}/{}.{}, blknum={}, result_size={}, {}",
+                rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum,
+                res.as_ref().map(|b| b.len()).unwrap_or(0),
+                page_info
+            );
         }
 
         res

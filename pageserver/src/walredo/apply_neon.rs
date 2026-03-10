@@ -3,7 +3,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::BytesMut;
 use pageserver_api::key::Key;
 use pageserver_api::reltag::SlruKind;
-use postgres_ffi::v14::nonrelfile_utils::{
+use postgres_ffi::V702::nonrelfile_utils::{
     mx_offset_to_flags_bitshift, mx_offset_to_flags_offset, mx_offset_to_member_offset,
     transaction_id_set_status,
 };
@@ -125,9 +125,11 @@ pub(crate) fn apply_in_neon(
                 "ClogSetCommitted record with unexpected key {key}"
             );
             for &xid in xids {
-                let pageno = xid / pg_constants::CLOG_XACTS_PER_PAGE;
-                let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+                let pageno = xid / (pg_constants::CLOG_XACTS_PER_PAGE as u64);
+                let expected_segno =
+                    (pageno / (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
+                let expected_blknum =
+                    (pageno % (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
 
                 // Check that we're modifying the correct CLOG block.
                 assert!(
@@ -139,7 +141,11 @@ pub(crate) fn apply_in_neon(
                     "ClogSetCommitted record for XID {xid} with unexpected key {key}"
                 );
 
-                transaction_id_set_status(xid, pg_constants::TRANSACTION_STATUS_COMMITTED, page);
+                transaction_id_set_status(
+                    xid as u32,
+                    pg_constants::TRANSACTION_STATUS_COMMITTED,
+                    page,
+                );
             }
 
             // Append the timestamp
@@ -165,9 +171,11 @@ pub(crate) fn apply_in_neon(
                 "ClogSetAborted record with unexpected key {key}"
             );
             for &xid in xids {
-                let pageno = xid / pg_constants::CLOG_XACTS_PER_PAGE;
-                let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+                let pageno = xid / (pg_constants::CLOG_XACTS_PER_PAGE as u64);
+                let expected_segno =
+                    (pageno / (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
+                let expected_blknum =
+                    (pageno % (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
 
                 // Check that we're modifying the correct CLOG block.
                 assert!(
@@ -179,7 +187,11 @@ pub(crate) fn apply_in_neon(
                     "ClogSetAborted record for XID {xid} with unexpected key {key}"
                 );
 
-                transaction_id_set_status(xid, pg_constants::TRANSACTION_STATUS_ABORTED, page);
+                transaction_id_set_status(
+                    xid as u32,
+                    pg_constants::TRANSACTION_STATUS_ABORTED,
+                    page,
+                );
             }
         }
         NeonWalRecord::MultixactOffsetCreate { mid, moff } => {
@@ -191,13 +203,13 @@ pub(crate) fn apply_in_neon(
             );
             // Compute the block and offset to modify.
             // See RecordNewMultiXact in PostgreSQL sources.
-            let pageno = mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
-            let entryno = mid % pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+            let pageno = *mid / (pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u64);
+            let entryno = *mid % (pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u64);
             let offset = (entryno * 4) as usize;
 
             // Check that we're modifying the correct multixact-offsets block.
-            let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-            let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+            let expected_segno = (pageno / (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
+            let expected_blknum = (pageno % (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
             assert!(
                 segno == expected_segno,
                 "MultiXactOffsetsCreate record for multi-xid {mid} with unexpected key {key}"
@@ -207,7 +219,7 @@ pub(crate) fn apply_in_neon(
                 "MultiXactOffsetsCreate record for multi-xid {mid} with unexpected key {key}"
             );
 
-            LittleEndian::write_u32(&mut page[offset..offset + 4], *moff);
+            LittleEndian::write_u32(&mut page[offset..offset + 4], *moff as u32);
         }
         NeonWalRecord::MultixactMembersCreate { moff, members } => {
             let (slru_kind, segno, blknum) = key.to_slru_block().context("invalid record")?;
@@ -217,18 +229,20 @@ pub(crate) fn apply_in_neon(
                 "MultixactMembersCreate record with unexpected key {key}"
             );
             for (i, member) in members.iter().enumerate() {
-                let offset = moff + i as u32;
+                let offset = *moff + (i as u64);
 
                 // Compute the block and offset to modify.
                 // See RecordNewMultiXact in PostgreSQL sources.
-                let pageno = offset / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
+                let pageno = (offset / (pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u64)) as u32;
                 let memberoff = mx_offset_to_member_offset(offset);
                 let flagsoff = mx_offset_to_flags_offset(offset);
                 let bshift = mx_offset_to_flags_bitshift(offset);
 
                 // Check that we're modifying the correct multixact-members block.
-                let expected_segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                let expected_blknum = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+                let expected_segno =
+                    (pageno as u64 / (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
+                let expected_blknum =
+                    (pageno as u64 % (pg_constants::SLRU_PAGES_PER_SEGMENT as u64)) as u32;
                 assert!(
                     segno == expected_segno,
                     "MultiXactMembersCreate record for offset {moff} with unexpected key {key}"
@@ -242,7 +256,7 @@ pub(crate) fn apply_in_neon(
                 flagsval &= !(((1 << pg_constants::MXACT_MEMBER_BITS_PER_XACT) - 1) << bshift);
                 flagsval |= member.status << bshift;
                 LittleEndian::write_u32(&mut page[flagsoff..flagsoff + 4], flagsval);
-                LittleEndian::write_u32(&mut page[memberoff..memberoff + 4], member.xid);
+                LittleEndian::write_u32(&mut page[memberoff..memberoff + 4], member.xid as u32);
             }
         }
         NeonWalRecord::AuxFile { .. } => {

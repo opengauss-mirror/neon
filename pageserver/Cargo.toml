@@ -93,7 +93,7 @@ tokio-io-timeout.workspace = true
 tokio-postgres.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
-tokio-tar.workspace = true
+astral-tokio-tar.workspace = true
 tokio-util.workspace = true
 toml_edit = { workspace = true, features = [ "serde" ] }
 tonic.workspace = true

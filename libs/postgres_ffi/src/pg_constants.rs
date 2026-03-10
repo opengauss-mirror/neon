@@ -63,10 +63,12 @@ pub const fn HEAPBLK_TO_OFFSET(x: u32) -> u32 {
     (x % HEAPBLOCKS_PER_BYTE as u32) * BITS_PER_HEAPBLOCK as u32
 }
 
-pub const BITS_PER_HEAPBLOCK: u16 = 2;
+// openGauss visibility map tracks only ALL_VISIBLE with one bit per heap page.
+pub const BITS_PER_HEAPBLOCK: u16 = 1;
 pub const VISIBILITYMAP_ALL_VISIBLE: u8 = 0x01;
-pub const VISIBILITYMAP_ALL_FROZEN: u8 = 0x02;
-pub const VISIBILITYMAP_VALID_BITS: u8 = 0x03;
+// openGauss has no ALL_FROZEN bit in VM.
+pub const VISIBILITYMAP_ALL_FROZEN: u8 = 0x00;
+pub const VISIBILITYMAP_VALID_BITS: u8 = VISIBILITYMAP_ALL_VISIBLE;
 
 // From xact.h
 pub const XLOG_XACT_COMMIT: u8 = 0x00;
@@ -240,7 +242,7 @@ pub const SLOTS_PER_FSM_PAGE: u32 = FSM_LEAF_NODES_PER_PAGE as u32;
 /* From visibilitymap.c */
 
 pub const VM_MAPSIZE: usize = BLCKSZ as usize - MAXALIGN_SIZE_OF_PAGE_HEADER_DATA;
-pub const VM_BITS_PER_HEAPBLOCK: usize = 2;
+pub const VM_BITS_PER_HEAPBLOCK: usize = 1;
 pub const VM_HEAPBLOCKS_PER_BYTE: usize = 8 / VM_BITS_PER_HEAPBLOCK;
 pub const VM_HEAPBLOCKS_PER_PAGE: usize = VM_MAPSIZE * VM_HEAPBLOCKS_PER_BYTE;
 

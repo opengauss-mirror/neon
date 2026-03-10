@@ -51,6 +51,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #endif
@@ -70,13 +71,12 @@
 #endif
 #endif
 
+#include "pgxc/locator.h"
 #include "access/clog.h"
-#include "access/commit_ts.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
 #include "access/subtrans.h"
-#include "access/syncscan.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -89,8 +89,8 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "knl/knl_variable.h"
 #include "postmaster/autovacuum.h"
-#include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
@@ -98,9 +98,8 @@
 #include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
-#include "storage/buf_internals.h"
-#include "storage/bufmgr.h"
-#include "storage/dsm.h"
+#include "storage/buf/buf_internals.h"
+#include "storage/buf/bufmgr.h"
 #if PG_MAJORVERSION_NUM >= 17
 #include "storage/dsm_registry.h"
 #endif
@@ -112,13 +111,15 @@
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/sinvaladt.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/snapmgr.h"
-
+#ifdef ENABLE_NEON
+#include "executor/node/nodeShareInputScan.h"
+#endif
 #include "inmem_smgr.h"
 
 #ifdef HAVE_LIBSECCOMP
@@ -136,9 +137,43 @@ static bool redo_block_filter(XLogReaderState *record, uint8 block_id);
 static void GetPage(StringInfo input_message);
 static void Ping(StringInfo input_message);
 static ssize_t buffered_read(void *buf, size_t count);
-static void CreateFakeSharedMemoryAndSemaphores(void);
+#ifdef ENABLE_NEON
+static void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port);
+#else
+	static void CreateFakeSharedMemoryAndSemaphores(void);
+#endif
 
 static BufferTag target_redo_tag;
+
+#ifdef ENABLE_NEON
+/* openGauss doesn't have wal_redo_buffer as a global variable */
+static Buffer wal_redo_buffer;
+
+/* openGauss doesn't have xlog_outdesc, implement a compatible version */
+static void
+xlog_outdesc(StringInfo buf, XLogReaderState *record)
+{
+	RmgrId		rmid = XLogRecGetRmid(record);
+	uint8		info = XLogRecGetInfo(record);
+	const char *id;
+
+	appendStringInfoString(buf, RmgrTable[rmid].rm_name);
+	appendStringInfoChar(buf, '/');
+
+	/* openGauss uses xlog_type_name instead of rm_identify */
+	if (RmgrTable[rmid].rm_type_name != NULL)
+		id = RmgrTable[rmid].rm_type_name(info);
+	else
+		id = NULL;
+
+	if (id == NULL)
+		appendStringInfo(buf, "UNKNOWN (%X): ", info & ~XLR_INFO_MASK);
+	else
+		appendStringInfo(buf, "%s: ", id);
+
+	RmgrTable[rmid].rm_desc(buf, record);
+}
+#endif
 
 static XLogReaderState *reader_state;
 
@@ -167,7 +202,9 @@ static XLogReaderState *reader_state;
 static int
 close_range_syscall(unsigned int start_fd, unsigned int count, unsigned int flags)
 {
-    return syscall(__NR_close_range, start_fd, count, flags);
+    // return syscall(__NR_close_range, start_fd, count, flags);
+	// TODO: MUST FIX IT!!!
+	return 0;
 }
 
 
@@ -226,10 +263,14 @@ enter_seccomp_mode(void)
 	seccomp_load_rules(allowed_syscalls, lengthof(allowed_syscalls));
 }
 #endif /* HAVE_LIBSECCOMP */
-
-PGDLLEXPORT void
-WalRedoMain(int argc, char *argv[]);
-
+#ifdef __cplusplus
+extern "C" {
+#endif
+	PGDLLEXPORT void
+	WalRedoMain(int argc, char *argv[]);
+#ifdef __cplusplus
+}
+#endif
 /*
  * Entry point for the WAL redo process.
  *
@@ -246,7 +287,7 @@ WalRedoMain(int argc, char *argv[])
 	bool		enable_seccomp;
 #endif
 
-	am_wal_redo_postgres = true;
+	t_thrd.xlog_cxt.am_wal_redo_postgres = true;
 	/*
 	 * Pageserver treats any output to stderr as an ERROR, so we must
 	 * set the log level as early as possible to only log FATAL and 
@@ -263,9 +304,6 @@ WalRedoMain(int argc, char *argv[])
 	 * DropRelationAllLocalBuffers() is proportional to the number of
 	 * buffers. So let's keep it small (default value is 1024)
 	 */
-	num_temp_buffers = 4;
-	NBuffers = 4;
-
 	/*
 	 * install the simple in-memory smgr
 	 */
@@ -278,13 +316,6 @@ WalRedoMain(int argc, char *argv[])
 	load_file("$libdir/neon_rmgr", false);
 	process_shared_preload_libraries_in_progress = false;
 #endif
-
-	/* Initialize MaxBackends (if under postmaster, was done already) */
-	MaxConnections = 1;
-	max_worker_processes = 0;
-	max_parallel_workers = 0;
-	max_wal_senders = 0;
-	InitializeMaxBackends();
 
 #if PG_VERSION_NUM >= 150000
 	process_shmem_requests();
@@ -301,13 +332,16 @@ WalRedoMain(int argc, char *argv[])
 	 * We have our own version of CreateSharedMemoryAndSemaphores() that
 	 * sets up local memory instead of shared one.
 	 */
+#ifdef ENABLE_NEON
+	CreateFakeSharedMemoryAndSemaphores(false, 0);
+#else
 	CreateFakeSharedMemoryAndSemaphores();
-
+#endif
 	/*
 	 * Remember stand-alone backend startup time,roughly at the same point
 	 * during startup that postmaster does so.
 	 */
-	PgStartTime = GetCurrentTimestamp();
+	t_thrd.time_cxt.pg_start_time = GetCurrentTimestamp();
 
 	/*
 	 * Create a per-backend PGPROC struct in shared memory. We must do
@@ -318,7 +352,7 @@ WalRedoMain(int argc, char *argv[])
 	SetProcessingMode(NormalProcessing);
 
 	/* Redo routines won't work if we're not "in recovery" */
-	InRecovery = true;
+	t_thrd.xlog_cxt.InRecovery = true;
 
 	/*
 	 * Create the memory context we will use in the main loop.
@@ -326,13 +360,16 @@ WalRedoMain(int argc, char *argv[])
 	 * MessageContext is reset once per iteration of the main loop, ie, upon
 	 * completion of processing of each command message from the client.
 	 */
-	MessageContext = AllocSetContextCreate(TopMemoryContext,
-										   "MessageContext",
-										   ALLOCSET_DEFAULT_SIZES);
+	t_thrd.mem_cxt.msg_mem_cxt = AllocSetContextCreate(t_thrd.top_mem_cxt,
+													   "MessageContext",
+													   ALLOCSET_DEFAULT_MINSIZE,
+													   ALLOCSET_DEFAULT_INITSIZE,
+													   ALLOCSET_DEFAULT_MAXSIZE);
 
 	/* we need a ResourceOwner to hold buffer pins */
-	Assert(CurrentResourceOwner == NULL);
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "wal redo");
+	Assert(t_thrd.utils_cxt.CurrentResourceOwner == NULL);
+	t_thrd.utils_cxt.CurrentResourceOwner =
+		ResourceOwnerCreate(NULL, "wal redo", THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
 	/* Initialize resource managers */
 	for (int rmid = 0; rmid <= RM_MAX_ID; rmid++)
@@ -340,7 +377,7 @@ WalRedoMain(int argc, char *argv[])
 		if (RmgrTable[rmid].rm_startup != NULL)
 			RmgrTable[rmid].rm_startup();
 	}
-	reader_state = XLogReaderAllocate(wal_segment_size, NULL, XL_ROUTINE(), NULL);
+	reader_state = XLogReaderAllocate(&XLogPageRead, NULL);
 
 #ifdef HAVE_LIBSECCOMP
 	/* We prefer opt-out to opt-in for greater security */
@@ -361,7 +398,7 @@ WalRedoMain(int argc, char *argv[])
 	/*
 	 * Main processing loop
 	 */
-	MemoryContextSwitchTo(MessageContext);
+	MemoryContextSwitchTo(t_thrd.mem_cxt.msg_mem_cxt);
 	initStringInfo(&input_message);
 #if PG_MAJORVERSION_NUM >= 16
 	MyBackendType = B_BACKEND;
@@ -372,7 +409,7 @@ WalRedoMain(int argc, char *argv[])
 		/* Release memory left over from prior query cycle. */
 		resetStringInfo(&input_message);
 
-		set_ps_display("idle");
+		set_ps_display("idle", false);
 
 		/*
 		 * (3) read a command (loop blocks here)
@@ -448,6 +485,225 @@ WalRedoMain(int argc, char *argv[])
  * any sizeable effect on RSS, so probably such clean up not worth the risk of having
  * half-initialized postgres.
  */
+#ifdef ENABLE_NEON
+#include "access/csnlog.h"
+#include "utils/guc_storage.h"
+#include "postmaster/startup.h"
+void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
+	PGShmemHeader *hdr;
+	char		cwd[MAXPGPATH];
+    InitNuma();
+
+    /* Set max backends and thread pool group number before alloc share memory array. */
+    CalcMaxBackends();
+
+    int numSemas;
+    Size size = ComputeTotalSizeOfShmem();
+    ereport(DEBUG3, (errmsg("invoking IpcMemoryCreate(size=%lu)", (unsigned long)size)));
+
+    /* Initialize the Memory Protection feature */
+    gs_memprot_init(size);
+
+	{
+		hdr = (PGShmemHeader *) malloc(size);
+		if (!hdr)
+			ereport(FATAL,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("[neon-wal-redo] can not allocate (pseudo-) shared memory")));
+
+		hdr->creatorPID = getpid();
+		hdr->magic = PGShmemMagic;
+		// hdr->dsm_control = 0;
+		hdr->device = 42; /* not relevant for non-shared memory */
+		hdr->inode = 43; /* not relevant for non-shared memory */
+		hdr->totalsize = size;
+		hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
+
+		UsedShmemSegAddr = hdr;
+		UsedShmemSegID = (unsigned long) 42; /* not relevant for non-shared memory */
+	}
+
+    InitShmemAccess(hdr);
+
+        /*
+         * Create semaphores
+         */
+    numSemas = ProcGlobalSemas();
+    numSemas += SpinlockSemas();
+    numSemas += XLogSemas();
+
+#ifdef ENABLED_DEBUG_SYNC
+    numSemas += 1; /* For debug sync handling */
+#endif
+    numSemas += 1; /* for locale concurrency control */
+
+	if (!getcwd(cwd, MAXPGPATH))
+		ereport(FATAL,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("[neon-wal-redo] can not read current directory name")));
+	t_thrd.proc_cxt.DataDir = cwd;
+	PGReserveSemaphores(numSemas, port);
+
+	InitShmemAllocation();
+	CreateLWLocks();
+	InitShmemIndex();
+#ifdef DEBUG_UHEAP
+        UHeapSchemeInit();
+#endif
+	    {
+        /* Manually init XLogCtl (skip XLOGShmemInit which accesses xlog dir) */
+        {
+            bool found;
+            t_thrd.shemem_ptr_cxt.ControlFile = (ControlFileData *)ShmemInitStruct(
+                "Control File", sizeof(ControlFileData), &found);
+            memset(t_thrd.shemem_ptr_cxt.ControlFile, 0, sizeof(ControlFileData));
+            t_thrd.shemem_ptr_cxt.XLogCtl = (XLogCtlData *)ShmemInitStruct(
+                "XLOG Ctl", sizeof(XLogCtlData), &found);
+            memset(t_thrd.shemem_ptr_cxt.XLogCtl, 0, sizeof(XLogCtlData));
+            t_thrd.shemem_ptr_cxt.XLogCtl->SharedRecoveryInProgress = true;
+        }
+        CLOGShmemInit();
+        CSNLOGShmemInit();
+        MultiXactShmemInit();
+        InitBufferPool();
+        pca_buf_init_ctx();
+        // /* global temporay table */
+        // active_gtt_shared_hash_init();
+        /*
+         * Set up lock manager
+         */
+        InitLocks();
+
+        /*
+         * Set up predicate lock manager
+         */
+        InitPredicateLocks();
+
+        SSInitTxnStatusCache();
+        // SSInitXminInfo();
+    }
+	  if (!IsUnderPostmaster) {
+		InitializeNumLwLockPartitions();
+        InitProcGlobal();
+        // InitBgworkerGlobal();
+        CreateSharedProcArray();
+        CreateProcXactHashTable();
+    }
+
+    CreateSharedRingBuffer();
+    CreateSharedBackendStatus();
+    sessionTimeShmemInit();
+    sessionStatShmemInit();
+    sessionMemoryShmemInit();
+
+    {
+        TwoPhaseShmemInit();
+    }
+
+    /*
+     * Set up shared-inval messaging
+     */
+    CreateSharedInvalidationState();
+
+    /*
+     * Set up interprocess signaling mechanisms
+     */
+    PMSignalShmemInit();
+    ProcSignalShmemInit();
+#ifdef USE_SPQ
+    ShareInputShmemInit();
+#endif
+    // MmapShmemInit();
+    {
+        CheckpointerShmemInit();
+        CBMShmemInit();
+        AutoVacuumShmemInit();
+        // TxnSnapCapShmemInit();
+        // CfsShrinkerShmemInit();
+        // RbCleanerShmemInit();
+    }
+    ReplicationSlotsShmemInit();
+#ifndef ENABLE_MULTIPLE_NODES
+    ReplicationOriginShmemInit();
+    ApplyLauncherShmemInit();
+#endif
+    WalSndShmemInit();
+    /*
+    * Set up WAL semaphores. This must be done after WalSndShmemInit().
+    */
+    if (!IsUnderPostmaster) {
+        InitWalSemaphores();
+    }
+    WalRcvShmemInit();
+    // DataSndShmemInit();
+    // DataRcvShmemInit();
+    // DataSenderQueueShmemInit();
+    // DataWriterQueueShmemInit();
+    HaShmemInit();
+    AsyncRollbackHashShmemInit();
+    // UndoWorkerShmemInit();
+    undo::InitUndoZoneLock();
+    heartbeat_shmem_init();
+    // MatviewShmemInit();
+#ifndef ENABLE_MULTIPLE_NODES
+    // if(g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
+    //     DcfContextShmemInit();
+    // }
+#endif
+
+    {
+        NotifySignalShmemInit();
+
+        // JobInfoShmemInit();
+        /*
+         * Set up other modules that need some shared memory space
+         */
+        BTreeShmemInit();
+        SyncScanShmemInit();
+        // AsyncShmemInit();
+
+#ifdef PGXC
+        NodeTablesShmemInit();
+#endif
+    }
+
+    /*
+     * Set up tablespace usage information management struct
+     */
+    // TableSpaceUsageManager::Init();
+
+    /*
+     * Set up thread shared fd cache
+     */
+    InitDataFileIdCache();
+    // InitUidCache();
+
+    /*
+     * Set up seg spc cache
+     */
+    // InitSegSpcCache();
+
+#ifdef ENABLE_MULTIPLE_NODES
+    if (IS_MULTI_DISASTER_RECOVER_MODE) {
+        InitDisasterCache();
+    }
+#endif
+
+    /*
+     * Set up CStoreSpaceAllocator
+     */
+    CStoreAllocator::InitColSpaceCache();
+
+#ifdef ENABLE_MULTIPLE_NODES
+    /*
+     * Set up TableStatusCache
+     */
+    if (g_instance.attr.attr_common.enable_tsdb) {
+        Tsdb::TableStatus::GetInstance().init();
+    }
+#endif   /* ENABLE_MULTIPLE_NODES */
+}
+#else
 static void
 CreateFakeSharedMemoryAndSemaphores(void)
 {
@@ -477,7 +733,7 @@ CreateFakeSharedMemoryAndSemaphores(void)
 
 		hdr->creatorPID = getpid();
 		hdr->magic = PGShmemMagic;
-		hdr->dsm_control = 0;
+		// hdr->dsm_control = 0;
 		hdr->device = 42; /* not relevant for non-shared memory */
 		hdr->inode = 43; /* not relevant for non-shared memory */
 		hdr->totalsize = size;
@@ -498,9 +754,9 @@ CreateFakeSharedMemoryAndSemaphores(void)
 		ereport(FATAL,
 			(errcode(ERRCODE_INTERNAL_ERROR),
 			 errmsg("[neon-wal-redo] can not read current directory name")));
-	DataDir = cwd;
-	PGReserveSemaphores(numSemas);
-	DataDir = NULL;
+	t_thrd.proc_cxt.DataDir = cwd;
+	PGReserveSemaphores(numSemas, 0);
+	t_thrd.proc_cxt.DataDir = NULL;
 
 	/*
 	 * The rest of function follows CreateSharedMemoryAndSemaphores() closely,
@@ -528,8 +784,6 @@ CreateFakeSharedMemoryAndSemaphores(void)
 #endif
 	XLOGShmemInit();
 	CLOGShmemInit();
-	CommitTsShmemInit();
-	SUBTRANSShmemInit();
 	MultiXactShmemInit();
 	InitBufferPool();
 
@@ -551,7 +805,6 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	CreateSharedProcArray();
 	CreateSharedBackendStatus();
 	TwoPhaseShmemInit();
-	BackgroundWorkerShmemInit();
 
 	/*
 	 * Set up shared-inval messaging
@@ -569,7 +822,6 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();
 	WalRcvShmemInit();
-	PgArchShmemInit();
 	ApplyLauncherShmemInit();
 
 	/*
@@ -577,29 +829,35 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	 */
 #if PG_MAJORVERSION_NUM < 17
 	/* "snapshot too old" was removed in PG17, and with it the SnapMgr */
-	SnapMgrInit();
 #endif
 	BTreeShmemInit();
 	SyncScanShmemInit();
-	/* Skip due to the 'pg_notify' directory check */
-	/* AsyncShmemInit(); */
+
 
 #ifdef EXEC_BACKEND
 
 	/*
 	 * Alloc the win32 shared backend array
+	 * In openGauss environment, we need to provide a stub implementation
+	 * or avoid calling this function as it's not defined in neon_walredo module
 	 */
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster) {
+#ifdef ENABLE_NEON
+		/* In openGauss, we skip this call as it's not implemented in the module */
+		elog(DEBUG1, "Skipping ShmemBackendArrayAllocation() in openGauss environment");
+#else
 		ShmemBackendArrayAllocation();
+#endif
+	}
 #endif
 
 	/*
 	 * Now give loadable modules a chance to set up their shmem allocations
 	 */
-	if (shmem_startup_hook)
-		shmem_startup_hook();
+	if (t_thrd.storage_cxt.shmem_startup_hook)
+		t_thrd.storage_cxt.shmem_startup_hook();
 }
-
+#endif
 
 /* Version compatility wrapper for ReadBufferWithoutRelcache */
 static inline Buffer
@@ -607,7 +865,12 @@ NeonRedoReadBuffer(NRelFileInfo rinfo,
 		   ForkNumber forkNum, BlockNumber blockNum,
 		   ReadBufferMode mode)
 {
-#if PG_VERSION_NUM >= 150000
+#ifdef ENABLE_NEON
+	/* openGauss version requires XLogPhyBlock* as last parameter */
+	return ReadBufferWithoutRelcache(rinfo, forkNum, blockNum, mode,
+									 NULL, /* no strategy */
+									 NULL); /* no XLogPhyBlock */
+#elif PG_VERSION_NUM >= 150000
 	return ReadBufferWithoutRelcache(rinfo, forkNum, blockNum, mode,
 									 NULL, /* no strategy */
 									 true); /* WAL redo is only performed on permanent rels */
@@ -621,8 +884,7 @@ NeonRedoReadBuffer(NRelFileInfo rinfo,
 /*
  * Some debug function that may be handy for now.
  */
-pg_attribute_unused()
-static char *
+static char * __attribute__((unused))
 pprint_buffer(char *data, int len)
 {
 	StringInfoData s;
@@ -681,7 +943,12 @@ ReadRedoCommand(StringInfo inBuf)
 
 	qtype = hdr[0];
 	memcpy(&len, &hdr[1], sizeof(int32));
+#ifdef ENABLE_NEON
+	/* openGauss doesn't have pg_ntoh32, use standard ntohl */
+	len = ntohl(len);
+#else
 	len = pg_ntoh32(len);
+#endif
 
 	if (len < 4)
 		ereport(ERROR,
@@ -735,6 +1002,11 @@ BeginRedoForBlock(StringInfo input_message)
 	rinfo.spcNode = pq_getmsgint(input_message, 4);
 	rinfo.dbNode = pq_getmsgint(input_message, 4);
 	rinfo.relNode = pq_getmsgint(input_message, 4);
+#ifdef ENABLE_NEON
+	/* openGauss RelFileNode has extra fields that must be initialized */
+	rinfo.bucketNode = InvalidBktId;
+	rinfo.opt = 0;
+#endif
 #else
 	rinfo.spcOid = pq_getmsgint(input_message, 4);
 	rinfo.dbOid = pq_getmsgint(input_message, 4);
@@ -751,11 +1023,24 @@ BeginRedoForBlock(StringInfo input_message)
 		 target_redo_tag.blockNum);
 
 	reln = smgropen(rinfo, INVALID_PROC_NUMBER, RELPERSISTENCE_PERMANENT);
+#ifdef ENABLE_NEON
+	/* openGauss: smgr_cached_nblocks is a single value, only for MAIN_FORKNUM */
+	if (forknum == MAIN_FORKNUM)
+	{
+		if (reln->smgr_cached_nblocks == InvalidBlockNumber ||
+			reln->smgr_cached_nblocks < blknum + 1)
+		{
+			reln->smgr_cached_nblocks = blknum + 1;
+		}
+	}
+#else
+	/* PostgreSQL: smgr_cached_nblocks is an array */
 	if (reln->smgr_cached_nblocks[forknum] == InvalidBlockNumber ||
 		reln->smgr_cached_nblocks[forknum] < blknum + 1)
 	{
 		reln->smgr_cached_nblocks[forknum] = blknum + 1;
 	}
+#endif
 }
 
 /*
@@ -786,6 +1071,11 @@ PushPage(StringInfo input_message)
 	rinfo.spcNode = pq_getmsgint(input_message, 4);
 	rinfo.dbNode = pq_getmsgint(input_message, 4);
 	rinfo.relNode = pq_getmsgint(input_message, 4);
+#ifdef ENABLE_NEON
+	/* openGauss RelFileNode has extra fields that must be initialized */
+	rinfo.bucketNode = InvalidBktId;
+	rinfo.opt = 0;
+#endif
 #else
 	rinfo.spcOid = pq_getmsgint(input_message, 4);
 	rinfo.dbOid = pq_getmsgint(input_message, 4);
@@ -843,10 +1133,25 @@ ApplyRecord(StringInfo input_message)
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = apply_error_callback;
 	errcallback.arg = (void *) reader_state;
+#ifdef ENABLE_NEON
+	/* openGauss: error_context_stack is in t_thrd.log_cxt */
+	errcallback.previous = t_thrd.log_cxt.error_context_stack;
+	t_thrd.log_cxt.error_context_stack = &errcallback;
+#else
+	/* PostgreSQL: error_context_stack is a global variable */
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
+#endif
 
+#ifdef ENABLE_NEON
+	/* openGauss doesn't have XLogBeginRead, manually implement the same logic */
+	ResetDecoder(reader_state);
+	reader_state->EndRecPtr = lsn;
+	reader_state->ReadRecPtr = InvalidXLogRecPtr;
+#else
+	/* PostgreSQL: use XLogBeginRead function */
 	XLogBeginRead(reader_state, lsn);
+#endif
 
 #if PG_VERSION_NUM >= 150000
 	/*
@@ -914,7 +1219,13 @@ ApplyRecord(StringInfo input_message)
 	redo_read_buffer_filter = NULL;
 
 	/* Pop the error context stack */
+#ifdef ENABLE_NEON
+	/* openGauss: error_context_stack is in t_thrd.log_cxt */
+	t_thrd.log_cxt.error_context_stack = errcallback.previous;
+#else
+	/* PostgreSQL: error_context_stack is a global variable */
 	error_context_stack = errcallback.previous;
+#endif
 
 	elog(TRACE, "applied WAL record with LSN %X/%X",
 		 (uint32) (lsn >> 32), (uint32) lsn);
@@ -957,6 +1268,10 @@ redo_block_filter(XLogReaderState *record, uint8 block_id)
 {
 	BufferTag	target_tag;
 	NRelFileInfo rinfo;
+	bool result;
+#ifdef ENABLE_NEON
+	bool hasImage = XLogRecHasBlockImage(record, block_id);
+#endif
 
 #if PG_VERSION_NUM >= 150000
 	XLogRecGetBlockTag(record, block_id,
@@ -984,7 +1299,9 @@ redo_block_filter(XLogReaderState *record, uint8 block_id)
 	 * If this block isn't one we are currently restoring, then return 'true'
 	 * so that this gets ignored
 	 */
-	return !BufferTagsEqual(&target_tag, &target_redo_tag);
+	result = !BufferTagsEqual(&target_tag, &target_redo_tag);
+
+	return result;
 }
 
 /*
@@ -1016,6 +1333,11 @@ GetPage(StringInfo input_message)
 	rinfo.spcNode = pq_getmsgint(input_message, 4);
 	rinfo.dbNode = pq_getmsgint(input_message, 4);
 	rinfo.relNode = pq_getmsgint(input_message, 4);
+#ifdef ENABLE_NEON
+	/* openGauss RelFileNode has extra fields that must be initialized */
+	rinfo.bucketNode = InvalidBktId;
+	rinfo.opt = 0;
+#endif
 #else
 	rinfo.spcOid = pq_getmsgint(input_message, 4);
 	rinfo.dbOid = pq_getmsgint(input_message, 4);
@@ -1028,7 +1350,6 @@ GetPage(StringInfo input_message)
 	buf = NeonRedoReadBuffer(rinfo, forknum, blknum, RBM_NORMAL);
 	Assert(buf == wal_redo_buffer);
 	page = BufferGetPage(buf);
-	/* single thread, so don't bother locking the page */
 
 	/* Response: Page content */
 	tot_written = 0;
@@ -1065,9 +1386,9 @@ Ping(StringInfo input_message)
 		ssize_t		rc;
 		/* We don't need alignment, but it's bad practice to use char[BLCKSZ] */
 #if PG_VERSION_NUM >= 160000
-		static const PGIOAlignedBlock response;
+		const static PGIOAlignedBlock response = {0};
 #else
-		static const PGAlignedBlock response;
+		const static PGAlignedBlock response = {0};
 #endif
 		rc = write(STDOUT_FILENO, &response.data[tot_written], BLCKSZ - tot_written);
 		if (rc < 0) {
@@ -1105,7 +1426,7 @@ static size_t stdin_ptr = 0;	/* # of bytes already consumed */
 static ssize_t
 buffered_read(void *buf, size_t count)
 {
-	char	   *dst = buf;
+	char	   *dst = static_cast<char *>(buf);
 
 	while (count > 0)
 	{

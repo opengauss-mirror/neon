@@ -36,7 +36,7 @@ InitMaterializedSRF(FunctionCallInfo fcinfo, bits32 flags)
 	if (get_call_result_type(fcinfo, NULL, &stored_tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	tupstore = tuplestore_begin_heap(false, false, work_mem);
+	// tupstore = tuplestore_begin_heap(false, false, work_mem);
 	rsinfo->returnMode = SFRM_Materialize;
 	rsinfo->setResult = tupstore;
 	rsinfo->setDesc = stored_tupdesc;
@@ -45,7 +45,7 @@ InitMaterializedSRF(FunctionCallInfo fcinfo, bits32 flags)
 
 TimeLineID GetWALInsertionTimeLine(void)
 {
-	return ThisTimeLineID + 1;
+	return t_thrd.xlog_cxt.ThisTimeLineID;
 }
 
 

@@ -180,12 +180,16 @@ impl PostgresProcess {
             .context("create pgdata directory")?;
 
         let pg_version = get_pg_version(self.pgbin.as_ref());
+        let (initdb_flavor, initdb_bin_path) =
+            postgres_initdb::locate_initdb_binary(self.pg_bin_dir.as_ref())
+                .context("locate initdb binary")?;
 
         postgres_initdb::do_run_initdb(postgres_initdb::RunInitdbArgs {
             superuser: initdb_user,
             locale: DEFAULT_LOCALE, // XXX: this shouldn't be hard-coded,
             pg_version,
-            initdb_bin: self.pg_bin_dir.join("initdb").as_ref(),
+            initdb_bin: initdb_bin_path.as_ref(),
+            flavor: initdb_flavor,
             library_search_path: &self.pg_lib_dir, // TODO: is this right? Prob works in compute image, not sure about neon_local.
             pgdata: &self.pgdata_dir,
         })

@@ -56,7 +56,7 @@ use pageserver_api::models::{
 use pageserver_api::reltag::{BlockNumber, RelTag};
 use pageserver_api::shard::{ShardIdentity, ShardIndex, ShardNumber, TenantShardId};
 use postgres_connection::PgConnectionConfig;
-use postgres_ffi::v14::xlog_utils;
+use postgres_ffi::V702::xlog_utils;
 use postgres_ffi::{PgMajorVersion, WAL_SEGMENT_SIZE, to_pg_timestamp};
 use rand::Rng;
 use remote_storage::DownloadError;
@@ -7080,15 +7080,30 @@ impl Timeline {
             RedoAttemptType::GcCompaction => false,
         };
 
+        // [LAYERDBG] Log page reconstruction details
+        let (rel, blkno) = key.to_rel_block().unwrap_or_default();
+        info!(
+            "[LAYERDBG] reconstruct_value: key={}, rel={}/{}/{}.{}, blkno={}, request_lsn={}, \
+             has_img={}, img_lsn={}, num_records={}",
+            key, rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno,
+            request_lsn, data.img.is_some(),
+            data.img.as_ref().map(|i| i.0.to_string()).unwrap_or_else(|| "none".to_string()),
+            data.records.len()
+        );
+
         // If we have a page image, and no WAL, we're all set
         if data.records.is_empty() {
             if let Some((img_lsn, img)) = &data.img {
-                trace!(
-                    "found page image for key {} at {}, no WAL redo required, req LSN {}",
-                    key, img_lsn, request_lsn,
+                info!(
+                    "[LAYERDBG] found page image for key {} at {}, no WAL redo required, req LSN {}, img_size={}",
+                    key, img_lsn, request_lsn, img.len()
                 );
                 Ok(img.clone())
             } else {
+                info!(
+                    "[LAYERDBG] base image for {} at {} not found",
+                    key, request_lsn
+                );
                 Err(PageReconstructError::from(anyhow!(
                     "base image for {key} at {request_lsn} not found"
                 )))
@@ -7099,6 +7114,10 @@ impl Timeline {
             // If we don't have a base image, then the oldest WAL record better initialize
             // the page
             if data.img.is_none() && !data.records.first().unwrap().1.will_init() {
+                info!(
+                    "[LAYERDBG] Base image for {} at {} not found, got {} WAL records, first will_init=false",
+                    key, request_lsn, data.records.len()
+                );
                 Err(PageReconstructError::from(anyhow!(
                     "Base image for {} at {} not found, but got {} WAL records",
                     key,
@@ -7107,20 +7126,27 @@ impl Timeline {
                 )))
             } else {
                 if data.img.is_some() {
-                    trace!(
-                        "found {} WAL records and a base image for {} at {}, performing WAL redo",
+                    info!(
+                        "[LAYERDBG] found {} WAL records and a base image for {} at {}, performing WAL redo",
                         data.records.len(),
                         key,
                         request_lsn
                     );
                 } else {
-                    trace!(
-                        "found {} WAL records that will init the page for {} at {}, performing WAL redo",
+                    info!(
+                        "[LAYERDBG] found {} WAL records that will init the page for {} at {}, performing WAL redo",
                         data.records.len(),
                         key,
                         request_lsn
                     );
                 };
+                // [LAYERDBG] Log each WAL record's details
+                for (idx, (rec_lsn, rec)) in data.records.iter().enumerate() {
+                    info!(
+                        "[LAYERDBG] WAL record {} for key {}: lsn={}, will_init={}, record_type={:?}",
+                        idx, key, rec_lsn, rec.will_init(), std::mem::discriminant(rec)
+                    );
+                }
                 let res = self
                     .walredo_mgr
                     .as_ref()
@@ -7136,9 +7162,19 @@ impl Timeline {
                     )
                     .await;
                 let img = match res {
-                    Ok(img) => img,
+                    Ok(img) => {
+                        info!(
+                            "[LAYERDBG] walredo success for {}, result_size={}",
+                            key, img.len()
+                        );
+                        img
+                    }
                     Err(walredo::Error::Cancelled) => return Err(PageReconstructError::Cancelled),
                     Err(walredo::Error::Other(err)) => {
+                        info!(
+                            "[LAYERDBG] walredo failure for {}: {:?}",
+                            key, err
+                        );
                         if fire_critical_error {
                             critical_timeline!(
                                 self.tenant_shard_id,
@@ -7881,6 +7917,25 @@ impl TimelineWriter<'_> {
 
         let batch_max_lsn = batch.max_lsn;
         let buf_size: u64 = batch.buffer_size() as u64;
+
+        // [LAYERDBG] Log put_batch call
+        tracing::info!(
+            "[LAYERDBG] put_batch: max_lsn={}, buf_size={}, metadata_count={}",
+            batch_max_lsn, buf_size, batch.metadata.len()
+        );
+        for meta in &batch.metadata {
+            if let wal_decoder::serialized_batch::ValueMeta::Serialized(s) = meta {
+                let key = pageserver_api::key::Key::from_compact(s.key);
+                // Extract rel info from key fields: field2=spc, field3=db, field4=rel, field5=fork, field6=blk
+                if key.field1 == 0x00 && key.field4 != 0 {
+                    tracing::info!(
+                        "[LAYERDBG] put_batch entry: key={}, rel={}/{}/{}.{}, blkno={}, lsn={}, will_init={}, len={}",
+                        s.key, key.field2, key.field3, key.field4, key.field5,
+                        key.field6, s.lsn, s.will_init, s.len
+                    );
+                }
+            }
+        }
 
         let action = self.get_open_layer_action(batch_max_lsn, buf_size);
         let layer = self

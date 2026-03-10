@@ -216,9 +216,43 @@ pub fn copy_tls_certificates(
     Ok(())
 }
 
-/// Create a standby.signal file
+/// Create a standby.signal file (PostgreSQL 12+) or recovery.conf (openGauss)
+/// For openGauss, we need to create recovery.conf with standby_mode = 'on'
 pub fn add_standby_signal(pgdata_path: &Path) -> Result<()> {
-    // XXX: consider making it a part of config.json
+    add_standby_signal_ext(pgdata_path, false, None, None)
+}
+
+/// Create standby signal with openGauss support
+/// For openGauss: creates recovery.conf with standby_mode = 'on' and primary_conninfo
+/// For PostgreSQL: creates standby.signal file
+pub fn add_standby_signal_ext(
+    pgdata_path: &Path,
+    is_opengauss: bool,
+    primary_conninfo: Option<&str>,
+    primary_slotname: Option<&str>,
+) -> Result<()> {
+    if is_opengauss {
+        // openGauss uses recovery.conf file with standby_mode = 'on'
+        let recovery_conf_path = pgdata_path.join("recovery.conf");
+        
+        use std::io::Write;
+        let mut file = File::create(&recovery_conf_path)?;
+        
+        writeln!(file, "# openGauss recovery configuration for Neon hot standby")?;
+        writeln!(file, "standby_mode = 'on'")?;
+        
+        if let Some(conninfo) = primary_conninfo {
+            writeln!(file, "primary_conninfo = '{}'", conninfo)?;
+        }
+        
+        // openGauss uses 'primary_slotname' instead of PostgreSQL's 'primary_slot_name'
+        if let Some(slotname) = primary_slotname {
+            writeln!(file, "primary_slotname = '{}'", slotname)?;
+        }
+        
+        info!("created recovery.conf for openGauss standby mode");
+    } else {
+        // PostgreSQL 12+ uses standby.signal file
     let signalfile = pgdata_path.join("standby.signal");
 
     if !signalfile.exists() {
@@ -226,6 +260,7 @@ pub fn add_standby_signal(pgdata_path: &Path) -> Result<()> {
         info!("created standby.signal");
     } else {
         info!("reused pre-existing standby.signal");
+        }
     }
     Ok(())
 }

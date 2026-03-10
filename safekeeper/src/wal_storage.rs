@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::future::BoxFuture;
-use postgres_ffi::v14::xlog_utils::{IsPartialXLogFileName, IsXLogFileName, XLogFromFileName};
+use postgres_ffi::V702::xlog_utils::{IsPartialXLogFileName, IsXLogFileName, XLogFromFileName};
 use postgres_ffi::waldecoder::WalStreamDecoder;
 use postgres_ffi::{PG_TLI, XLogFileName, XLogSegNo, dispatch_pgversion};
 use postgres_versioninfo::{PgMajorVersion, PgVersionId};
@@ -435,6 +435,26 @@ impl Storage for PhysicalStorage {
 
     /// Write WAL to disk.
     async fn write_wal(&mut self, startpos: Lsn, buf: &[u8]) -> Result<()> {
+        // TESTDBG: Log WAL data being written to disk
+        if !buf.is_empty() {
+            info!(
+                "TESTDBG wal_storage::write_wal: startpos={}, buf_len={}, write_lsn={}",
+                startpos, buf.len(), self.write_lsn
+            );
+            // Print first 64 bytes
+            info!(
+                "TESTDBG wal_storage::write_wal: first_64_bytes={:02x?}",
+                &buf[..std::cmp::min(buf.len(), 64)]
+            );
+            // Print last 64 bytes if buffer is longer
+            if buf.len() > 128 {
+                info!(
+                    "TESTDBG wal_storage::write_wal: last_64_bytes={:02x?}",
+                    &buf[buf.len()-64..]
+                );
+            }
+        }
+        
         // Disallow any non-sequential writes, which can result in gaps or overwrites.
         // If we need to move the pointer, use truncate_wal() instead.
         if self.write_lsn > startpos {

@@ -1,0 +1,225 @@
+-- ============================================================================
+-- Neon Test Environment Cleanup
+-- ============================================================================
+-- This script cleans up the test environment after all tests complete.
+-- It MUST be run last after all other test cases.
+--
+-- Actions:
+--   1. Display test summary and results
+--   2. Check for any failed tests
+--   3. Drop test schema and all objects
+--   4. Verify cleanup was successful
+-- ============================================================================
+\echo '=============================================='
+==============================================
+\echo '  Neon Test Environment Cleanup'
+  Neon Test Environment Cleanup
+\echo '=============================================='
+==============================================
+SET search_path TO neon_test, public;
+SET
+-- ============================================================================
+-- Display Test Summary
+-- ============================================================================
+\echo '--- Test Summary by Phase ---'
+--- Test Summary by Phase ---
+SELECT * FROM neon_test.get_test_summary();
+     phase      | total_tests | passed | failed | running 
+----------------+-------------+--------+--------+---------
+ initialization |           2 |      2 |      0 |       0
+(1 row)
+
+\echo '--- All Test Results ---'
+--- All Test Results ---
+SELECT 
+    test_name,
+    test_phase,
+    test_status,
+    duration_ms || ' ms' AS duration,
+    message
+FROM neon_test.test_results
+ORDER BY id;
+     test_name     |   test_phase   | test_status | duration |                 message                  
+-------------------+----------------+-------------+----------+------------------------------------------
+ neon_setup        | initialization | PASSED      | 3136 ms  | Environment setup completed successfully
+ neon_test_helpers | initialization | PASSED      | 4575 ms  | Helper functions created and verified
+(2 rows)
+
+-- ============================================================================
+-- Check for Failed Tests
+-- ============================================================================
+\echo '--- Checking for Failed Tests ---'
+--- Checking for Failed Tests ---
+DO $$
+DECLARE
+    v_failed_count INT;
+    v_passed_count INT;
+    v_total_count INT;
+BEGIN
+    SELECT 
+        COUNT(*) FILTER (WHERE test_status = 'FAILED'),
+        COUNT(*) FILTER (WHERE test_status = 'PASSED'),
+        COUNT(*)
+    INTO v_failed_count, v_passed_count, v_total_count
+    FROM neon_test.test_results;
+    
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'FINAL TEST RESULTS';
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'Total Tests: %', v_total_count;
+    RAISE NOTICE 'Passed: %', v_passed_count;
+    RAISE NOTICE 'Failed: %', v_failed_count;
+    RAISE NOTICE '========================================';
+    
+    IF v_failed_count > 0 THEN
+        RAISE WARNING 'There are % failed tests!', v_failed_count;
+    ELSE
+        RAISE NOTICE 'All tests passed successfully!';
+    END IF;
+END $$;
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  ========================================
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  FINAL TEST RESULTS
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  ========================================
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  Total Tests: 2
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  Passed: 2
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  Failed: 0
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  ========================================
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:69: NOTICE:  All tests passed successfully!
+ANONYMOUS BLOCK EXECUTE
+-- Show failed tests details if any
+SELECT test_name, test_phase, message
+FROM neon_test.test_results
+WHERE test_status = 'FAILED'
+ORDER BY id;
+ test_name | test_phase | message 
+-----------+------------+---------
+(0 rows)
+
+-- ============================================================================
+-- Save Final Statistics
+-- ============================================================================
+\echo '--- Recording Cleanup Phase ---'
+--- Recording Cleanup Phase ---
+-- Record cleanup start
+INSERT INTO neon_test.test_results (test_name, test_phase, test_status, message)
+VALUES ('neon_cleanup', 'cleanup', 'RUNNING', 'Starting environment cleanup');
+INSERT 0 1
+-- ============================================================================
+-- Check for Orphaned Objects
+-- ============================================================================
+\echo '--- Checking for Orphaned Objects ---'
+--- Checking for Orphaned Objects ---
+-- List any remaining tables (besides our tracking tables)
+SELECT tablename 
+FROM pg_tables 
+WHERE schemaname = 'neon_test' 
+  AND tablename NOT IN ('test_results', 'env_info')
+ORDER BY tablename;
+ tablename 
+-----------
+(0 rows)
+
+-- List any remaining functions
+SELECT proname AS function_name
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE n.nspname = 'neon_test'
+  AND proname NOT LIKE 'record_%'
+  AND proname NOT LIKE 'assert_%'
+  AND proname NOT LIKE 'get_%'
+  AND proname NOT LIKE 'table_%'
+  AND proname NOT LIKE 'index_%'
+ORDER BY proname;
+ function_name 
+---------------
+(0 rows)
+
+-- ============================================================================
+-- Display Environment Info
+-- ============================================================================
+\echo '--- Environment Info ---'
+--- Environment Info ---
+SELECT key, value FROM neon_test.env_info ORDER BY key;
+    key     |                                                                                 value                                                                                 
+------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ database   | postgres
+ init_time  | 2025-12-30 07:46:08.977189+00
+ pg_version | (openGauss 7.0.0-RC3 build 3cfd8054) compiled at 2025-12-30 09:23:55 commit 497 last mr 8538 debug on aarch64-unknown-linux-gnu, compiled by g++ (GCC) 10.3.1, 64-bit
+ user       | cloud_admin
+(4 rows)
+
+-- ============================================================================
+-- Update Cleanup Status
+-- ============================================================================
+UPDATE neon_test.test_results 
+SET test_status = 'PASSED',
+    end_time = CURRENT_TIMESTAMP,
+    duration_ms = EXTRACT(MILLISECONDS FROM (CURRENT_TIMESTAMP - start_time))::INT,
+    message = 'Cleanup completed successfully'
+WHERE test_name = 'neon_cleanup';
+UPDATE 1
+-- Final summary
+\echo '--- Final Test Results Summary ---'
+--- Final Test Results Summary ---
+SELECT 
+    test_status,
+    COUNT(*) AS count
+FROM neon_test.test_results
+GROUP BY test_status
+ORDER BY test_status;
+ test_status | count 
+-------------+-------
+ PASSED      |     3
+(1 row)
+
+-- ============================================================================
+-- Drop Test Schema
+-- ============================================================================
+\echo '--- Dropping Test Schema ---'
+--- Dropping Test Schema ---
+-- This will drop all objects in the schema
+DROP SCHEMA IF EXISTS neon_test CASCADE;
+gsql:/usr1/neon/neon_branch_dev/test_runner/regress_og/sql/neon_cleanup.sql:144: NOTICE:  drop cascades to 15 other objects
+DETAIL:  drop cascades to table test_results
+drop cascades to table env_info
+drop cascades to function record_test_start(character varying,character varying)
+drop cascades to function record_test_end(integer,character varying,text)
+drop cascades to function record_test_passed(character varying,text)
+drop cascades to function record_test_failed(character varying,text)
+drop cascades to function assert_equals(text,text,text)
+drop cascades to function assert_true(boolean,text)
+drop cascades to function assert_false(boolean,text)
+drop cascades to function assert_null(anyelement,text)
+drop cascades to function assert_not_null(anyelement,text)
+drop cascades to function assert_row_count(text,bigint,text)
+drop cascades to function table_exists(text,text)
+drop cascades to function index_exists(text,text)
+drop cascades to function get_test_summary()
+DROP SCHEMA
+-- ============================================================================
+-- Verify Cleanup
+-- ============================================================================
+\echo '--- Verifying Cleanup ---'
+--- Verifying Cleanup ---
+-- Check if schema still exists
+SELECT 
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'neon_test')
+        THEN 'FAILED: Schema still exists!'
+        ELSE 'SUCCESS: Schema removed successfully'
+    END AS cleanup_verification;
+         cleanup_verification         
+--------------------------------------
+ SUCCESS: Schema removed successfully
+(1 row)
+
+-- Reset search path
+SET search_path TO public;
+SET
+\echo '=============================================='
+==============================================
+\echo '  Environment Cleanup Complete'
+  Environment Cleanup Complete
+\echo '=============================================='
+==============================================
+total time: 833  ms

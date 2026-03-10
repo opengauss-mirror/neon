@@ -844,6 +844,170 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
             };
             let send_buf = &send_buf[..send_size];
 
+            // TESTDBG: Log WAL data being sent with XLogRecord parsing
+            // openGauss WAL structure constants:
+            // - XLOG_BLCKSZ = 8192 (page size)
+            // - XLogPageHeaderData = 24 bytes
+            // - XLogLongPageHeaderData = 40 bytes
+            // - XLogRecord = 32 bytes
+            // - WAL_SEGMENT_SIZE = 16MB
+            const XLOG_BLCKSZ: u64 = 8192;
+            const XLOG_SIZE_OF_XLOG_SHORT_PHD: usize = 24;
+            const XLOG_SIZE_OF_XLOG_LONG_PHD: usize = 40;
+            const XLOG_SIZE_OF_XLOG_RECORD: usize = 32;
+            const WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+            const XLP_LONG_HEADER: u16 = 0x0002;
+            const XLOG_PAGE_MAGIC: u16 = 0xD074; // openGauss page magic (53364)
+            
+            if !send_buf.is_empty() {
+                info!(
+                    "TESTDBG safekeeper SEND: start_pos={}, end_pos={}, send_size={}",
+                    self.start_pos, self.end_pos, send_size
+                );
+                
+                // Parse WAL data considering page headers
+                let mut offset = 0usize;
+                let mut record_count = 0;
+                let mut current_lsn = self.start_pos.0;
+                
+                while offset < send_buf.len() {
+                    let data = &send_buf[offset..];
+                    
+                    // Check if we're at a page boundary
+                    let page_offset = current_lsn % XLOG_BLCKSZ;
+                    let segment_offset = current_lsn % WAL_SEGMENT_SIZE;
+                    
+                    // At the start of a page, we need to skip the page header
+                    if page_offset == 0 {
+                        // Determine header size: long header at segment start, short header otherwise
+                        let hdr_size = if segment_offset == 0 {
+                            XLOG_SIZE_OF_XLOG_LONG_PHD
+                        } else {
+                            XLOG_SIZE_OF_XLOG_SHORT_PHD
+                        };
+                        
+                        if data.len() >= hdr_size {
+                            // Parse page header for debugging
+                            let xlp_magic = u16::from_le_bytes([data[0], data[1]]);
+                            let xlp_info = u16::from_le_bytes([data[2], data[3]]);
+                            let xlp_tli = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                            let xlp_pageaddr = u64::from_le_bytes([data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]]);
+                            let xlp_rem_len = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                            let xlp_total_len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+                            
+                            let is_long_header = (xlp_info & XLP_LONG_HEADER) != 0;
+                            let actual_hdr_size = if is_long_header { XLOG_SIZE_OF_XLOG_LONG_PHD } else { XLOG_SIZE_OF_XLOG_SHORT_PHD };
+                            
+                            info!(
+                                "TESTDBG safekeeper SEND: PAGE_HEADER at LSN={:X}/{:X} offset={}: xlp_magic=0x{:04X}, xlp_info=0x{:04X}, xlp_tli={}, xlp_pageaddr={:X}/{:X}, xlp_rem_len={}, xlp_total_len={}, hdr_size={}",
+                                (current_lsn >> 32) as u32, current_lsn as u32,
+                                offset,
+                                xlp_magic,
+                                xlp_info,
+                                xlp_tli,
+                                (xlp_pageaddr >> 32) as u32, xlp_pageaddr as u32,
+                                xlp_rem_len,
+                                xlp_total_len,
+                                actual_hdr_size
+                            );
+                            
+                            // Validate page magic
+                            if xlp_magic != XLOG_PAGE_MAGIC {
+                                info!(
+                                    "TESTDBG safekeeper SEND: WARNING - unexpected page magic 0x{:04X} (expected 0x{:04X})",
+                                    xlp_magic, XLOG_PAGE_MAGIC
+                                );
+                            }
+                            
+                            offset += actual_hdr_size;
+                            current_lsn += actual_hdr_size as u64;
+                            continue;
+                        } else {
+                            info!(
+                                "TESTDBG safekeeper SEND: insufficient data for page header at offset={}, remaining={}",
+                                offset, data.len()
+                            );
+                            break;
+                        }
+                    }
+                    
+                    // Not at page boundary, try to parse XLogRecord
+                    if data.len() < XLOG_SIZE_OF_XLOG_RECORD {
+                        info!(
+                            "TESTDBG safekeeper SEND: insufficient data for XLogRecord at offset={}, remaining={}",
+                            offset, data.len()
+                        );
+                        break;
+                    }
+                    
+                    // Read XLogRecord fields (openGauss format)
+                    let xl_tot_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let xl_term = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                    let xl_xid = u64::from_le_bytes([data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]]);
+                    let xl_prev = u64::from_le_bytes([data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23]]);
+                    let xl_info = data[24];
+                    let xl_rmid = data[25];
+                    let xl_bucket_id = u16::from_le_bytes([data[26], data[27]]);
+                    let xl_crc = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+                    
+                    // Sanity check for xl_tot_len
+                    if xl_tot_len < XLOG_SIZE_OF_XLOG_RECORD as u32 || xl_tot_len > 10 * 1024 * 1024 {
+                        info!(
+                            "TESTDBG safekeeper SEND: record[{}] INVALID xl_tot_len={} at LSN={:X}/{:X} offset={}, remaining={}, raw_bytes={:02X?}",
+                            record_count, xl_tot_len,
+                            (current_lsn >> 32) as u32, current_lsn as u32,
+                            offset, data.len(),
+                            &data[..std::cmp::min(32, data.len())]
+                        );
+                        break;
+                    }
+                    
+                    info!(
+                        "TESTDBG safekeeper SEND: record[{}] at LSN={:X}/{:X}: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
+                        record_count,
+                        (current_lsn >> 32) as u32, current_lsn as u32,
+                        xl_tot_len,
+                        xl_term,
+                        xl_xid,
+                        (xl_prev >> 32) as u32,
+                        xl_prev as u32,
+                        xl_info,
+                        xl_rmid,
+                        xl_bucket_id,
+                        xl_crc
+                    );
+                    
+                    // Calculate how much of this record is on the current page
+                    let remaining_in_page = XLOG_BLCKSZ - page_offset;
+                    let record_len = xl_tot_len as u64;
+                    
+                    if record_len <= remaining_in_page {
+                        // Record fits entirely on current page
+                        let aligned_len = ((xl_tot_len as usize) + 7) & !7;
+                        offset += aligned_len;
+                        current_lsn += aligned_len as u64;
+                    } else {
+                        // Record spans multiple pages
+                        info!(
+                            "TESTDBG safekeeper SEND: record[{}] spans pages: record_len={}, remaining_in_page={}",
+                            record_count, record_len, remaining_in_page
+                        );
+                        
+                        let aligned_len = ((xl_tot_len as usize) + 7) & !7;
+                        offset += aligned_len;
+                        current_lsn += aligned_len as u64;
+                    }
+                    
+                    record_count += 1;
+                    
+                    // Limit output
+                    if record_count >= 5 {
+                        info!("TESTDBG safekeeper SEND: ... (truncated, {} bytes remaining)", send_buf.len() - offset);
+                        break;
+                    }
+                }
+            }
+
             // and send it, while respecting Timeline::cancel
             let msg = BeMessage::XLogData(XLogDataBody {
                 wal_start: self.start_pos.0,

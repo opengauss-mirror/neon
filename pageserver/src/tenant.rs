@@ -5825,10 +5825,9 @@ async fn run_initdb(
     pg_version: PgMajorVersion,
     cancel: &CancellationToken,
 ) -> Result<(), InitdbError> {
-    let initdb_bin_path = conf
-        .pg_bin_dir(pg_version)
-        .map_err(InitdbError::Other)?
-        .join("initdb");
+    let pg_bin_dir = conf.pg_bin_dir(pg_version).map_err(InitdbError::Other)?;
+    let (initdb_flavor, initdb_bin_path) =
+        postgres_initdb::locate_initdb_binary(&pg_bin_dir).map_err(InitdbError::Other)?;
     let initdb_lib_dir = conf.pg_lib_dir(pg_version).map_err(InitdbError::Other)?;
     info!(
         "running {} in {}, libdir: {}",
@@ -5850,6 +5849,7 @@ async fn run_initdb(
         superuser: &conf.superuser,
         locale: &conf.locale,
         initdb_bin: &initdb_bin_path,
+        flavor: initdb_flavor,
         pg_version,
         library_search_path: &initdb_lib_dir,
         pgdata: initdb_target_dir,

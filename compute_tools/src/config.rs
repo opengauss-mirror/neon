@@ -51,10 +51,58 @@ pub fn write_postgres_conf(
     // File::create() destroys the file content if it exists.
     let mut file = File::create(path)?;
 
-    // Write the postgresql.conf content from the spec file as is.
+    // Check if we're using openGauss
+    let is_opengauss = params.pgbin.contains("gaussdb") || params.pgbin.contains("openGauss");
+
+    // Write the postgresql.conf content from the spec file.
+    // For openGauss, filter out parameters that should only be in recovery.conf
     if let Some(conf) = &spec.cluster.postgresql_conf {
+        if is_opengauss && matches!(spec.mode, ComputeMode::Replica) {
+            // Filter out parameters that openGauss doesn't support in postgresql.conf
+            // These parameters belong in recovery.conf for openGauss
+            let filtered_conf: String = conf
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.starts_with("primary_conninfo") &&
+                    !trimmed.starts_with("primary_slot_name")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            writeln!(file, "{}", filtered_conf)?;
+        } else {
         writeln!(file, "{conf}")?;
+        }
     }
+
+    // For OpenGauss: Disable audit and double write functionality as they're not needed in Neon
+    writeln!(file, "# OpenGauss settings for Neon")?;
+    writeln!(file, "audit_enabled = off")?;
+    writeln!(file, "enable_double_write = off")?;
+    writeln!(file, "enable_incremental_checkpoint = off")?;
+    writeln!(file, "enable_ustore = off")?;
+    writeln!(file, "log_statement = 'all'")?;
+    writeln!(file, "log_min_messages = 'DEBUG1'")?;
+    
+    // [LAYERDBG] Disable index scans to force SeqScan for debugging table loss issue
+    // This is a temporary setting for debugging purposes
+    writeln!(file, "# [LAYERDBG] Disable index scans for debugging")?;
+    writeln!(file, "enable_indexscan = off")?;
+    writeln!(file, "enable_indexonlyscan = off")?;
+    writeln!(file, "enable_bitmapscan = off")?;
+
+    // Logging configuration
+    writeln!(file, "# Logging configuration")?;
+    writeln!(file, "logging_collector = on")?;
+    writeln!(file, "log_directory = 'pg_log'")?;
+    writeln!(file, "log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'")?;
+    writeln!(file, "log_rotation_size = 100MB")?;
+    writeln!(file, "log_rotation_age = 1d")?;
+    writeln!(file, "log_destination = 'stderr'")?;
+    writeln!(file, "log_min_messages = debug1")?;
+    writeln!(file, "log_min_error_statement = error")?;
+    writeln!(file, "log_min_duration_statement = 0")?;
+    writeln!(file, "log_line_prefix = '%m [%p] [%c] [%l] [%d] [%u] [%r] '")?;
 
     // Stripe size GUC should be defined prior to connection string
     if let Some(stripe_size) = spec.shard_stripe_size {

@@ -165,12 +165,12 @@ extern neon_per_backend_counters *neon_per_backend_counters_shared;
  * for prepared transactions, because they're not real processes and cannot do
  * I/O.
  */
-#define NUM_NEON_PERF_COUNTER_SLOTS (MaxBackends + NUM_AUXILIARY_PROCS)
+#define NUM_NEON_PERF_COUNTER_SLOTS (g_instance.shmem_cxt.MaxBackends + NUM_AUXILIARY_PROCS)
 
 #if PG_VERSION_NUM >= 170000
 #define MyNeonCounters (&neon_per_backend_counters_shared[MyProcNumber])
 #else
-#define MyNeonCounters (&neon_per_backend_counters_shared[MyProc->pgprocno])
+#define MyNeonCounters (&neon_per_backend_counters_shared[t_thrd.proc->pgprocno])
 #endif
 
 extern void inc_getpage_wait(uint64 latency);

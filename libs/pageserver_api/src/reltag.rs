@@ -182,6 +182,8 @@ pub enum SlruKind {
     Clog = 0,
     MultiXactMembers,
     MultiXactOffsets,
+    /// openGauss CSN (Commit Sequence Number) log
+    Csnlog,
 }
 
 impl fmt::Display for SlruKind {
@@ -190,6 +192,7 @@ impl fmt::Display for SlruKind {
             Self::Clog => write!(f, "pg_xact"),
             Self::MultiXactMembers => write!(f, "pg_multixact/members"),
             Self::MultiXactOffsets => write!(f, "pg_multixact/offsets"),
+            Self::Csnlog => write!(f, "pg_csnlog"),
         }
     }
 }

@@ -9,7 +9,7 @@ use std::process::Child;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use compute_api::responses::TlsConfig;
 use compute_api::spec::{
     Database, DatabricksSettings, GenericOption, GenericOptions, PgIdent, Role,
@@ -562,9 +562,16 @@ pub async fn tune_pgbouncer(
 /// and send them to the logger. In the future we may also want to add context to
 /// these logs.
 pub fn handle_postgres_logs(stderr: std::process::ChildStderr) -> JoinHandle<Result<()>> {
+    handle_postgres_logs_with_file(stderr, None)
+}
+
+pub fn handle_postgres_logs_with_file(
+    stderr: std::process::ChildStderr,
+    log_file_path: Option<std::path::PathBuf>,
+) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let stderr = tokio::process::ChildStderr::from_std(stderr)?;
-        handle_postgres_logs_async(stderr).await
+        handle_postgres_logs_async(stderr, log_file_path).await
     })
 }
 
@@ -572,11 +579,32 @@ pub fn handle_postgres_logs(stderr: std::process::ChildStderr) -> JoinHandle<Res
 /// - next line starts with timestamp
 /// - EOF
 /// - no new lines were written for the last 100 milliseconds
-async fn handle_postgres_logs_async(stderr: tokio::process::ChildStderr) -> Result<()> {
+async fn handle_postgres_logs_async(
+    stderr: tokio::process::ChildStderr,
+    log_file_path: Option<std::path::PathBuf>,
+) -> Result<()> {
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     let timeout_duration = Duration::from_millis(100);
     let ts_regex =
         regex::Regex::new(r"^\d+-\d{2}-\d{2} \d{2}:\d{2}:\d{2}").expect("regex is valid");
+
+    // Open log file if path is provided
+    let mut log_file: Option<tokio::fs::File> = if let Some(ref path) = log_file_path {
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        Some(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .with_context(|| format!("Failed to open log file: {}", path.display()))?,
+        )
+    } else {
+        None
+    };
 
     let mut buf = vec![];
     loop {
@@ -591,9 +619,12 @@ async fn handle_postgres_logs_async(stderr: tokio::process::ChildStderr) -> Resu
         };
 
         if !buf.is_empty() && should_flush_buf {
+            // Save buf content before clearing
+            let buf_content = buf.clone();
+            
             // join multiline message into a single line, separated by unicode Zero Width Space.
             // "PG:" suffix is used to distinguish postgres logs from other logs.
-            let combined = format!("PG:{}\n", buf.join("\u{200B}"));
+            let combined = format!("PG:{}\n", buf_content.join("\u{200B}"));
             buf.clear();
 
             // sync write to stderr to avoid interleaving with other logs
@@ -601,6 +632,15 @@ async fn handle_postgres_logs_async(stderr: tokio::process::ChildStderr) -> Resu
             let res = std::io::stderr().lock().write_all(combined.as_bytes());
             if let Err(e) = res {
                 tracing::error!("error while writing to stderr: {}", e);
+            }
+
+            // Also write to log file if provided
+            if let Some(ref mut file) = log_file {
+                // Write raw lines (without "PG:" prefix) to the log file
+                let raw_combined = format!("{}\n", buf_content.join("\n"));
+                if let Err(e) = tokio::io::AsyncWriteExt::write_all(file, raw_combined.as_bytes()).await {
+                    tracing::error!("error while writing to log file: {}", e);
+                }
             }
         }
 

@@ -18,7 +18,7 @@ use clap::Parser;
 use compute_api::requests::ComputeClaimsScope;
 use compute_api::spec::{ComputeMode, PageserverProtocol};
 use control_plane::broker::StorageBroker;
-use control_plane::endpoint::{ComputeControlPlane, EndpointTerminateMode};
+use control_plane::endpoint::{ComputeControlPlane, EndpointStatus, EndpointTerminateMode};
 use control_plane::endpoint_storage::{ENDPOINT_STORAGE_DEFAULT_ADDR, EndpointStorage};
 use control_plane::local_env;
 use control_plane::local_env::{
@@ -40,7 +40,7 @@ use pageserver_api::controller_api::{
     NodeAvailabilityWrapper, PlacementPolicy, TenantCreateRequest,
 };
 use pageserver_api::models::{
-    ShardParameters, TenantConfigRequest, TimelineCreateRequest, TimelineInfo,
+    ShardParameters, TenantConfigRequest, TenantWaitLsnRequest, TimelineCreateRequest, TimelineInfo,
 };
 use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardStripeSize, TenantShardId};
 use postgres_backend::AuthType;
@@ -52,6 +52,7 @@ use safekeeper_api::{
 };
 use storage_broker::DEFAULT_LISTEN_ADDR as DEFAULT_BROKER_ADDR;
 use tokio::task::JoinSet;
+use tokio_opengauss::NoTls;
 use url::Host;
 use utils::auth::{Claims, Scope};
 use utils::id::{NodeId, TenantId, TenantTimelineId, TimelineId};
@@ -65,8 +66,8 @@ const DEFAULT_BRANCH_NAME: &str = "main";
 project_git_version!(GIT_VERSION);
 
 #[allow(dead_code)]
-const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG17;
-const DEFAULT_PG_VERSION_NUM: &str = "17";
+const DEFAULT_PG_VERSION: PgMajorVersion = PgMajorVersion::PG14;
+const DEFAULT_PG_VERSION_NUM: &str = "14";
 
 const DEFAULT_PAGESERVER_CONTROL_PLANE_API: &str = "http://127.0.0.1:1234/upcall/v1/";
 
@@ -1366,8 +1367,104 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                     anyhow!("Found no timeline id for branch name '{ancestor_branch_name}'")
                 })?;
 
-            let start_lsn = args.ancestor_start_lsn;
             let storage_controller = StorageController::from_env(env);
+
+            // If no explicit start LSN is provided, try to sync with the running endpoint's current LSN
+            let start_lsn = if args.ancestor_start_lsn.is_some() {
+                args.ancestor_start_lsn
+            } else {
+                // Try to find a running endpoint on the ancestor timeline to get its current LSN
+                let cplane = ComputeControlPlane::load(env.clone())?;
+                let mut endpoint_lsn: Option<Lsn> = None;
+
+                for endpoint in cplane.endpoints.values() {
+                    if endpoint.tenant_id == tenant_id
+                        && endpoint.timeline_id == ancestor_timeline_id
+                        && endpoint.status() == EndpointStatus::Running
+                    {
+                        // Found a running endpoint, try to get its flush LSN
+                        let connstr = format!(
+                            "host=127.0.0.1 port={} user=cloud_admin dbname=postgres",
+                            endpoint.pg_address.port()
+                        );
+                        match tokio_opengauss::connect(&connstr, NoTls).await {
+                            Ok((client, connection)) => {
+                                // Spawn connection handler
+                                tokio::spawn(async move {
+                                    if let Err(e) = connection.await {
+                                        eprintln!("connection error: {}", e);
+                                    }
+                                });
+
+                                // Query current flush LSN (openGauss uses pg_get_flush_lsn())
+                                match client.query_one("SELECT pg_get_flush_lsn()", &[]).await {
+                                    Ok(row) => {
+                                        let lsn_str: String = row.get(0);
+                                        // Parse LSN format like "00000000/04BEFAA0" or "0/4BEFAA0"
+                                        if let Ok(lsn) = Lsn::from_str(&lsn_str.replace("00000000/", "0/")) {
+                                            println!("Syncing branch point with endpoint flush LSN: {}", lsn);
+                                            endpoint_lsn = Some(lsn);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: Failed to get flush LSN from endpoint: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Failed to connect to endpoint: {}", e);
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                // If we got an LSN from the endpoint, wait for pageserver to sync
+                if let Some(lsn) = endpoint_lsn {
+                    println!("Waiting for pageserver to sync WAL to {}...", lsn);
+                    println!("(This may take a while for large transactions)");
+                    
+                    let pageserver = get_default_pageserver(env);
+                    let tenant_shard_id = TenantShardId::unsharded(tenant_id);
+                    
+                    // Use longer timeout (5 minutes) and retry mechanism for large WAL volumes
+                    let max_retries = 3;
+                    let timeout_per_attempt = Duration::from_secs(120); // 2 minutes per attempt
+                    let mut success = false;
+                    
+                    for attempt in 1..=max_retries {
+                        let mut timelines = HashMap::new();
+                        timelines.insert(ancestor_timeline_id, lsn);
+                        let wait_req = TenantWaitLsnRequest {
+                            timelines,
+                            timeout: timeout_per_attempt,
+                        };
+                        
+                        match pageserver.http_client.wait_lsn(tenant_shard_id, wait_req).await {
+                            Ok(_) => {
+                                println!("WAL sync complete.");
+                                success = true;
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt < max_retries {
+                                    println!("Attempt {}/{}: still waiting... ({})", attempt, max_retries, e);
+                                } else {
+                                    eprintln!("Warning: wait_lsn failed after {} attempts: {}", max_retries, e);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !success {
+                        eprintln!("Proceeding with branch creation anyway. Data may be incomplete.");
+                    }
+                }
+
+                // Use the endpoint LSN as the branch point to ensure data consistency
+                endpoint_lsn
+            };
+
             let create_req = TimelineCreateRequest {
                 new_timeline_id,
                 mode: pageserver_api::models::TimelineCreateRequestMode::Branch {
@@ -1537,6 +1634,15 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .endpoints
                 .get(endpoint_id.as_str())
                 .ok_or_else(|| anyhow!("endpoint {endpoint_id} not found"))?;
+
+            // If the endpoint is in Crashed state, clean up the pidfile so it can be restarted
+            if endpoint.status() == EndpointStatus::Crashed {
+                let pidfile_path = endpoint.pgdata().join("postmaster.pid");
+                if pidfile_path.exists() {
+                    std::fs::remove_file(&pidfile_path)
+                        .with_context(|| format!("failed to remove crashed pidfile: {}", pidfile_path.display()))?;
+                }
+            }
 
             if !args.allow_multiple {
                 cplane.check_conflicting_endpoints(

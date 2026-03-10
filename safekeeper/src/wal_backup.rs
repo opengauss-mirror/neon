@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt;
 use futures::stream::{self, FuturesOrdered};
-use postgres_ffi::v14::xlog_utils::XLogSegNoOffsetToRecPtr;
+use postgres_ffi::V702::xlog_utils::XLogSegNoOffsetToRecPtr;
 use postgres_ffi::{PG_TLI, XLogFileName, XLogSegNo};
 use remote_storage::{
     DownloadOpts, GenericRemoteStorage, ListingMode, RemotePath, StorageMetadata,

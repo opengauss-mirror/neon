@@ -98,7 +98,7 @@ impl Leadership {
         if let Err(DatabaseError::Query(diesel::result::Error::DatabaseError(_kind, ref err))) = res
         {
             const REL_NOT_FOUND_MSG: &str = "relation \"controllers\" does not exist";
-            if err.message().trim() == REL_NOT_FOUND_MSG {
+            if err.message().contains(REL_NOT_FOUND_MSG) {
                 // Special case: if this is a brand new storage controller, migrations will not
                 // have run at this point yet, and, hence, the controllers table does not exist.
                 // Detect this case via the error string (diesel doesn't type it) and allow it.

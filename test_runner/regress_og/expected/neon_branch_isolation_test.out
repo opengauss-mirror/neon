@@ -1,0 +1,261 @@
+-- Neon Branch Isolation Test
+-- Tests that CRUD operations on main and child branches are completely isolated
+-- Setup: Create initial data on main branch
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin".
+SET client_min_messages = WARNING;
+SET
+DROP TABLE IF EXISTS isolation_test CASCADE;
+DROP TABLE
+CREATE TABLE isolation_test (
+    id SERIAL PRIMARY KEY,
+    category TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    description TEXT
+);
+CREATE TABLE
+INSERT INTO isolation_test (category, value, description) VALUES
+    ('initial', 1, 'Row 1'),
+    ('initial', 2, 'Row 2'),
+    ('initial', 3, 'Row 3'),
+    ('initial', 4, 'Row 4'),
+    ('initial', 5, 'Row 5');
+INSERT 0 5
+SELECT * FROM isolation_test ORDER BY id;
+ id | category | value | description 
+----+----------+-------+-------------
+  1 | initial  |     1 | Row 1
+  2 | initial  |     2 | Row 2
+  3 | initial  |     3 | Row 3
+  4 | initial  |     4 | Row 4
+  5 | initial  |     5 | Row 5
+(5 rows)
+
+-- Create child branch
+\! neon_local timeline branch --branch-name isolation_test_branch
+Syncing branch point with endpoint flush LSN: 0/26F4770
+Waiting for pageserver to sync WAL to 0/26F4770...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '78f17303e90afa21115a81dc0addd6e6' at Lsn 0/26F4770 for tenant: f3486518192114c70781d746427d635d. Ancestor timeline: 'main'
+\! neon_local endpoint create ep-isolation-test --branch-name isolation_test_branch --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep-isolation-test
+Starting existing endpoint ep-isolation-test...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+\! sleep 5
+-- Verify branch inherited data
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SET client_min_messages = WARNING;
+SET
+SELECT 'BRANCH - Inherited data:' AS info;
+           info           
+--------------------------
+ BRANCH - Inherited data:
+(1 row)
+
+SELECT * FROM isolation_test ORDER BY id;
+ id | category | value | description 
+----+----------+-------+-------------
+  1 | initial  |     1 | Row 1
+  2 | initial  |     2 | Row 2
+  3 | initial  |     3 | Row 3
+  4 | initial  |     4 | Row 4
+  5 | initial  |     5 | Row 5
+(5 rows)
+
+-- Main branch CRUD operations
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SET client_min_messages = WARNING;
+SET
+INSERT INTO isolation_test (category, value, description) VALUES
+    ('main_insert', 100, 'Main insert 1'),
+    ('main_insert', 101, 'Main insert 2');
+INSERT 0 2
+UPDATE isolation_test 
+SET value = value + 1000, description = description || ' [MAIN UPDATE]'
+WHERE category = 'initial' AND id <= 2;
+UPDATE 2
+DELETE FROM isolation_test WHERE id = 3;
+DELETE 1
+SELECT 'MAIN - After CRUD:' AS info;
+        info        
+--------------------
+ MAIN - After CRUD:
+(1 row)
+
+SELECT * FROM isolation_test ORDER BY id;
+ id |  category   | value |     description     
+----+-------------+-------+---------------------
+  1 | initial     |  1001 | Row 1 [MAIN UPDATE]
+  2 | initial     |  1002 | Row 2 [MAIN UPDATE]
+  4 | initial     |     4 | Row 4
+  5 | initial     |     5 | Row 5
+  6 | main_insert |   100 | Main insert 1
+  7 | main_insert |   101 | Main insert 2
+(6 rows)
+
+-- Verify branch NOT affected by main CRUD
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SET client_min_messages = WARNING;
+SET
+SELECT 'BRANCH - After main CRUD (should be unchanged):' AS info;
+                      info                       
+-------------------------------------------------
+ BRANCH - After main CRUD (should be unchanged):
+(1 row)
+
+SELECT * FROM isolation_test ORDER BY id;
+ id | category | value | description 
+----+----------+-------+-------------
+  1 | initial  |     1 | Row 1
+  2 | initial  |     2 | Row 2
+  3 | initial  |     3 | Row 3
+  4 | initial  |     4 | Row 4
+  5 | initial  |     5 | Row 5
+(5 rows)
+
+SELECT 'BRANCH - Check main_insert (should be 0):' AS info;
+                   info                    
+-------------------------------------------
+ BRANCH - Check main_insert (should be 0):
+(1 row)
+
+SELECT COUNT(*) FROM isolation_test WHERE category = 'main_insert';
+ count 
+-------
+     0
+(1 row)
+
+SELECT 'BRANCH - Check id=3 exists (should be 1):' AS info;
+                   info                    
+-------------------------------------------
+ BRANCH - Check id=3 exists (should be 1):
+(1 row)
+
+SELECT COUNT(*) FROM isolation_test WHERE id = 3;
+ count 
+-------
+     1
+(1 row)
+
+-- Branch CRUD operations
+INSERT INTO isolation_test (category, value, description) VALUES
+    ('branch_insert', 200, 'Branch insert 1'),
+    ('branch_insert', 201, 'Branch insert 2');
+INSERT 0 2
+UPDATE isolation_test 
+SET value = value + 2000, description = description || ' [BRANCH UPDATE]'
+WHERE category = 'initial' AND id IN (4, 5);
+UPDATE 2
+DELETE FROM isolation_test WHERE id = 1;
+DELETE 1
+SELECT 'BRANCH - After CRUD:' AS info;
+         info         
+----------------------
+ BRANCH - After CRUD:
+(1 row)
+
+SELECT * FROM isolation_test ORDER BY id;
+ id |   category    | value |      description      
+----+---------------+-------+-----------------------
+  2 | initial       |     2 | Row 2
+  3 | initial       |     3 | Row 3
+  4 | initial       |  2004 | Row 4 [BRANCH UPDATE]
+  5 | initial       |  2005 | Row 5 [BRANCH UPDATE]
+  6 | branch_insert |   200 | Branch insert 1
+  7 | branch_insert |   201 | Branch insert 2
+(6 rows)
+
+-- Verify main NOT affected by branch CRUD
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SET client_min_messages = WARNING;
+SET
+SELECT 'MAIN - After branch CRUD (should be unchanged):' AS info;
+                      info                       
+-------------------------------------------------
+ MAIN - After branch CRUD (should be unchanged):
+(1 row)
+
+SELECT * FROM isolation_test ORDER BY id;
+ id |  category   | value |     description     
+----+-------------+-------+---------------------
+  1 | initial     |  1001 | Row 1 [MAIN UPDATE]
+  2 | initial     |  1002 | Row 2 [MAIN UPDATE]
+  4 | initial     |     4 | Row 4
+  5 | initial     |     5 | Row 5
+  6 | main_insert |   100 | Main insert 1
+  7 | main_insert |   101 | Main insert 2
+(6 rows)
+
+SELECT 'MAIN - Check branch_insert (should be 0):' AS info;
+                   info                    
+-------------------------------------------
+ MAIN - Check branch_insert (should be 0):
+(1 row)
+
+SELECT COUNT(*) FROM isolation_test WHERE category = 'branch_insert';
+ count 
+-------
+     0
+(1 row)
+
+SELECT 'MAIN - Check id=1 exists (should be 1):' AS info;
+                  info                   
+-----------------------------------------
+ MAIN - Check id=1 exists (should be 1):
+(1 row)
+
+SELECT COUNT(*) FROM isolation_test WHERE id = 1;
+ count 
+-------
+     1
+(1 row)
+
+-- Final state comparison
+SELECT 'MAIN - Final summary:' AS info;
+         info          
+-----------------------
+ MAIN - Final summary:
+(1 row)
+
+SELECT category, COUNT(*) AS count FROM isolation_test GROUP BY category ORDER BY category;
+  category   | count 
+-------------+-------
+ initial     |     4
+ main_insert |     2
+(2 rows)
+
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SET client_min_messages = WARNING;
+SET
+SELECT 'BRANCH - Final summary:' AS info;
+          info           
+-------------------------
+ BRANCH - Final summary:
+(1 row)
+
+SELECT category, COUNT(*) AS count FROM isolation_test GROUP BY category ORDER BY category;
+   category    | count 
+---------------+-------
+ branch_insert |     2
+ initial       |     4
+(2 rows)
+
+-- Cleanup: Ensure on main branch before stopping branch endpoint
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SET client_min_messages = WARNING;
+SET
+DROP TABLE IF EXISTS isolation_test CASCADE;
+DROP TABLE
+\! neon_local endpoint stop ep-isolation-test --mode immediate --destroy 2>&1 || true
+
+compute_ctl stopped
+Destroying postgres data directory 'NEON_ROOT/.neon/endpoints/ep-isolation-test/pgdata'
+null
+total time: 14921  ms

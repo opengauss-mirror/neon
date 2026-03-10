@@ -1,0 +1,285 @@
+-- ============================================================================
+-- Neon Test Helper Functions
+-- ============================================================================
+-- This script creates helper functions used by other test cases.
+-- It MUST run after neon_setup.sql
+--
+-- Functions provided:
+--   - record_test_start(): Start tracking a test
+--   - record_test_end(): End tracking a test with result
+--   - assert_equals(): Compare two values
+--   - assert_true(): Verify condition is true
+--   - assert_row_count(): Verify table has expected row count
+-- ============================================================================
+
+\echo '=============================================='
+\echo '  Creating Test Helper Functions'
+\echo '=============================================='
+
+SET search_path TO neon_test, public;
+
+-- Record start of this helper test
+INSERT INTO neon_test.test_results (test_name, test_phase, test_status, message)
+VALUES ('neon_test_helpers', 'initialization', 'RUNNING', 'Creating helper functions');
+
+-- ============================================================================
+-- Test Recording Functions
+-- ============================================================================
+\echo '--- Creating Test Recording Functions ---'
+
+-- Function to record test start
+CREATE OR REPLACE FUNCTION neon_test.record_test_start(
+    p_test_name VARCHAR(100),
+    p_phase VARCHAR(50) DEFAULT 'testing'
+) RETURNS INT AS $$
+DECLARE
+    v_id INT;
+BEGIN
+    INSERT INTO neon_test.test_results (test_name, test_phase, test_status, message)
+    VALUES (p_test_name, p_phase, 'RUNNING', 'Test started')
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to record test end
+CREATE OR REPLACE FUNCTION neon_test.record_test_end(
+    p_test_id INT,
+    p_status VARCHAR(20),
+    p_message TEXT DEFAULT NULL
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE neon_test.test_results
+    SET test_status = p_status,
+        end_time = CURRENT_TIMESTAMP,
+        duration_ms = EXTRACT(MILLISECONDS FROM (CURRENT_TIMESTAMP - start_time))::INT,
+        message = COALESCE(p_message, message)
+    WHERE id = p_test_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Convenience function to record a passed test
+CREATE OR REPLACE FUNCTION neon_test.record_test_passed(
+    p_test_name VARCHAR(100),
+    p_message TEXT DEFAULT 'Test passed'
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO neon_test.test_results (test_name, test_phase, test_status, message, end_time, duration_ms)
+    VALUES (p_test_name, 'testing', 'PASSED', p_message, CURRENT_TIMESTAMP, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Convenience function to record a failed test
+CREATE OR REPLACE FUNCTION neon_test.record_test_failed(
+    p_test_name VARCHAR(100),
+    p_message TEXT DEFAULT 'Test failed'
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO neon_test.test_results (test_name, test_phase, test_status, message, end_time, duration_ms)
+    VALUES (p_test_name, 'testing', 'FAILED', p_message, CURRENT_TIMESTAMP, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================================
+-- Assertion Functions
+-- ============================================================================
+\echo '--- Creating Assertion Functions ---'
+
+-- Assert two values are equal
+CREATE OR REPLACE FUNCTION neon_test.assert_equals(
+    p_expected TEXT,
+    p_actual TEXT,
+    p_message TEXT DEFAULT 'Values should be equal'
+) RETURNS BOOLEAN AS $$
+BEGIN
+    IF p_expected IS DISTINCT FROM p_actual THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - Expected: %, Actual: %', p_message, p_expected, p_actual;
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Assert condition is true
+CREATE OR REPLACE FUNCTION neon_test.assert_true(
+    p_condition BOOLEAN,
+    p_message TEXT DEFAULT 'Condition should be true'
+) RETURNS BOOLEAN AS $$
+BEGIN
+    IF NOT p_condition THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: %', p_message;
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Assert condition is false
+CREATE OR REPLACE FUNCTION neon_test.assert_false(
+    p_condition BOOLEAN,
+    p_message TEXT DEFAULT 'Condition should be false'
+) RETURNS BOOLEAN AS $$
+BEGIN
+    IF p_condition THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: %', p_message;
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Assert a value is NULL
+CREATE OR REPLACE FUNCTION neon_test.assert_null(
+    p_value ANYELEMENT,
+    p_message TEXT DEFAULT 'Value should be NULL'
+) RETURNS BOOLEAN AS $$
+BEGIN
+    IF p_value IS NOT NULL THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - Got: %', p_message, p_value;
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Assert a value is NOT NULL
+CREATE OR REPLACE FUNCTION neon_test.assert_not_null(
+    p_value ANYELEMENT,
+    p_message TEXT DEFAULT 'Value should not be NULL'
+) RETURNS BOOLEAN AS $$
+BEGIN
+    IF p_value IS NULL THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: %', p_message;
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================================
+-- Table Utility Functions
+-- ============================================================================
+\echo '--- Creating Table Utility Functions ---'
+
+-- Assert table has expected row count
+-- Note: p_table_name can be 'schema.table' format or just 'table'
+CREATE OR REPLACE FUNCTION neon_test.assert_row_count(
+    p_table_name TEXT,
+    p_expected_count BIGINT,
+    p_message TEXT DEFAULT NULL
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_actual_count BIGINT;
+    v_msg TEXT;
+    v_schema TEXT;
+    v_table TEXT;
+    v_parts TEXT[];
+BEGIN
+    -- Parse schema.table format
+    v_parts := string_to_array(p_table_name, '.');
+    IF array_length(v_parts, 1) = 2 THEN
+        v_schema := v_parts[1];
+        v_table := v_parts[2];
+        EXECUTE format('SELECT COUNT(*) FROM %I.%I', v_schema, v_table) INTO v_actual_count;
+    ELSE
+        -- Just table name, use current search_path
+        EXECUTE format('SELECT COUNT(*) FROM %I', p_table_name) INTO v_actual_count;
+    END IF;
+    
+    v_msg := COALESCE(p_message, 'Row count mismatch for table ' || p_table_name);
+    
+    IF v_actual_count != p_expected_count THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - Expected: %, Actual: %', v_msg, p_expected_count, v_actual_count;
+    END IF;
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Check if table exists
+CREATE OR REPLACE FUNCTION neon_test.table_exists(
+    p_schema TEXT,
+    p_table TEXT
+) RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM pg_tables 
+        WHERE schemaname = p_schema AND tablename = p_table
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Check if index exists
+CREATE OR REPLACE FUNCTION neon_test.index_exists(
+    p_schema TEXT,
+    p_index TEXT
+) RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE schemaname = p_schema AND indexname = p_index
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================================
+-- Test Summary Function
+-- ============================================================================
+\echo '--- Creating Summary Functions ---'
+
+-- Get test summary
+CREATE OR REPLACE FUNCTION neon_test.get_test_summary()
+RETURNS TABLE (
+    phase VARCHAR(50),
+    total_tests BIGINT,
+    passed BIGINT,
+    failed BIGINT,
+    running BIGINT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        tr.test_phase,
+        COUNT(*) AS total_tests,
+        COUNT(*) FILTER (WHERE tr.test_status = 'PASSED') AS passed,
+        COUNT(*) FILTER (WHERE tr.test_status = 'FAILED') AS failed,
+        COUNT(*) FILTER (WHERE tr.test_status = 'RUNNING') AS running
+    FROM neon_test.test_results tr
+    GROUP BY tr.test_phase
+    ORDER BY tr.test_phase;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================================
+-- Verify Helper Functions
+-- ============================================================================
+\echo '--- Verifying Helper Functions ---'
+
+-- Test assert_equals
+SELECT neon_test.assert_equals('test', 'test', 'String comparison') AS test_assert_equals;
+
+-- Test assert_true
+SELECT neon_test.assert_true(1 = 1, 'One equals one') AS test_assert_true;
+
+-- Test table_exists
+SELECT neon_test.table_exists('neon_test', 'test_results') AS test_results_exists;
+
+
+-- ============================================================================
+-- Update Test Status
+-- ============================================================================
+
+UPDATE neon_test.test_results 
+SET test_status = 'PASSED',
+    end_time = CURRENT_TIMESTAMP,
+    duration_ms = EXTRACT(MILLISECONDS FROM (CURRENT_TIMESTAMP - start_time))::INT,
+    message = 'Helper functions created and verified'
+WHERE test_name = 'neon_test_helpers';
+
+-- Show current test results
+SELECT test_name, test_phase, test_status, message 
+FROM neon_test.test_results 
+ORDER BY id;
+
+\echo '=============================================='
+\echo '  Test Helper Functions Ready'
+\echo '=============================================='
+

@@ -15,17 +15,19 @@
 
 #include "pagestore_client.h"
 #include RELFILEINFO_HDR
-#include "storage/smgr.h"
-#include "storage/lwlock.h"
+#include "storage/smgr/smgr.h"
+#include "storage/lock/lwlock.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
-#include "catalog/pg_tablespace_d.h"
+// #include "catalog/pg_tablespace_d.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
 
 #if PG_VERSION_NUM >= 150000
 #include "miscadmin.h"
 #endif
+
+typedef LWLock *LWLockId;
 
 typedef struct
 {
@@ -70,7 +72,8 @@ RelsizeCacheShmemInit(void)
 	relsize_ctl = (RelSizeHashControl *) ShmemInitStruct("relsize_hash", sizeof(RelSizeHashControl), &found);
 	if (!found)
 	{
-		relsize_lock = (LWLockId) GetNamedLWLockTranche("neon_relsize");
+		// relsize_lock = (LWLockId) GetNamedLWLockTranche("neon_relsize");
+		relsize_lock = (LWLockId) LWLockAssign(LWTRANCHE_NEON_RELSIZE);
 		info.keysize = sizeof(RelTag);
 		info.entrysize = sizeof(RelSizeEntry);
 		relsize_hash = ShmemInitHash("neon_relsize",
@@ -83,6 +86,8 @@ RelsizeCacheShmemInit(void)
 		relsize_ctl->writes = 0;
 		dlist_init(&relsize_ctl->lru);
 	}
+	ereport(INFO,
+		(errmsg("RelsizeCacheShmemInit %p, %p, %p, %s", relsize_hash->hctl, relsize_hash->hash, relsize_hash->keycopy, relsize_hash->tabname)));
 }
 
 bool
@@ -90,7 +95,8 @@ get_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber *size)
 {
 	bool		found = false;
 
-	if (relsize_hash_size > 0)
+	/* Check if shared memory is initialized */
+	if (relsize_hash_size > 0 && relsize_hash != NULL && relsize_lock != NULL)
 	{
 		RelTag		tag;
 		RelSizeEntry *entry;
@@ -99,7 +105,7 @@ get_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber *size)
 		tag.forknum = forknum;
 		/* We need exclusive lock here because of LRU list manipulation */
 		LWLockAcquire(relsize_lock, LW_EXCLUSIVE);
-		entry = hash_search(relsize_hash, &tag, HASH_FIND, NULL);
+		entry = (RelSizeEntry *)hash_search(relsize_hash, &tag, HASH_FIND, NULL);
 		if (entry != NULL)
 		{
 			*size = entry->size;
@@ -121,7 +127,8 @@ get_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber *size)
 void
 set_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size)
 {
-	if (relsize_hash_size > 0)
+	/* Check if shared memory is initialized */
+	if (relsize_hash_size > 0 && relsize_hash != NULL && relsize_lock != NULL)
 	{
 		RelTag		tag;
 		RelSizeEntry *entry;
@@ -134,7 +141,7 @@ set_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size)
 		 * This should actually never happen! Below we check if hash is full and delete least recently user item in this case.
 		 * But for further safety we also perform check here.
 		 */
-		while ((entry = hash_search(relsize_hash, &tag, HASH_ENTER_NULL, &found)) == NULL)
+		while ((entry = (RelSizeEntry *)hash_search(relsize_hash, &tag, HASH_ENTER_NULL, &found)) == NULL)
 		{
 			RelSizeEntry *victim = dlist_container(RelSizeEntry, lru_node, dlist_pop_head_node(&relsize_ctl->lru));
 			hash_search(relsize_hash, &victim->tag, HASH_REMOVE, NULL);
@@ -169,7 +176,8 @@ set_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size)
 void
 update_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size)
 {
-	if (relsize_hash_size > 0)
+	/* Check if shared memory is initialized */
+	if (relsize_hash_size > 0 && relsize_hash != NULL && relsize_lock != NULL)
 	{
 		RelTag		tag;
 		RelSizeEntry *entry;
@@ -178,7 +186,7 @@ update_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size)
 		tag.rinfo = rinfo;
 		tag.forknum = forknum;
 		LWLockAcquire(relsize_lock, LW_EXCLUSIVE);
-		entry = hash_search(relsize_hash, &tag, HASH_ENTER, &found);
+		entry = (RelSizeEntry *)hash_search(relsize_hash, &tag, HASH_ENTER, &found);
 		if (!found || entry->size < size)
 			entry->size = size;
 		if (!found)
@@ -203,14 +211,15 @@ update_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size)
 void
 forget_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum)
 {
-	if (relsize_hash_size > 0)
+	/* Check if shared memory is initialized */
+	if (relsize_hash_size > 0 && relsize_hash != NULL && relsize_lock != NULL)
 	{
 		RelTag		tag;
 		RelSizeEntry *entry;
 		tag.rinfo = rinfo;
 		tag.forknum = forknum;
 		LWLockAcquire(relsize_lock, LW_EXCLUSIVE);
-		entry = hash_search(relsize_hash, &tag, HASH_REMOVE, NULL);
+		entry = (RelSizeEntry *)hash_search(relsize_hash, &tag, HASH_REMOVE, NULL);
 		if (entry)
 		{
 			dlist_delete(&entry->lru_node);
@@ -223,6 +232,12 @@ forget_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum)
 void
 relsize_hash_init(void)
 {
+	static bool initialized = false;
+	
+	// Prevent re-initialization in OpenGauss which may call _PG_init() multiple times
+	if (initialized)
+		return;
+	
 	DefineCustomIntVariable("neon.relsize_hash_size",
 							"Sets the maximum number of cached relation sizes for neon",
 							NULL,
@@ -233,6 +248,8 @@ relsize_hash_init(void)
 							PGC_POSTMASTER,
 							0,
 							NULL, NULL, NULL);
+	
+	initialized = true;
 }
 
 /*
@@ -243,5 +260,6 @@ void
 RelsizeCacheShmemRequest(void)
 {
 	RequestAddinShmemSpace(sizeof(RelSizeHashControl) + hash_estimate_size(relsize_hash_size, sizeof(RelSizeEntry)));
-	RequestNamedLWLockTranche("neon_relsize", 1);
+	// RequestNamedLWLockTranche("neon_relsize", 1);
+	RequestAddinLWLocks(1);
 }

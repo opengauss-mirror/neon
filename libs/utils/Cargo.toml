@@ -38,7 +38,7 @@ serde_json.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
-tokio-tar.workspace = true
+astral-tokio-tar.workspace = true
 tokio-util.workspace = true
 toml_edit = { workspace = true, features = ["serde"] }
 tracing.workspace = true

@@ -1187,7 +1187,7 @@ def wait_flush_lsn_align_by_ep(env, branch, tenant_id, timeline_id, ep, sks):
 
 
 # Test behaviour with one safekeeper down and missing a lot of WAL, exercising
-# neon_walreader and checking that pg_wal never bloats. Namely, ensures that
+# neon_walreader and checking that pg_xlog never bloats. Namely, ensures that
 # compute doesn't keep many WAL for lagging sk, but still can recover it with
 # neon_walreader, in two scenarious: a) WAL never existed on compute (it started
 # on basebackup LSN later than lagging sk position) though segment file exists
@@ -1250,7 +1250,7 @@ def test_lagging_sk(neon_env_builder: NeonEnvBuilder):
         for _ in range(0, 5):
             fill_segment(ep)
     # there shouldn't be more than 2 WAL segments (but dir may have archive_status files)
-    assert ep.get_pg_wal_size() < 16 * 2.5
+    assert ep.get_pg_xlog_size() < 16 * 2.5
 
     sk2.stop()  # stop another sk to ensure sk1 and sk3 can work
     sk1.start()
@@ -1272,7 +1272,7 @@ def test_lagging_sk(neon_env_builder: NeonEnvBuilder):
         for _ in range(0, 5):
             fill_segment(ep)
     # there shouldn't be more than 2 WAL segments (but dir may have archive_status files)
-    assert ep.get_pg_wal_size() < 16 * 2.5
+目录    assert ep.get_pg_xlog_size() < 16 * 2.5
 
     ep.stop()
     ep = env.endpoints.create_start(

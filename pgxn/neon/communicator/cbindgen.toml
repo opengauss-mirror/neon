@@ -1,4 +1,15 @@
 language = "C"
+include_guard = "NEON_COMMUNICATOR_COMMUNICATOR_BINDINGS_H"
+header = """
+#ifdef __cplusplus
+extern "C" {
+#endif
+"""
+trailer = """
+#ifdef __cplusplus
+}
+#endif
+"""
 
 [enum]
 prefix_with_name = true

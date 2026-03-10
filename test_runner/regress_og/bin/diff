@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# Custom diff tool for Neon regression tests
+#
+# This script normalizes expected and result files before comparing them.
+# Normalization rules are defined in normalize.sed
+#
+# Usage: This script is called by pg_regress instead of system diff
+#
+
+set -eu -o pipefail
+
+# Get the two files to compare (last two arguments)
+file1="${@:(-2):1}"  # expected file
+file2="${@:(-1):1}"  # result file
+
+# Get any additional diff arguments
+args=${@:1:$#-2}
+
+# Get the directory where this script is located
+BASEDIR=$(dirname "$0")
+
+# Find the system diff command
+DIFF=/usr/bin/diff
+if [ ! -f "$DIFF" ]; then
+    DIFF=$(which diff 2>/dev/null || echo "/usr/bin/diff")
+fi
+
+# Get test name from expected file
+test=$(basename "$file1" .out | sed -E "s/_[0-9]+$//")
+
+# Check if we should skip normalization (for debugging)
+if [ "${NEON_RAW_DIFF:-}" = "1" ]; then
+    exec "$DIFF" $args "$file1" "$file2"
+fi
+
+# Ensure expected file exists (for new tests)
+touch "$file1"
+
+# Choose normalize file
+normalize_file="$BASEDIR/normalize.sed"
+if [[ -f "$BASEDIR/normalize_local.sed" ]]; then
+    normalize_file="$BASEDIR/normalize_local.sed"
+fi
+
+# Create modified files with normalization applied
+sed -Ef "$normalize_file" < "$file1" > "$file1.normalized" 2>/dev/null || cp "$file1" "$file1.normalized"
+sed -Ef "$normalize_file" < "$file2" > "$file2.normalized" 2>/dev/null || cp "$file2" "$file2.normalized"
+
+# Keep unmodified copies for debugging
+cp "$file2" "$file2.unmodified" 2>/dev/null || true
+
+# Run diff on normalized files
+# -w: ignore whitespace differences
+# -u: unified format
+"$DIFF" -w $args "$file1.normalized" "$file2.normalized"
+exit_code=$?
+
+exit $exit_code
+
+

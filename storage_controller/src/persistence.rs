@@ -2,7 +2,7 @@ pub(crate) mod split_state;
 use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
-use std::sync::Arc;
+//use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diesel::deserialize::{FromSql, FromSqlRow};
@@ -10,6 +10,7 @@ use diesel::expression::AsExpression;
 use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::serialize::{IsNull, ToSql};
+use diesel::sql_types::{Array, BigInt, Bool, Integer, Nullable, Text, Timestamptz};
 use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, ManagerConfig};
@@ -26,12 +27,13 @@ use pageserver_api::models::{ShardImportStatus, TenantConfig};
 use pageserver_api::shard::{
     ShardConfigError, ShardCount, ShardIdentity, ShardNumber, ShardStripeSize, TenantShardId,
 };
-use rustls::client::WebPkiServerVerifier;
-use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::ring;
+// use rustls::client::WebPkiServerVerifier;
+// use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+// use rustls::crypto::ring;
 use safekeeper_api::membership::SafekeeperGeneration;
 use scoped_futures::ScopedBoxFuture;
 use serde::{Deserialize, Serialize};
+use tokio_opengauss::tls::NoTls;
 use utils::generation::Generation;
 use utils::id::{NodeId, TenantId, TimelineId};
 use utils::lsn::Lsn;
@@ -45,6 +47,21 @@ use crate::timeline_import::{
     TimelineImport, TimelineImportUpdateError, TimelineImportUpdateFollowUp,
 };
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
+// openGauss不支持ON CONFLICT的语法，改用ON DUPLICATE
+const UPSERT_PENDING_OP_SQL: &str = r#"
+    INSERT INTO safekeeper_timeline_pending_ops
+        (tenant_id, timeline_id, sk_id, generation, op_kind)
+    VALUES ($1, $2, $3, $4, $5)
+    ON DUPLICATE KEY UPDATE
+        generation = CASE
+            WHEN safekeeper_timeline_pending_ops.generation < $4 THEN $4
+            ELSE safekeeper_timeline_pending_ops.generation
+        END,
+        op_kind = CASE
+            WHEN safekeeper_timeline_pending_ops.generation < $4 THEN $5
+            ELSE safekeeper_timeline_pending_ops.op_kind
+        END
+"#;
 
 /// ## What do we store?
 ///
@@ -185,7 +202,7 @@ impl Persistence {
 
     pub async fn new(database_url: String) -> Self {
         let mut mgr_config = ManagerConfig::default();
-        mgr_config.custom_setup = Box::new(establish_connection_rustls);
+        mgr_config.custom_setup = Box::new(establish_connection_opengauss);
 
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(
             database_url,
@@ -218,7 +235,7 @@ impl Persistence {
         log_postgres_connstr_info(database_url)
             .map_err(|e| diesel::ConnectionError::InvalidConnectionUrl(e.to_string()))?;
         loop {
-            match establish_connection_rustls(database_url).await {
+            match establish_connection_opengauss(database_url).await {
                 Ok(_) => {
                     tracing::info!("Connected to database.");
                     return Ok(());
@@ -1166,21 +1183,41 @@ impl Persistence {
         let unhealthy_records = unhealthy_records.as_slice();
         self.with_measured_conn(DatabaseOperation::UpdateMetadataHealth, move |conn| {
             Box::pin(async move {
-                diesel::insert_into(metadata_health)
-                    .values(healthy_records)
-                    .on_conflict((tenant_id, shard_number, shard_count))
-                    .do_update()
-                    .set((healthy.eq(true), last_scrubbed_at.eq(now)))
-                    .execute(conn)
-                    .await?;
+                const UPSERT_SQL: &str = r#"
+                    INSERT INTO metadata_health
+                        (tenant_id, shard_number, shard_count, healthy, last_scrubbed_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON DUPLICATE KEY UPDATE
+                        healthy = $6,
+                        last_scrubbed_at = $7
+                "#;
 
-                diesel::insert_into(metadata_health)
-                    .values(unhealthy_records)
-                    .on_conflict((tenant_id, shard_number, shard_count))
-                    .do_update()
-                    .set((healthy.eq(false), last_scrubbed_at.eq(now)))
-                    .execute(conn)
-                    .await?;
+                for record in healthy_records {
+                    diesel::sql_query(UPSERT_SQL)
+                        .bind::<Text, _>(&record.tenant_id)
+                        .bind::<Integer, _>(record.shard_number)
+                        .bind::<Integer, _>(record.shard_count)
+                        .bind::<Bool, _>(record.healthy)
+                        .bind::<Timestamptz, _>(record.last_scrubbed_at)
+                        .bind::<Bool, _>(true)
+                        .bind::<Timestamptz, _>(now)
+                        .execute(conn)
+                        .await?;
+                }
+
+                for record in unhealthy_records {
+                    diesel::sql_query(UPSERT_SQL)
+                        .bind::<Text, _>(&record.tenant_id)
+                        .bind::<Integer, _>(record.shard_number)
+                        .bind::<Integer, _>(record.shard_count)
+                        .bind::<Bool, _>(record.healthy)
+                        .bind::<Timestamptz, _>(record.last_scrubbed_at)
+                        .bind::<Bool, _>(false)
+                        .bind::<Timestamptz, _>(now)
+                        .execute(conn)
+                        .await?;
+                }
+
                 Ok(())
             })
         })
@@ -1188,7 +1225,7 @@ impl Persistence {
     }
 
     /// Lists all the metadata health records.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Temporarily disabled - unused function
     pub(crate) async fn list_metadata_health_records(
         &self,
     ) -> DatabaseResult<Vec<MetadataHealthPersistence>> {
@@ -1344,15 +1381,41 @@ impl Persistence {
                     .as_insert_or_update()
                     .map_err(|e| DatabaseError::Logical(format!("{e}")))?;
 
-                let inserted_updated = diesel::insert_into(safekeepers)
-                    .values(&bind)
-                    .on_conflict(id)
-                    .do_update()
-                    .set(&bind)
+                const UPSERT_SQL: &str = r#"
+                    INSERT INTO safekeepers
+                        (id, region_id, version, host, port, http_port, https_port, availability_zone_id, scheduling_policy)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, $10))
+                    ON DUPLICATE KEY UPDATE
+                        region_id = $2,
+                        version = $3,
+                        host = $4,
+                        port = $5,
+                        http_port = $6,
+                        https_port = $7,
+                        availability_zone_id = $8,
+                        scheduling_policy = COALESCE($9, safekeepers.scheduling_policy)
+                "#;
+
+                let scheduling_policy_value = bind
+                    .scheduling_policy
+                    .map(|policy| policy.to_string());
+                let default_scheduling_policy: String = SkSchedulingPolicy::Activating.into();
+
+                let inserted_updated = diesel::sql_query(UPSERT_SQL)
+                    .bind::<BigInt, _>(bind.id)
+                    .bind::<Text, _>(bind.region_id)
+                    .bind::<BigInt, _>(bind.version)
+                    .bind::<Text, _>(bind.host)
+                    .bind::<Integer, _>(bind.port)
+                    .bind::<Integer, _>(bind.http_port)
+                    .bind::<Nullable<Integer>, _>(bind.https_port)
+                    .bind::<Text, _>(bind.availability_zone_id)
+                    .bind::<Nullable<Text>, _>(scheduling_policy_value.as_deref())
+                    .bind::<Text, _>(default_scheduling_policy.as_str())
                     .execute(conn)
                     .await?;
 
-                if inserted_updated != 1 {
+                if inserted_updated > 2 {
                     return Err(DatabaseError::Logical(format!(
                         "unexpected number of rows ({inserted_updated})"
                     )));
@@ -1444,19 +1507,65 @@ impl Persistence {
     pub(crate) async fn insert_timeline(&self, entry: TimelinePersistence) -> DatabaseResult<bool> {
         use crate::schema::timelines;
 
-        let entry = &entry;
         self.with_measured_conn(DatabaseOperation::InsertTimeline, move |conn| {
+            let entry = entry.clone();
             Box::pin(async move {
-                let inserted_updated = diesel::insert_into(timelines::table)
-                    .values(entry)
-                    .on_conflict((timelines::tenant_id, timelines::timeline_id))
-                    .do_nothing()
+                const INSERT_OR_IGNORE_SQL: &str = r#"
+                    INSERT INTO timelines
+                        (
+                            tenant_id,
+                            timeline_id,
+                            start_lsn,
+                            generation,
+                            sk_set,
+                            new_sk_set,
+                            cplane_notified_generation,
+                            deleted_at,
+                            sk_set_notified_generation
+                        )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON DUPLICATE KEY UPDATE
+                        start_lsn = timelines.start_lsn,
+                        generation = timelines.generation,
+                        sk_set = timelines.sk_set,
+                        new_sk_set = timelines.new_sk_set,
+                        cplane_notified_generation = timelines.cplane_notified_generation,
+                        deleted_at = timelines.deleted_at,
+                        sk_set_notified_generation = timelines.sk_set_notified_generation
+                "#;
+
+                let TimelinePersistence {
+                    tenant_id,
+                    timeline_id,
+                    start_lsn,
+                    generation,
+                    sk_set,
+                    new_sk_set,
+                    cplane_notified_generation,
+                    deleted_at,
+                    sk_set_notified_generation,
+                } = entry;
+
+                let sk_set_array = sk_set.into_iter().map(Some).collect::<Vec<_>>();
+                let new_sk_set_array =
+                    new_sk_set.map(|set| set.into_iter().map(Some).collect::<Vec<_>>());
+
+                let inserted_updated = diesel::sql_query(INSERT_OR_IGNORE_SQL)
+                    .bind::<Text, _>(tenant_id)
+                    .bind::<Text, _>(timeline_id)
+                    .bind::<crate::schema::sql_types::PgLsn, _>(start_lsn)
+                    .bind::<Integer, _>(generation)
+                    .bind::<Array<Nullable<BigInt>>, _>(sk_set_array)
+                    .bind::<Nullable<Array<Nullable<BigInt>>>, _>(new_sk_set_array)
+                    .bind::<Integer, _>(cplane_notified_generation)
+                    .bind::<Nullable<Timestamptz>, _>(deleted_at)
+                    .bind::<Integer, _>(sk_set_notified_generation)
                     .execute(conn)
                     .await?;
 
                 match inserted_updated {
-                    0 => Ok(false),
                     1 => Ok(true),
+                    0 | 2 => Ok(false),
                     _ => Err(DatabaseError::Logical(format!(
                         "unexpected number of rows ({inserted_updated})"
                     ))),
@@ -1510,7 +1619,6 @@ impl Persistence {
         new_sk_set: Option<&[NodeId]>,
         reconcile_requests: &[TimelinePendingOpPersistence],
     ) -> DatabaseResult<()> {
-        use crate::schema::safekeeper_timeline_pending_ops as stpo;
         use crate::schema::timelines;
         use diesel::query_dsl::methods::FilterDsl;
 
@@ -1551,16 +1659,16 @@ impl Persistence {
                 };
 
                 for req in reconcile_requests {
-                    let inserted_updated = diesel::insert_into(stpo::table)
-                        .values(req)
-                        .on_conflict((stpo::tenant_id, stpo::timeline_id, stpo::sk_id))
-                        .do_update()
-                        .set(req)
-                        .filter(stpo::generation.lt(req.generation))
+                    let inserted_updated = diesel::sql_query(UPSERT_PENDING_OP_SQL)
+                        .bind::<Text, _>(req.tenant_id.clone())
+                        .bind::<Text, _>(req.timeline_id.clone())
+                        .bind::<BigInt, _>(req.sk_id)
+                        .bind::<Integer, _>(req.generation)
+                        .bind::<diesel::sql_types::VarChar, _>(req.op_kind)
                         .execute(conn)
                         .await?;
 
-                    if inserted_updated > 1 {
+                    if inserted_updated > 2 {
                         return Err(DatabaseError::Logical(format!(
                             "unexpected number of rows ({inserted_updated})"
                         )));
@@ -1784,30 +1892,26 @@ impl Persistence {
         &self,
         entry: TimelinePendingOpPersistence,
     ) -> DatabaseResult<bool> {
-        use crate::schema::safekeeper_timeline_pending_ops as skpo;
-        // This overrides the `filter` fn used in other functions, so contain the mayhem via a function-local use
-        use diesel::query_dsl::methods::FilterDsl;
-
-        let entry = &entry;
         self.with_measured_conn(DatabaseOperation::InsertTimelineReconcile, move |conn| {
+            let entry = entry.clone();
             Box::pin(async move {
                 // For simplicity it makes sense to keep only the last operation
                 // per (tenant, timeline, sk) tuple: if we migrated a timeline
                 // from node and adding it back it is not necessary to remove
                 // data on it. Hence, generation is not part of primary key and
                 // we override any rows with lower generations here.
-                let inserted_updated = diesel::insert_into(skpo::table)
-                    .values(entry)
-                    .on_conflict((skpo::tenant_id, skpo::timeline_id, skpo::sk_id))
-                    .do_update()
-                    .set(entry)
-                    .filter(skpo::generation.lt(entry.generation))
+                let inserted_updated = diesel::sql_query(UPSERT_PENDING_OP_SQL)
+                    .bind::<Text, _>(entry.tenant_id.clone())
+                    .bind::<Text, _>(entry.timeline_id.clone())
+                    .bind::<BigInt, _>(entry.sk_id)
+                    .bind::<Integer, _>(entry.generation)
+                    .bind::<diesel::sql_types::VarChar, _>(entry.op_kind)
                     .execute(conn)
                     .await?;
 
                 match inserted_updated {
-                    0 => Ok(false),
                     1 => Ok(true),
+                    0 | 2 => Ok(false),
                     _ => Err(DatabaseError::Logical(format!(
                         "unexpected number of rows ({inserted_updated})"
                     ))),
@@ -2137,112 +2241,22 @@ impl Persistence {
     }
 }
 
-pub(crate) fn load_certs() -> anyhow::Result<Arc<rustls::RootCertStore>> {
-    let der_certs = rustls_native_certs::load_native_certs();
-
-    if !der_certs.errors.is_empty() {
-        anyhow::bail!("could not parse certificates: {:?}", der_certs.errors);
-    }
-
-    let mut store = rustls::RootCertStore::empty();
-    store.add_parsable_certificates(der_certs.certs);
-    Ok(Arc::new(store))
-}
-
-#[derive(Debug)]
-/// A verifier that accepts all certificates (but logs an error still)
-struct AcceptAll(Arc<WebPkiServerVerifier>);
-impl ServerCertVerifier for AcceptAll {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
-        now: rustls::pki_types::UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let r =
-            self.0
-                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now);
-        if let Err(err) = r {
-            tracing::info!(
-                ?server_name,
-                "ignoring db connection TLS validation error: {err:?}"
-            );
-            return Ok(ServerCertVerified::assertion());
-        }
-        r
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls12_signature(message, cert, dss)
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.0.verify_tls13_signature(message, cert, dss)
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.supported_verify_schemes()
-    }
-}
-
-/// Loads the root certificates and constructs a client config suitable for connecting.
-/// This function is blocking.
-fn client_config_with_root_certs() -> anyhow::Result<rustls::ClientConfig> {
-    let client_config =
-        rustls::ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("ring should support the default protocol versions");
-    static DO_CERT_CHECKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let do_cert_checks =
-        DO_CERT_CHECKS.get_or_init(|| std::env::var("STORCON_DB_CERT_CHECKS").is_ok());
-    Ok(if *do_cert_checks {
-        client_config
-            .with_root_certificates(load_certs()?)
-            .with_no_client_auth()
-    } else {
-        let verifier = AcceptAll(
-            WebPkiServerVerifier::builder_with_provider(
-                load_certs()?,
-                Arc::new(ring::default_provider()),
-            )
-            .build()?,
-        );
-        client_config
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth()
-    })
-}
-
-fn establish_connection_rustls(config: &str) -> BoxFuture<ConnectionResult<AsyncPgConnection>> {
-    let fut = async {
-        // We first set up the way we want rustls to work.
-        let rustls_config = client_config_with_root_certs()
-            .map_err(|err| ConnectionError::BadConnection(format!("{err:?}")))?;
-        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config);
-        let (client, conn) = tokio_postgres::connect(config, tls)
+fn establish_connection_opengauss(config: &str) -> BoxFuture<ConnectionResult<AsyncPgConnection>> {
+    let conn_str = config.to_owned();
+    async move {
+        let (client, conn) = tokio_opengauss::connect(&conn_str, NoTls)
             .await
             .map_err(|e| ConnectionError::BadConnection(e.to_string()))?;
-
         AsyncPgConnection::try_from_client_and_connection(client, conn).await
-    };
-    fut.boxed()
+    }
+    .boxed()
 }
 
 #[cfg_attr(test, test)]
 fn test_config_debug_censors_password() {
     let has_pw =
         "host=/var/lib/postgresql,localhost port=1234 user=specialuser password='NOT ALLOWED TAG'";
-    let has_pw_cfg = has_pw.parse::<tokio_postgres::Config>().unwrap();
+    let has_pw_cfg = has_pw.parse::<tokio_opengauss::Config>().unwrap();
     assert!(format!("{has_pw_cfg:?}").contains("specialuser"));
     // Ensure that the password is not leaked by the debug impl
     assert!(!format!("{has_pw_cfg:?}").contains("NOT ALLOWED TAG"));
@@ -2250,7 +2264,7 @@ fn test_config_debug_censors_password() {
 
 fn log_postgres_connstr_info(config_str: &str) -> anyhow::Result<()> {
     let config = config_str
-        .parse::<tokio_postgres::Config>()
+        .parse::<tokio_opengauss::Config>()
         .map_err(|_e| anyhow::anyhow!("Couldn't parse config str"))?;
     // We use debug formatting here, and use a unit test to ensure that we don't leak the password.
     // To make extra sure the test gets ran, run it every time the function is called

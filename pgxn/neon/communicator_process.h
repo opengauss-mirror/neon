@@ -13,5 +13,6 @@
 #define COMMUNICATOR_PROCESS_H
 
 extern void pg_init_communicator_process(void);
+extern void communicator_register_bgworker(void);
 
 #endif			/* COMMUNICATOR_PROCESS_H */

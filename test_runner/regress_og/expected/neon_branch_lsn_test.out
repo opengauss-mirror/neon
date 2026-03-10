@@ -1,0 +1,290 @@
+-- Neon Branch Creation with Specified LSN Test
+-- Tests branch creation at specific LSN with data inheritance and isolation
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin".
+SET client_min_messages = WARNING;
+SET
+DROP TABLE IF EXISTS lsn_test CASCADE;
+DROP TABLE
+CREATE TABLE lsn_test (
+    id SERIAL PRIMARY KEY,
+    stage TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    description TEXT
+);
+CREATE TABLE
+-- Insert stage 1 data
+INSERT INTO lsn_test (stage, value, description) VALUES
+    ('stage1', 1, 'Data 1'),
+    ('stage1', 2, 'Data 2'),
+    ('stage1', 3, 'Data 3');
+INSERT 0 3
+SELECT 'MAIN - Stage 1 data:' AS info;
+         info         
+----------------------
+ MAIN - Stage 1 data:
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id | stage  | value | description 
+----+--------+-------+-------------
+  1 | stage1 |     1 | Data 1
+  2 | stage1 |     2 | Data 2
+  3 | stage1 |     3 | Data 3
+(3 rows)
+
+-- Save current LSN to file for branch creation
+\t on
+Showing only tuples.
+\o /tmp/branch_lsn.txt
+SELECT pg_current_xlog_location();
+\o
+\t off
+Tuples only is off.
+-- Insert stage 2 data (after LSN is recorded)
+INSERT INTO lsn_test (stage, value, description) VALUES
+    ('stage2', 4, 'Data 4'),
+    ('stage2', 5, 'Data 5');
+INSERT 0 2
+SELECT 'MAIN - After stage 2 (branch should NOT have this):' AS info;
+                        info                         
+-----------------------------------------------------
+ MAIN - After stage 2 (branch should NOT have this):
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id | stage  | value | description 
+----+--------+-------+-------------
+  1 | stage1 |     1 | Data 1
+  2 | stage1 |     2 | Data 2
+  3 | stage1 |     3 | Data 3
+  4 | stage2 |     4 | Data 4
+  5 | stage2 |     5 | Data 5
+(5 rows)
+
+-- Create branch at stage 1 LSN
+\! neon_local timeline branch --branch-name lsn_test_branch --ancestor-start-lsn $(cat /tmp/branch_lsn.txt | tr -d ' \n\t')
+Created timeline '38b0d319a9b5ef4296e6bf3aa280f546' at Lsn 0/275A900 for tenant: 2e98c8162bb935dac73b045682fd7713. Ancestor timeline: 'main'
+\! neon_local endpoint create ep-lsn-test --branch-name lsn_test_branch --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep-lsn-test
+Starting existing endpoint ep-lsn-test...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+\! sleep 5
+-- Verify branch only has stage 1 data
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SET client_min_messages = WARNING;
+SET
+SELECT 'BRANCH - Inherited data (should only have stage1):' AS info;
+                        info                        
+----------------------------------------------------
+ BRANCH - Inherited data (should only have stage1):
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id | stage  | value | description 
+----+--------+-------+-------------
+  1 | stage1 |     1 | Data 1
+  2 | stage1 |     2 | Data 2
+  3 | stage1 |     3 | Data 3
+(3 rows)
+
+SELECT 'BRANCH - Check stage2 (should be 0):' AS info;
+                 info                 
+--------------------------------------
+ BRANCH - Check stage2 (should be 0):
+(1 row)
+
+SELECT COUNT(*) FROM lsn_test WHERE stage = 'stage2';
+ count 
+-------
+     0
+(1 row)
+
+SELECT 'BRANCH - Stage summary (should only show stage1):' AS info;
+                       info                        
+---------------------------------------------------
+ BRANCH - Stage summary (should only show stage1):
+(1 row)
+
+SELECT stage, COUNT(*) FROM lsn_test GROUP BY stage ORDER BY stage;
+ stage  | count 
+--------+-------
+ stage1 |     3
+(1 row)
+
+-- Branch CRUD operations
+INSERT INTO lsn_test (stage, value, description) VALUES
+    ('branch_data', 100, 'Branch insert 1'),
+    ('branch_data', 101, 'Branch insert 2');
+INSERT 0 2
+UPDATE lsn_test 
+SET value = value + 1000, description = description || ' [BRANCH]'
+WHERE stage = 'stage1' AND id <= 2;
+UPDATE 2
+DELETE FROM lsn_test WHERE id = 3;
+DELETE 1
+SELECT 'BRANCH - After CRUD:' AS info;
+         info         
+----------------------
+ BRANCH - After CRUD:
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id |    stage    | value |   description   
+----+-------------+-------+-----------------
+  1 | stage1      |  1001 | Data 1 [BRANCH]
+  2 | stage1      |  1002 | Data 2 [BRANCH]
+  4 | branch_data |   100 | Branch insert 1
+  5 | branch_data |   101 | Branch insert 2
+(4 rows)
+
+-- Verify main not affected by branch CRUD
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SET client_min_messages = WARNING;
+SET
+SELECT 'MAIN - After branch CRUD (should be unchanged):' AS info;
+                      info                       
+-------------------------------------------------
+ MAIN - After branch CRUD (should be unchanged):
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id | stage  | value | description 
+----+--------+-------+-------------
+  1 | stage1 |     1 | Data 1
+  2 | stage1 |     2 | Data 2
+  3 | stage1 |     3 | Data 3
+  4 | stage2 |     4 | Data 4
+  5 | stage2 |     5 | Data 5
+(5 rows)
+
+SELECT 'MAIN - Check branch_data (should be 0):' AS info;
+                  info                   
+-----------------------------------------
+ MAIN - Check branch_data (should be 0):
+(1 row)
+
+SELECT COUNT(*) FROM lsn_test WHERE stage = 'branch_data';
+ count 
+-------
+     0
+(1 row)
+
+SELECT 'MAIN - Check id=3 (should be 1):' AS info;
+               info               
+----------------------------------
+ MAIN - Check id=3 (should be 1):
+(1 row)
+
+SELECT COUNT(*) FROM lsn_test WHERE id = 3;
+ count 
+-------
+     1
+(1 row)
+
+-- Main additional CRUD operations
+INSERT INTO lsn_test (stage, value, description) VALUES
+    ('stage3', 6, 'Data 6');
+INSERT 0 1
+UPDATE lsn_test 
+SET value = value + 2000
+WHERE stage = 'stage2';
+UPDATE 2
+DELETE FROM lsn_test WHERE id = 1;
+DELETE 1
+SELECT 'MAIN - After additional CRUD:' AS info;
+             info              
+-------------------------------
+ MAIN - After additional CRUD:
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id | stage  | value | description 
+----+--------+-------+-------------
+  2 | stage1 |     2 | Data 2
+  3 | stage1 |     3 | Data 3
+  4 | stage2 |  2004 | Data 4
+  5 | stage2 |  2005 | Data 5
+  6 | stage3 |     6 | Data 6
+(5 rows)
+
+-- Verify branch not affected by main operations
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SET client_min_messages = WARNING;
+SET
+SELECT 'BRANCH - After main operations (should be unchanged):' AS info;
+                         info                          
+-------------------------------------------------------
+ BRANCH - After main operations (should be unchanged):
+(1 row)
+
+SELECT * FROM lsn_test ORDER BY id;
+ id |    stage    | value |   description   
+----+-------------+-------+-----------------
+  1 | stage1      |  1001 | Data 1 [BRANCH]
+  2 | stage1      |  1002 | Data 2 [BRANCH]
+  4 | branch_data |   100 | Branch insert 1
+  5 | branch_data |   101 | Branch insert 2
+(4 rows)
+
+SELECT 'BRANCH - Check stage3 (should be 0):' AS info;
+                 info                 
+--------------------------------------
+ BRANCH - Check stage3 (should be 0):
+(1 row)
+
+SELECT COUNT(*) FROM lsn_test WHERE stage = 'stage3';
+ count 
+-------
+     0
+(1 row)
+
+-- Final summary
+SELECT 'BRANCH - Final summary:' AS info;
+          info           
+-------------------------
+ BRANCH - Final summary:
+(1 row)
+
+SELECT stage, COUNT(*) AS count FROM lsn_test GROUP BY stage ORDER BY stage;
+    stage    | count 
+-------------+-------
+ branch_data |     2
+ stage1      |     2
+(2 rows)
+
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SET client_min_messages = WARNING;
+SET
+SELECT 'MAIN - Final summary:' AS info;
+         info          
+-----------------------
+ MAIN - Final summary:
+(1 row)
+
+SELECT stage, COUNT(*) AS count FROM lsn_test GROUP BY stage ORDER BY stage;
+ stage  | count 
+--------+-------
+ stage1 |     2
+ stage2 |     2
+ stage3 |     1
+(3 rows)
+
+-- Cleanup
+DROP TABLE IF EXISTS lsn_test CASCADE;
+DROP TABLE
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin".
+SET client_min_messages = WARNING;
+SET
+\! neon_local endpoint stop ep-lsn-test --mode immediate --destroy 2>&1 || true
+
+compute_ctl stopped
+Destroying postgres data directory 'NEON_ROOT/.neon/endpoints/ep-lsn-test/pgdata'
+null
+\! rm -f /tmp/branch_lsn.txt
+total time: 15427  ms

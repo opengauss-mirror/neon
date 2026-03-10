@@ -16,8 +16,15 @@ srcdir = $(dir $(firstword $(MAKEFILE_LIST)))
 
 PG_CONFIG = pg_config
 
-subdirs = neon neon_rmgr neon_walredo neon_utils neon_test_utils
+ifeq ($(findstring /,$(PG_CONFIG)),)
+PG_CONFIG_ENV :=
+else
+PG_CONFIG_LIBDIR := $(abspath $(dir $(PG_CONFIG))../lib)
+PG_CONFIG_ENV := LD_LIBRARY_PATH=$(PG_CONFIG_LIBDIR):$$LD_LIBRARY_PATH
+endif
 
+subdirs = neon neon_rmgr neon_walredo neon_utils
+#subdirs = neon_walredo
 .PHONY: install install-compute install-storage $(subdirs)
 install: $(subdirs)
 install-compute: neon neon_utils neon_test_utils neon_rmgr
@@ -25,4 +32,4 @@ install-storage: neon_rmgr neon_walredo
 
 $(subdirs): %:
 	mkdir -p $*
-	$(MAKE) PG_CONFIG=$(PG_CONFIG) -C $* -f $(abspath $(srcdir)/$@/Makefile) install
+	$(PG_CONFIG_ENV) $(MAKE) PG_CONFIG=$(PG_CONFIG) -C $* -f $(abspath $(srcdir)/$@/Makefile) install

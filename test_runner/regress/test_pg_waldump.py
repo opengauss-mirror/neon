@@ -53,7 +53,7 @@ def test_pg_waldump(neon_simple_env: NeonEnv, test_output_dir, pg_bin: PgBin):
     endpoint.stop()
 
     assert endpoint.pgdata_dir
-    wal_path = os.path.join(endpoint.pgdata_dir, "pg_wal/000000010000000000000001")
+    wal_path = os.path.join(endpoint.pgdata_dir, "pg_xlog/000000010000000000000001")
     pg_waldump_path = os.path.join(pg_bin.pg_bin_path, "pg_waldump")
     # check segment on compute
     check_wal_segment(pg_waldump_path, wal_path, test_output_dir)

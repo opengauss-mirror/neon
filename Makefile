@@ -1,11 +1,15 @@
 ROOT_PROJECT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-# Where to install Postgres, default is ./pg_install, maybe useful for package
-# managers.
-POSTGRES_INSTALL_DIR ?= $(ROOT_PROJECT_DIR)/pg_install
+# Where to install openGauss, default is ./og_install
+OPENGAUSS_INSTALL_DIR ?= $(ROOT_PROJECT_DIR)og_install
+# Normalize to absolute path
+OPENGAUSS_INSTALL_DIR := $(abspath $(OPENGAUSS_INSTALL_DIR))
 
-# Supported PostgreSQL versions
-POSTGRES_VERSIONS = v17 v16 v15 v14
+# Path to openGauss binarylibs directory, default is 3rd_og
+OPENGAUSS_BINARYLIBS_DIR ?= $(THIRD_BIN_PATH)
+
+# Supported openGauss versions
+OPENGAUSS_VERSIONS = V702
 
 # CARGO_BUILD_FLAGS: Extra flags to pass to `cargo build`. `--locked`
 # and `--features testing` are popular examples.
@@ -76,22 +80,23 @@ else ifeq ($(UNAME_S),Darwin)
 		OPENSSL_PREFIX := $(shell brew --prefix openssl@3)
 		PG_CONFIGURE_OPTS += --with-includes=$(OPENSSL_PREFIX)/include --with-libraries=$(OPENSSL_PREFIX)/lib
 		PG_CONFIGURE_OPTS += PKG_CONFIG_PATH=$(shell brew --prefix icu4c)/lib/pkgconfig
-		# macOS already has bison and flex in the system, but they are old and result in postgres-v14 target failure
+		# macOS already has bison and flex in the system, but they are old
 		# brew formulae are keg-only and not symlinked into HOMEBREW_PREFIX, force their usage
 		EXTRA_PATH_OVERRIDES += $(shell brew --prefix bison)/bin/:$(shell brew --prefix flex)/bin/:
 	endif
 endif
 
-# Use -C option so that when PostgreSQL "make install" installs the
+# Use -C option so that when openGauss "make install" installs the
 # headers, the mtime of the headers are not changed when there have
 # been no changes to the files. Changing the mtime triggers an
 # unnecessary rebuild of 'postgres_ffi'.
 PG_CONFIGURE_OPTS += INSTALL='$(ROOT_PROJECT_DIR)/scripts/ninstall.sh -C'
 
+MAKEFLAGS += -j
 # Choose whether we should be silent or verbose
 CARGO_BUILD_FLAGS += --$(if $(filter s,$(MAKEFLAGS)),quiet,verbose)
 # Fix for a corner case when make doesn't pass a jobserver
-CARGO_BUILD_FLAGS += $(filter -j1,$(MAKEFLAGS))
+CARGO_BUILD_FLAGS += $(filter -j`nproc`,$(MAKEFLAGS))
 
 # This option has a side effect of passing make jobserver to cargo.
 # However, we shouldn't do this if `make -n` (--dry-run) has been asked.
@@ -102,17 +107,20 @@ CARGO_CMD_PREFIX += CARGO_TERM_PROGRESS_WHEN=never CI=1
 CACHEDIR_TAG_CONTENTS := "Signature: 8a477f597d28d172789f06886806bc55"
 
 #
-# Top level Makefile to build Neon and PostgreSQL
+# Top level Makefile to build Neon and openGauss
 #
 .PHONY: all
-all: neon postgres-install neon-pg-ext
+all: neon neon-pg-ext
+
+.PHONY: show-config
+show-config:
+	@echo "BUILD_TYPE=$(BUILD_TYPE) TARGET=$(NEON_CARGO_ARTIFACT_TARGET_DIR)"
 
 ### Neon Rust bits
 #
-# The 'postgres_ffi' crate depends on the Postgres headers.
+# The 'postgres_ffi' crate depends on the openGauss headers.
 .PHONY: neon
-neon: postgres-headers-install walproposer-lib cargo-target-dir
-	+@echo "Compiling Neon"
+neon: walproposer-lib cargo-target-dir
 	$(CARGO_CMD_PREFIX) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_PROFILE)
 
 .PHONY: cargo-target-dir
@@ -122,15 +130,24 @@ cargo-target-dir:
 	test -e target/CACHEDIR.TAG || echo "$(CACHEDIR_TAG_CONTENTS)" > target/CACHEDIR.TAG
 
 .PHONY: neon-pg-ext-%
-neon-pg-ext-%: postgres-install-% cargo-target-dir
-	+@echo "Compiling neon-specific Postgres extensions for $*"
-	mkdir -p $(BUILD_DIR)/pgxn-$*
-	$(MAKE) PG_CONFIG="$(POSTGRES_INSTALL_DIR)/$*/bin/pg_config" COPT='$(COPT)' \
+neon-pg-ext-%: opengauss-build-% cargo-target-dir
+	@mkdir -p $(BUILD_DIR)/pgxn-$* \
+		$(OPENGAUSS_INSTALL_DIR)/$*/lib/postgresql \
+		$(OPENGAUSS_INSTALL_DIR)/$*/share/postgresql/extension
+	@PATH="$(OPENGAUSS_INSTALL_DIR)/$*/bin:$$PATH" \
+	$(MAKE) -s PG_CONFIG="$(OPENGAUSS_INSTALL_DIR)/$*/bin/pg_config" COPT='$(COPT)' \
 		NEON_CARGO_ARTIFACT_TARGET_DIR="$(NEON_CARGO_ARTIFACT_TARGET_DIR)" \
 		CARGO_BUILD_FLAGS="$(CARGO_BUILD_FLAGS)" \
 		CARGO_PROFILE="$(CARGO_PROFILE)" \
-		-C $(BUILD_DIR)/pgxn-$*\
-		-f $(ROOT_PROJECT_DIR)/pgxn/Makefile  install
+		-C $(BUILD_DIR)/pgxn-$* -f $(ROOT_PROJECT_DIR)pgxn/Makefile install
+	@for f in $(BUILD_DIR)/pgxn-$*/neon*/*.so; do \
+		[ -f "$$f" ] && cp -f "$$f" $(OPENGAUSS_INSTALL_DIR)/$*/lib/postgresql/; \
+	done 2>/dev/null || true
+	@for f in $(ROOT_PROJECT_DIR)pgxn/neon*/*.{control,sql}; do \
+		[ -f "$$f" ] && cp -f "$$f" $(OPENGAUSS_INSTALL_DIR)/$*/share/postgresql/extension/; \
+	done 2>/dev/null || true
+	@[ -f "$(OPENGAUSS_INSTALL_DIR)/$*/lib/postgresql/neon.so" ] || \
+		(echo "ERROR: neon.so not found" && exit 1)
 
 # Build walproposer as a static library. walproposer source code is located
 # in the pgxn/neon directory.
@@ -142,14 +159,14 @@ neon-pg-ext-%: postgres-install-% cargo-target-dir
 # they depend on openssl and other libraries that are not included in our
 # Rust build.
 .PHONY: walproposer-lib
-walproposer-lib: neon-pg-ext-v17
+walproposer-lib: neon-pg-ext-V702
 	+@echo "Compiling walproposer-lib"
 	mkdir -p $(BUILD_DIR)/walproposer-lib
-	$(MAKE) PG_CONFIG=$(POSTGRES_INSTALL_DIR)/v17/bin/pg_config COPT='$(COPT)' \
+	$(MAKE) PG_CONFIG=$(OPENGAUSS_INSTALL_DIR)/V702/bin/pg_config COPT='$(COPT)' \
 		-C $(BUILD_DIR)/walproposer-lib \
 		-f $(ROOT_PROJECT_DIR)/pgxn/neon/Makefile walproposer-lib
-	cp $(POSTGRES_INSTALL_DIR)/v17/lib/libpgport.a $(BUILD_DIR)/walproposer-lib
-	cp $(POSTGRES_INSTALL_DIR)/v17/lib/libpgcommon.a $(BUILD_DIR)/walproposer-lib
+	cp $(OPENGAUSS_INSTALL_DIR)/V702/lib/libpgport.a $(BUILD_DIR)/walproposer-lib
+	# cp $(OPENGAUSS_INSTALL_DIR)/V702/lib/libpgcommon.a $(BUILD_DIR)/walproposer-lib
 	$(AR) d $(BUILD_DIR)/walproposer-lib/libpgport.a \
 		pg_strong_random.o
 	$(AR) d $(BUILD_DIR)/walproposer-lib/libpgcommon.a \
@@ -164,57 +181,26 @@ ifeq ($(UNAME_S),Linux)
 		pg_crc32c.o
 endif
 
-# Shorthand to call neon-pg-ext-% target for all Postgres versions
+# Shorthand to call neon-pg-ext-% target for all openGauss versions
 .PHONY: neon-pg-ext
-neon-pg-ext: $(foreach pg_version,$(POSTGRES_VERSIONS),neon-pg-ext-$(pg_version))
+neon-pg-ext: $(foreach pg_version,$(OPENGAUSS_VERSIONS),neon-pg-ext-$(pg_version))
+
+.PHONY: configure-release configure-debug
+configure-release:
+	@[ -f .neon/config ] && sed -i 's|target/debug|target/release|g' .neon/config || true
+
+configure-debug:
+	@[ -f .neon/config ] && sed -i 's|target/release|target/debug|g' .neon/config || true
 
 # This removes everything
 .PHONY: distclean
 distclean:
-	$(RM) -r $(POSTGRES_INSTALL_DIR) $(BUILD_DIR)
+	$(RM) -r $(BUILD_DIR) $(OPENGAUSS_INSTALL_DIR)
 	$(CARGO_CMD_PREFIX) cargo clean
 
 .PHONY: fmt
 fmt:
 	./pre-commit.py --fix-inplace
-
-postgres-%-pg-bsd-indent: postgres-%
-	+@echo "Compiling pg_bsd_indent"
-	$(MAKE) -C $(BUILD_DIR)/$*/src/tools/pg_bsd_indent/
-
-# Create typedef list for the core. Note that generally it should be combined with
-# buildfarm one to cover platform specific stuff.
-# https://wiki.postgresql.org/wiki/Running_pgindent_on_non-core_code_or_development_code
-postgres-%-typedefs.list: postgres-%
-	$(ROOT_PROJECT_DIR)/vendor/postgres-$*/src/tools/find_typedef $(POSTGRES_INSTALL_DIR)/$*/bin > $@
-
-# Indent postgres. See src/tools/pgindent/README for details.
-.PHONY: postgres-%-pgindent
-postgres-%-pgindent: postgres-%-pg-bsd-indent postgres-%-typedefs.list
-	+@echo merge with buildfarm typedef to cover all platforms
-	+@echo note: I first tried to download from pgbuildfarm.org, but for unclear reason e.g. \
-		REL_16_STABLE list misses PGSemaphoreData
-	# wget -q -O - "http://www.pgbuildfarm.org/cgi-bin/typedefs.pl?branch=REL_16_STABLE" |\
-	# cat - postgres-$*-typedefs.list | sort | uniq > postgres-$*-typedefs-full.list
-	cat $(ROOT_PROJECT_DIR)/vendor/postgres-$*/src/tools/pgindent/typedefs.list |\
-		cat - postgres-$*-typedefs.list | sort | uniq > postgres-$*-typedefs-full.list
-	+@echo note: you might want to run it on selected files/dirs instead.
-	INDENT=$(BUILD_DIR)/$*/src/tools/pg_bsd_indent/pg_bsd_indent \
-		$(ROOT_PROJECT_DIR)/vendor/postgres-$*/src/tools/pgindent/pgindent --typedefs postgres-$*-typedefs-full.list \
-		$(ROOT_PROJECT_DIR)/vendor/postgres-$*/src/ \
-		--excludes $(ROOT_PROJECT_DIR)/vendor/postgres-$*/src/tools/pgindent/exclude_file_patterns
-	$(RM) pg*.BAK
-
-# Indent pxgn/neon.
-.PHONY: neon-pgindent
-neon-pgindent: postgres-v17-pg-bsd-indent neon-pg-ext-v17
-	$(MAKE) PG_CONFIG=$(POSTGRES_INSTALL_DIR)/v17/bin/pg_config COPT='$(COPT)' \
-		FIND_TYPEDEF=$(ROOT_PROJECT_DIR)/vendor/postgres-v17/src/tools/find_typedef \
-		INDENT=$(BUILD_DIR)/v17/src/tools/pg_bsd_indent/pg_bsd_indent \
-		PGINDENT_SCRIPT=$(ROOT_PROJECT_DIR)/vendor/postgres-v17/src/tools/pgindent/pgindent \
-		-C $(BUILD_DIR)/pgxn-v17/neon \
-		-f $(ROOT_PROJECT_DIR)/pgxn/neon/Makefile pgindent
-
 
 .PHONY: setup-pre-commit-hook
 setup-pre-commit-hook:
@@ -233,18 +219,12 @@ lint-openapi-spec: build-tools/node_modules
 			--skip-rule=no-server-example.com --skip-rule=operation-2xx-response\
 			lint {} \+
 
-# Targets for building PostgreSQL are defined in postgres.mk.
-#
-# But if the caller has indicated that PostgreSQL is already
-# installed, by setting the PG_INSTALL_CACHED variable, skip it.
-ifdef PG_INSTALL_CACHED
-postgres-install: skip-install
-$(foreach pg_version,$(POSTGRES_VERSIONS),postgres-install-$(pg_version)): skip-install
-postgres-headers-install:
-	+@echo "Skipping installation of PostgreSQL headers because PG_INSTALL_CACHED is set"
-skip-install:
-	+@echo "Skipping PostgreSQL installation because PG_INSTALL_CACHED is set"
 
+ifdef OG_INSTALL_CACHED
+opengauss-build-%: 
+	+@echo "Skipping openGauss installation because OG_INSTALL_CACHED is set"
 else
-include postgres.mk
+# Targets for building openGauss are defined in opengauss.mk.
+include opengauss.mk
 endif
+

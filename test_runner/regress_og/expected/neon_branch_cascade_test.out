@@ -1,0 +1,369 @@
+-- ============================================================================
+-- STEP 1: Create test data on MAIN branch
+-- ============================================================================
+DROP TABLE IF EXISTS test_branch;
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:4: NOTICE:  table "test_branch" does not exist, skipping
+DROP TABLE
+CREATE TABLE test_branch (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    value INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:11: NOTICE:  CREATE TABLE will create implicit sequence "test_branch_id_seq" for serial column "test_branch.id"
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:11: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_branch_pkey" for table "test_branch"
+CREATE TABLE
+INSERT INTO test_branch (name, value) VALUES
+    ('item1', 100),
+    ('item2', 200),
+    ('item3', 300);
+INSERT 0 3
+SELECT * FROM test_branch;
+ id | name  | value |         created_at
+----+-------+-------+----------------------------
+  1 | item1 |   100 | YYYY-MM-DD HH:MM:SS.XXX
+  2 | item2 |   200 | YYYY-MM-DD HH:MM:SS.XXX
+  3 | item3 |   300 | YYYY-MM-DD HH:MM:SS.XXX
+(3 rows)
+SELECT COUNT(*) FROM test_branch;
+ count
+---------------------------------------------------------------------
+     3
+(1 row)
+CREATE TABLE large_table (
+    id SERIAL PRIMARY KEY,
+    data TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:26: NOTICE:  CREATE TABLE will create implicit sequence "large_table_id_seq" for serial column "large_table.id"
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:26: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "large_table_pkey" for table "large_table"
+CREATE TABLE
+INSERT INTO large_table (data)
+SELECT md5(random()::text) FROM generate_series(1, 100000);
+INSERT 0 100000
+SELECT COUNT(*) FROM large_table;
+ count
+---------------------------------------------------------------------
+ 100000
+(1 row)
+-- ============================================================================
+-- STEP 2: Create a new branch using shell command
+-- ============================================================================
+-- Create the branch using full path (neon_root is set by the wrapper)
+\! neon_local timeline branch --branch-name branch1
+Syncing branch point with endpoint flush LSN: X/XXXXXXXX
+Waiting for pageserver to sync WAL to X/XXXXXXXX...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' at Lsn X/XXXXXXXX for tenant: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx. Ancestor timeline: 'main'
+-- Create and start endpoint for the branch
+-- Use $BRANCH1_PORT environment variable (exported by wrapper) to match :branch1_port
+\! neon_local endpoint create ep_branch1 --branch-name branch1 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_branch1
+Starting existing endpoint ep_branch1...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:xxxxx/postgres'
+-- ============================================================================
+-- STEP 3: Switch to new branch and check main branch data
+-- ============================================================================
+-- Switch to branch endpoint (port xxxxx = branch1_port)
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+SELECT * FROM test_branch;
+ id | name  | value |         created_at
+----+-------+-------+----------------------------
+  1 | item1 |   100 | YYYY-MM-DD HH:MM:SS.XXX
+  2 | item2 |   200 | YYYY-MM-DD HH:MM:SS.XXX
+  3 | item3 |   300 | YYYY-MM-DD HH:MM:SS.XXX
+(3 rows)
+SELECT COUNT(*) FROM large_table;
+ count
+---------------------------------------------------------------------
+ 100000
+(1 row)
+UPDATE large_table SET data = 'modified' WHERE id <= 10000;
+UPDATE 10000
+SELECT COUNT(*) FROM large_table WHERE data = 'modified';
+ count
+---------------------------------------------------------------------
+ 10000
+(1 row)
+-- do some ddl in old table
+ALTER TABLE test_branch ADD COLUMN new_int_col INT;
+ALTER TABLE
+ALTER TABLE test_branch DROP COLUMN created_at;
+ALTER TABLE
+create index on test_branch(name);
+CREATE INDEX
+create index on test_branch(value);
+CREATE INDEX
+\d+ test_branch;
+                                                       Table "public.test_branch"
+   Column    |          Type          |                        Modifiers                         | Storage  | Stats target | Description
+-------------+------------------------+----------------------------------------------------------+----------+--------------+-------------
+ id          | integer                | not null default nextval('test_branch_id_seq'::regclass) | plain    |              |
+ name        | character varying(100) |                                                          | extended |              |
+ value       | integer                |                                                          | plain    |              |
+ new_int_col | integer                |                                                          | plain    |              |
+Indexes:
+    "test_branch_pkey" PRIMARY KEY, btree (id) TABLESPACE pg_default
+    "test_branch_name_idx" btree (name) TABLESPACE pg_default
+    "test_branch_value_idx" btree (value) TABLESPACE pg_default
+Has OIDs: no
+Options: orientation=row, compression=no
+-- do some dml
+delete from test_branch where id = 300;
+DELETE 0
+INSERT INTO test_branch (name, value) VALUES ('branch1_data', 999);
+INSERT 0 1
+update test_branch set name = 'branch_data_name';
+UPDATE 4
+SELECT * FROM test_branch;
+ id |       name       | value | new_int_col
+----+------------------+-------+-------------
+  1 | branch_data_name |   100 |
+  2 | branch_data_name |   200 |
+  3 | branch_data_name |   300 |
+  4 | branch_data_name |   999 |
+(4 rows)
+-- create new table in branch
+CREATE TABLE branch_only_table (id INT PRIMARY KEY, data TEXT);
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:79: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "branch_only_table_pkey" for table "branch_only_table"
+CREATE TABLE
+INSERT INTO branch_only_table VALUES (1, 'only on branch1');
+INSERT 0 1
+INSERT INTO branch_only_table VALUES (2, 'only on branch1');
+INSERT 0 1
+INSERT INTO branch_only_table VALUES (3, 'only on branch1');
+INSERT 0 1
+INSERT INTO branch_only_table VALUES (4, 'only on branch1');
+INSERT 0 1
+INSERT INTO branch_only_table VALUES (5, 'only on branch1');
+INSERT 0 1
+SELECT * FROM branch_only_table;
+ id |      data
+----+-----------------
+  1 | only on branch1
+  2 | only on branch1
+  3 | only on branch1
+  4 | only on branch1
+  5 | only on branch1
+(5 rows)
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+-- branch operation dont affect main branch
+-- expect 0, no data modified
+SELECT COUNT(*) FROM large_table WHERE data = 'modified';
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+\d+ test_branch;
+                                                         Table "public.test_branch"
+   Column   |            Type             |                        Modifiers                         | Storage  | Stats target | Description
+------------+-----------------------------+----------------------------------------------------------+----------+--------------+-------------
+ id         | integer                     | not null default nextval('test_branch_id_seq'::regclass) | plain    |              |
+ name       | character varying(100)      |                                                          | extended |              |
+ value      | integer                     |                                                          | plain    |              |
+ created_at | timestamp without time zone | default pg_systimestamp()                                | plain    |              |
+Indexes:
+    "test_branch_pkey" PRIMARY KEY, btree (id) TABLESPACE pg_default
+Has OIDs: no
+Options: orientation=row, compression=no
+SELECT * FROM test_branch;
+ id | name  | value |         created_at
+----+-------+-------+----------------------------
+  1 | item1 |   100 | YYYY-MM-DD HH:MM:SS.XXX
+  2 | item2 |   200 | YYYY-MM-DD HH:MM:SS.XXX
+  3 | item3 |   300 | YYYY-MM-DD HH:MM:SS.XXX
+(3 rows)
+UPDATE test_branch SET value = 111 WHERE name = 'item1';
+UPDATE 1
+SELECT * FROM test_branch WHERE name = 'item1';
+ id | name  | value |         created_at
+----+-------+-------+----------------------------
+  1 | item1 |   111 | YYYY-MM-DD HH:MM:SS.XXX
+(1 row)
+CREATE TABLE table_only_in_main (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    value INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:106: NOTICE:  CREATE TABLE will create implicit sequence "table_only_in_main_id_seq" for serial column "table_only_in_main.id"
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:106: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "table_only_in_main_pkey" for table "table_only_in_main"
+CREATE TABLE
+INSERT INTO table_only_in_main (name, value) VALUES
+    ('item1', 100),
+    ('item2', 200),
+    ('item3', 300);
+INSERT 0 3
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+-- main endpoint update dont affect branch data
+SELECT value FROM test_branch WHERE name = 'item1';
+ value
+---------------------------------------------------------------------
+(0 rows)
+-- expect error
+\d+ table_only_in_main;
+Did not find any relation named "table_only_in_main".
+BEGIN;
+BEGIN
+INSERT INTO test_branch (name, value) VALUES ('tx_test', 500);
+INSERT 0 1
+SAVEPOINT sp1;
+SAVEPOINT
+INSERT INTO test_branch (name, value) VALUES ('tx_test2', 600);
+INSERT 0 1
+ROLLBACK TO sp1;
+ROLLBACK
+COMMIT;
+COMMIT
+-- expect only tx_test inserted
+SELECT * FROM test_branch WHERE name LIKE 'tx%';
+ id |  name   | value | new_int_col
+----+---------+-------+-------------
+  5 | tx_test |   500 |
+(1 row)
+-- Stop branch endpoint
+\! neon_local endpoint stop ep_branch1
+\! sleep 5
+\! neon_local endpoint start ep_branch1
+Starting existing endpoint ep_branch1...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:xxxxx/postgres'
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin".
+-- OK after restart
+SELECT * FROM test_branch;
+ id |       name       | value | new_int_col
+----+------------------+-------+-------------
+  1 | branch_data_name |   100 |
+  2 | branch_data_name |   200 |
+  3 | branch_data_name |   300 |
+  4 | branch_data_name |   999 |
+(4 rows)
+SELECT * FROM branch_only_table;
+ id |      data
+----+-----------------
+  1 | only on branch1
+  2 | only on branch1
+  3 | only on branch1
+  4 | only on branch1
+  5 | only on branch1
+(5 rows)
+-- ============================================================================
+-- STEP 4: Cascading Branch
+-- ============================================================================
+-- Create the branch using full path (neon_root is set by the wrapper)
+\! neon_local timeline branch --branch-name branch2 --ancestor-branch-name branch1
+Syncing branch point with endpoint flush LSN: X/XXXXXXXX
+Waiting for pageserver to sync WAL to X/XXXXXXXX...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' at Lsn X/XXXXXXXX for tenant: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx. Ancestor timeline: 'branch1'
+\! neon_local endpoint create ep_branch2 --branch-name branch2 --pg-port ${BRANCH2_PORT}
+\! neon_local endpoint start ep_branch2
+Starting existing endpoint ep_branch2...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:xxxxx/postgres'
+\c - - - :branch2_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+-- data same as branch1
+SELECT * FROM test_branch;
+ id |       name       | value | new_int_col
+----+------------------+-------+-------------
+  1 | branch_data_name |   100 |
+  2 | branch_data_name |   200 |
+  3 | branch_data_name |   300 |
+  4 | branch_data_name |   999 |
+(4 rows)
+SELECT * FROM branch_only_table;
+ id |      data
+----+-----------------
+  1 | only on branch1
+  2 | only on branch1
+  3 | only on branch1
+  4 | only on branch1
+  5 | only on branch1
+(5 rows)
+-- create new table in branch
+CREATE TABLE branch2_only_table (id INT PRIMARY KEY, data TEXT);
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:161: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "branch2_only_table_pkey" for table "branch2_only_table"
+CREATE TABLE
+INSERT INTO branch2_only_table VALUES (1, 'only on branch2');
+INSERT 0 1
+INSERT INTO branch2_only_table VALUES (2, 'only on branch2');
+INSERT 0 1
+INSERT INTO branch2_only_table VALUES (3, 'only on branch2');
+INSERT 0 1
+INSERT INTO branch2_only_table VALUES (4, 'only on branch2');
+INSERT 0 1
+INSERT INTO branch2_only_table VALUES (5, 'only on branch2');
+INSERT 0 1
+select * from branch2_only_table;
+ id |      data
+----+-----------------
+  1 | only on branch2
+  2 | only on branch2
+  3 | only on branch2
+  4 | only on branch2
+  5 | only on branch2
+(5 rows)
+drop table test_branch;
+DROP TABLE
+drop table branch_only_table;
+DROP TABLE
+-- Create the branch using full path (neon_root is set by the wrapper)
+\! neon_local timeline branch --branch-name branch3 --ancestor-branch-name branch2
+Syncing branch point with endpoint flush LSN: X/XXXXXXXX
+Waiting for pageserver to sync WAL to X/XXXXXXXX...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' at Lsn X/XXXXXXXX for tenant: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx. Ancestor timeline: 'branch2'
+\! neon_local endpoint create ep_branch3 --branch-name branch3 --pg-port ${BRANCH3_PORT}
+\! neon_local endpoint start ep_branch3
+Starting existing endpoint ep_branch3...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:xxxxx/postgres'
+\c - - - :branch3_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+-- error table drop in branch2
+SELECT * FROM test_branch;
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:183: ERROR:  relation "test_branch" does not exist on
+-- error table drop in branch2
+SELECT * FROM branch_only_table;
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:185: ERROR:  relation "branch_only_table" does not exist on
+-- create new table in branch
+CREATE TABLE branch3_only_table (id INT PRIMARY KEY, data TEXT);
+gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:188: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "branch3_only_table_pkey" for table "branch3_only_table"
+CREATE TABLE
+INSERT INTO branch3_only_table VALUES (1, 'only on branch3');
+INSERT 0 1
+INSERT INTO branch3_only_table VALUES (2, 'only on branch3');
+INSERT 0 1
+INSERT INTO branch3_only_table VALUES (3, 'only on branch3');
+INSERT 0 1
+INSERT INTO branch3_only_table VALUES (4, 'only on branch3');
+INSERT 0 1
+INSERT INTO branch3_only_table VALUES (5, 'only on branch3');
+INSERT 0 1
+select * from branch3_only_table;
+ id |      data
+----+-----------------
+  1 | only on branch3
+  2 | only on branch3
+  3 | only on branch3
+  4 | only on branch3
+  5 | only on branch3
+(5 rows)
+-- expect error
+\c - - - :branch2_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+\d+ branch3_only_table;
+Did not find any relation named "branch3_only_table".
+-- expect error
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "xxxxx".
+\d+ branch3_only_table;
+Did not find any relation named "branch3_only_table".
+\! neon_local endpoint stop ep_branch1;
+\! neon_local endpoint stop ep_branch2;
+\! neon_local endpoint stop ep_branch3;

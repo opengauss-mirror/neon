@@ -261,7 +261,7 @@ class VanillaCompare(PgCompare):
         self.zenbenchmark.record(
             "data_size", data_size / (1024 * 1024), "MB", report=MetricReport.LOWER_IS_BETTER
         )
-        wal_size = self.pg.get_subdir_size(Path("pg_wal"))
+        wal_size = self.pg.get_subdir_size(Path("pg_xlog"))
         self.zenbenchmark.record(
             "wal_size", wal_size / (1024 * 1024), "MB", report=MetricReport.LOWER_IS_BETTER
         )

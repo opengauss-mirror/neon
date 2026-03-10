@@ -26,7 +26,8 @@ impl PgVersionId {
     pub fn from_full_pg_version(version: u32) -> PgVersionId {
         match version {
             0 => PgVersionId(version), // unknown version
-            140000..180000 => PgVersionId(version),
+            // Accept a wider range to avoid panicking on older clusters (e.g. 9.x)
+            90000..=200000 => PgVersionId(version),
             _ => panic!("Invalid full PostgreSQL version ID {version}"),
         }
     }
@@ -101,6 +102,20 @@ impl PgMajorVersion {
         .to_string()
     }
 
+    /// Directory name candidates that may contain the binaries for this version.
+    ///
+    /// The first entry is the canonical Postgres-style directory (e.g. `v14`).
+    /// Subsequent entries allow downstream distributions (like openGauss) to
+    /// reuse Neon without renaming their existing install layouts.
+    pub const fn distrib_dir_candidates(&self) -> &'static [&'static str] {
+        match self {
+            PgMajorVersion::PG14 => &["v14", "V702"],
+            PgMajorVersion::PG15 => &["v15"],
+            PgMajorVersion::PG16 => &["v16"],
+            PgMajorVersion::PG17 => &["v17"],
+        }
+    }
+
     /// All currently supported major versions of PostgreSQL.
     pub const ALL: &'static [PgMajorVersion] = &[
         PgMajorVersion::PG14,
@@ -136,6 +151,11 @@ impl TryFrom<PgVersionId> for PgMajorVersion {
 
     fn try_from(value: PgVersionId) -> Result<Self, Self::Error> {
         Ok(match value.0 / 10000 {
+            // Accept legacy major versions (e.g. 9.x from openGauss) by mapping
+            // them onto the lowest supported major. This keeps callers that only
+            // need coarse compatibility checks from failing fast while still
+            // preserving the original PgVersionId elsewhere.
+            9..=13 => PgMajorVersion::PG14,
             14 => PgMajorVersion::PG14,
             15 => PgMajorVersion::PG15,
             16 => PgMajorVersion::PG16,

@@ -19,11 +19,11 @@
 #include "access/xlogdefs.h"
 #include "access/xlogreader.h"
 #include "libpq/pqformat.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "utils/memutils.h"
-#include "utils/wait_event.h"
+// #include "utils/wait_event.h"
 
-#include "libpq-fe.h"
+#include "libpq/libpq-fe.h"
 
 #include "neon_walreader.h"
 #include "walproposer.h"
@@ -110,20 +110,30 @@ NeonWALReader *
 NeonWALReaderAllocate(int wal_segment_size, XLogRecPtr available_lsn, char *log_prefix, TimeLineID tlid)
 {
 	NeonWALReader *reader;
+	bool		was_sealed = false;
 
 	/*
 	 * Note: we allocate in TopMemoryContext, reusing the reader for all process
 	 * reads.
 	 */
+	if (TopMemoryContext->is_sealed)
+	{
+		was_sealed = true;
+		MemoryContextUnSeal(TopMemoryContext);
+	}
+
 	reader = (NeonWALReader *)
 		MemoryContextAllocZero(TopMemoryContext, sizeof(NeonWALReader));
+
+	if (was_sealed)
+		MemoryContextSeal(TopMemoryContext);
 
 	reader->available_lsn = available_lsn;
 	reader->local_active_tlid = tlid;
 	reader->seg.ws_file = -1;
 	reader->seg.ws_segno = 0;
 	reader->seg.ws_tli = 0;
-	reader->segcxt.ws_segsize = wal_segment_size;
+	reader->segcxt.ws_segsize = XLogSegSize;
 
 	reader->rem_state = RS_NONE;
 
@@ -188,8 +198,8 @@ NeonWALRead(NeonWALReader *state, char *buf, XLogRecPtr startptr, Size count, Ti
 	}
 	else if (state->wre_errno == ENOENT)
 	{
-		nwr_log(LOG, "local read at %X/%X len %zu failed as segment file doesn't exist, attempting remote",
-				LSN_FORMAT_ARGS(startptr), count);
+		nwr_log(LOG, "local read at %X/%X len %zu failed as segment file doesn't exist, attempting remote (timeline=%u)",
+				LSN_FORMAT_ARGS(startptr), count, tli);
 		return NeonWALReadRemote(state, buf, startptr, count, tli);
 	}
 	else
@@ -388,8 +398,8 @@ NeonWALReadRemote(NeonWALReader *state, char *buf, XLogRecPtr startptr, Size cou
 			XLogSegNo	next_segno;
 			XLogSegNo	req_segno;
 
-			XLByteToSeg(state->req_lsn, req_segno, state->segcxt.ws_segsize);
-			XLByteToSeg(state->rem_lsn, next_segno, state->segcxt.ws_segsize);
+			XLByteToSeg(state->req_lsn, req_segno);
+			XLByteToSeg(state->rem_lsn, next_segno);
 
 			/*
 			 * Request completed. If there is a chance of serving next one
@@ -518,12 +528,31 @@ NeonWALReaderReadMsg(NeonWALReader *state)
 					nwr_log(DEBUG5, "received keepalive end_lsn=%X/%X reply_requested=%d",
 							LSN_FORMAT_ARGS(end_lsn),
 							reply_requested);
-					if (end_lsn < state->req_lsn + state->req_len)
+					/*
+					 * Check if safekeeper has enough WAL to satisfy the request.
+					 * end_lsn in keepalive represents the last LSN that safekeeper has
+					 * persisted (inclusive). To read from req_lsn with length req_len,
+					 * we need end_lsn >= req_lsn + req_len - 1 (since end_lsn is inclusive).
+					 * However, if end_lsn < req_lsn, safekeeper doesn't have the starting
+					 * position yet, which is a real error. If end_lsn >= req_lsn but
+					 * end_lsn < req_lsn + req_len, we should wait for more data rather than
+					 * immediately failing, as safekeeper might be catching up.
+					 */
+					if (end_lsn < state->req_lsn)
 					{
+						/* Safekeeper doesn't have the starting position - real error */
 						snprintf(state->err_msg, sizeof(state->err_msg),
-								 "closing remote connection: requested WAL up to %X/%X, but current donor %s has only up to %X/%X",
-								 LSN_FORMAT_ARGS(state->req_lsn + state->req_len), state->donor_name, LSN_FORMAT_ARGS(end_lsn));
+								 "closing remote connection: requested WAL from %X/%X, but current donor %s has only up to %X/%X",
+								 LSN_FORMAT_ARGS(state->req_lsn), state->donor_name, LSN_FORMAT_ARGS(end_lsn));
 						goto err;
+					}
+					else if (end_lsn < state->req_lsn + state->req_len)
+					{
+						/*
+						 * Safekeeper has the start but not the end - wait for
+						 * more data.
+						 */
+						return NEON_WALREAD_WOULDBLOCK;
 					}
 					continue;
 				}
@@ -643,29 +672,30 @@ NeonWALReadLocal(NeonWALReader *state, char *buf, XLogRecPtr startptr, Size coun
 		int			readbytes;
 		XLogSegNo	lastRemovedSegNo;
 
-		startoff = XLogSegmentOffset(recptr, state->segcxt.ws_segsize);
-
+		// startoff = XLogSegmentOffset(recptr, state->segcxt.ws_segsize);
+		startoff = recptr % XLogSegSize;
 		/*
 		 * If the data we want is not in a segment we have open, close what we
 		 * have (if anything) and open the next one, using the caller's
 		 * provided openSegment callback.
 		 */
 		if (state->seg.ws_file < 0 ||
-			!XLByteInSeg(recptr, state->seg.ws_segno, state->segcxt.ws_segsize) ||
-			tli != state->seg.ws_tli)
+			!XLByteInSeg(recptr, state->seg.ws_segno) 
+			|| tli != state->seg.ws_tli)
 		{
 			XLogSegNo	nextSegNo;
 
 			neon_wal_segment_close(state);
 
-			XLByteToSeg(recptr, nextSegNo, state->segcxt.ws_segsize);
+			XLByteToSeg(recptr, nextSegNo);
 			if (!neon_wal_segment_open(state, nextSegNo, &tli))
 			{
 				char		fname[MAXFNAMELEN];
 
 				state->wre_errno = errno;
 
-				XLogFileName(fname, tli, nextSegNo, state->segcxt.ws_segsize);
+				// XLogFileName(fname, tli, nextSegNo, state->segcxt.ws_segsize);
+				XLogFileName(fname, MAXFNAMELEN, tli, nextSegNo);
 				snprintf(state->err_msg, sizeof(state->err_msg), "failed to open WAL segment %s while reading at %X/%X: %s",
 						 fname, LSN_FORMAT_ARGS(recptr), strerror(state->wre_errno));
 				return false;
@@ -686,22 +716,23 @@ NeonWALReadLocal(NeonWALReader *state, char *buf, XLogRecPtr startptr, Size coun
 			segbytes = nbytes;
 
 #ifndef FRONTEND
-		pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
+		// pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
 #endif
 
 		/* Reset errno first; eases reporting non-errno-affecting errors */
 		errno = 0;
-		readbytes = pg_pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
+		readbytes = pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
 
 #ifndef FRONTEND
-		pgstat_report_wait_end();
+		// pgstat_report_wait_end();
 #endif
 
 		if (readbytes <= 0)
 		{
 			char		fname[MAXFNAMELEN];
 
-			XLogFileName(fname, state->seg.ws_tli, state->seg.ws_segno, state->segcxt.ws_segsize);
+			// XLogFileName(fname, state->seg.ws_tli, state->seg.ws_segno, state->segcxt.ws_segsize);
+			XLogFileName(fname, MAXFNAMELEN, state->seg.ws_tli, state->seg.ws_segno);
 
 			if (readbytes < 0)
 			{
@@ -727,8 +758,8 @@ NeonWALReadLocal(NeonWALReader *state, char *buf, XLogRecPtr startptr, Size coun
 			char		fname[MAXFNAMELEN];
 
 			state->wre_errno = ENOENT;
-
-			XLogFileName(fname, tli, state->seg.ws_segno, state->segcxt.ws_segsize);
+			// XLogFileName(fname, tli, state->seg.ws_segno, state->segcxt.ws_segsize);
+			XLogFileName(fname, MAXFNAMELEN, tli, state->seg.ws_segno);
 			snprintf(state->err_msg, sizeof(state->err_msg), "WAL segment %s has been removed during the read, lastRemovedSegNo " UINT64_FORMAT,
 					 fname, lastRemovedSegNo);
 			return false;
@@ -768,9 +799,9 @@ neon_wal_segment_open(NeonWALReader *state, XLogSegNo nextSegNo,
 	TimeLineID	tli = *tli_p;
 	char		path[MAXPGPATH];
 
-	XLogFilePath(path, tli, nextSegNo, state->segcxt.ws_segsize);
+	XLogFilePath(path, MAXPGPATH, tli, nextSegNo);
 	nwr_log(DEBUG5, "opening %s", path);
-	state->seg.ws_file = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	state->seg.ws_file = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
 	if (state->seg.ws_file >= 0)
 		return true;
 
@@ -783,7 +814,7 @@ is_wal_segment_exists(XLogSegNo segno, int segsize, TimeLineID tli)
 	struct stat stat_buffer;
 	char		path[MAXPGPATH];
 
-	XLogFilePath(path, tli, segno, segsize);
+	XLogFilePath(path, MAXPGPATH, tli, segno);
 	return stat(path, &stat_buffer) == 0;
 }
 

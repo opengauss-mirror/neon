@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
-use postgres_ffi::v14::xlog_utils::{IsPartialXLogFileName, IsXLogFileName};
+use postgres_ffi::V702::xlog_utils::{IsPartialXLogFileName, IsXLogFileName};
 use postgres_ffi::{MAX_SEND_SIZE, XLogSegNo};
 use safekeeper_api::models::WalSenderState;
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,17 @@
 //!
-//! Basic WAL stream decoding.
+//! Basic WAL stream decoding for openGauss.
 //!
 //! This understands the WAL page and record format, enough to figure out where the WAL record
 //! boundaries are, and to reassemble WAL records that cross page boundaries.
+//!
+//! openGauss XLog format differs from PostgreSQL in several ways:
+//! 1. XLogRecord is 32 bytes (vs 24 in PG): adds xl_term (4 bytes) and xl_bucket_id (2 bytes)
+//! 2. XLogPageHeaderData is 24 bytes (vs 20 in PG): adds xlp_total_len (4 bytes)
+//! 3. XLogLongPageHeaderData is 40 bytes (vs 32+8 in PG)
+//! 4. TransactionId is uint64 (vs uint32 in PG)
+//! 5. XLOG_PAGE_MAGIC is 0xD074 (vs 0xD10D in PG15)
+//! 6. XLogRecordBlockImageHeader is 4 bytes without bimg_info field
+//! 7. All records are 8-byte aligned (MAXALIGN)
 //!
 //! This functionality is needed by both the pageserver and the safekeepers. The pageserver needs
 //! to look deeper into the WAL records to also understand which blocks they modify, the code
@@ -39,6 +48,17 @@ pub trait WalStreamDecoderHandler {
 impl WalStreamDecoderHandler for WalStreamDecoder {
     fn validate_page_header(&self, hdr: &XLogPageHeaderData) -> Result<(), WalDecodeError> {
         let validate_impl = || {
+            tracing::info!(
+                "TESTDBG validate_page_header: xlp_magic={} (expected {}), xlp_pageaddr={} (expected {}), xlp_info={}, xlp_tli={}, xlp_rem_len={}, xlp_total_len={}",
+                hdr.xlp_magic,
+                XLOG_PAGE_MAGIC,
+                hdr.xlp_pageaddr,
+                self.lsn.0,
+                hdr.xlp_info,
+                hdr.xlp_tli,
+                hdr.xlp_rem_len,
+                hdr.xlp_total_len
+            );
             if hdr.xlp_magic != XLOG_PAGE_MAGIC as u16 {
                 return Err(format!(
                     "invalid xlog page header: xlp_magic={}, expected {}",
@@ -153,6 +173,13 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
                     // peek xl_tot_len at the beginning of the record.
                     // FIXME: assumes little-endian
                     let xl_tot_len = (&self.inputbuf[0..4]).get_u32_le();
+                    tracing::info!(
+                        "TESTDBG poll_decode_internal WaitingForRecord: lsn={}, xl_tot_len={}, inputbuf.remaining()={}, XLOG_SIZE_OF_XLOG_RECORD={}",
+                        self.lsn,
+                        xl_tot_len,
+                        self.inputbuf.remaining(),
+                        XLOG_SIZE_OF_XLOG_RECORD
+                    );
                     if (xl_tot_len as usize) < XLOG_SIZE_OF_XLOG_RECORD {
                         return Err(WalDecodeError {
                             msg: format!("invalid xl_tot_len {xl_tot_len}"),
@@ -166,6 +193,11 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
                         let recordbuf = self.inputbuf.copy_to_bytes(xl_tot_len as usize);
                         return Ok(Some(self.complete_record(recordbuf)?));
                     } else {
+                        tracing::info!(
+                            "TESTDBG poll_decode_internal: need to reassemble record, xl_tot_len={}, pageleft={}",
+                            xl_tot_len,
+                            pageleft
+                        );
                         // Need to assemble the record from pieces. Remember the size of the
                         // record, and loop back. On next iterations, we will reach the branch
                         // below, and copy the part of the record that was on this or next page(s)
@@ -215,6 +247,25 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
 
     fn complete_record(&mut self, recordbuf: Bytes) -> Result<(Lsn, Bytes), WalDecodeError> {
         // We now have a record in the 'recordbuf' local variable.
+        // openGauss XLogRecord is 32 bytes:
+        //   xl_tot_len:    4 bytes (offset 0)
+        //   xl_term:       4 bytes (offset 4)
+        //   xl_xid:        8 bytes (offset 8) - TransactionId is uint64 in openGauss
+        //   xl_prev:       8 bytes (offset 16)
+        //   xl_info:       1 byte  (offset 24)
+        //   xl_rmid:       1 byte  (offset 25)
+        //   xl_bucket_id:  2 bytes (offset 26)
+        //   xl_crc:        4 bytes (offset 28)
+        // Total: 32 bytes
+        
+        // TESTDBG: Print raw record header bytes
+        tracing::info!(
+            "TESTDBG complete_record: lsn={}, recordbuf.len()={}, header_hex={:02x?}",
+            self.lsn,
+            recordbuf.len(),
+            &recordbuf[0..std::cmp::min(recordbuf.len(), 64)]
+        );
+        
         let xlogrec =
             XLogRecord::from_slice(&recordbuf[0..XLOG_SIZE_OF_XLOG_RECORD]).map_err(|e| {
                 WalDecodeError {
@@ -223,12 +274,58 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
                 }
             })?;
 
+        // TESTDBG: Print parsed XLogRecord fields
+        tracing::info!(
+            "TESTDBG complete_record: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={}, xl_info=0x{:02x}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08x}",
+            xlogrec.xl_tot_len,
+            xlogrec.xl_term,
+            xlogrec.xl_xid,
+            xlogrec.xl_prev,
+            xlogrec.xl_info,
+            xlogrec.xl_rmid,
+            xlogrec.xl_bucket_id,
+            xlogrec.xl_crc
+        );
+
+        // openGauss CRC calculation:
+        // CRC is calculated over the record data (after xl_crc) first, then over the header (before xl_crc)
+        // xl_crc is at offset 28 in openGauss XLogRecord
+        let data_start = XLOG_RECORD_CRC_OFFS + 4; // 32
+        let data_end = recordbuf.len();
+        let hdr_start = 0;
+        let hdr_end = XLOG_RECORD_CRC_OFFS; // 28
+        
+        tracing::info!(
+            "TESTDBG complete_record: CRC calc: data_range=[{}..{}] ({} bytes), hdr_range=[{}..{}] ({} bytes), XLOG_RECORD_CRC_OFFS={}",
+            data_start, data_end, data_end - data_start,
+            hdr_start, hdr_end, hdr_end - hdr_start,
+            XLOG_RECORD_CRC_OFFS
+        );
+        
         let mut crc = 0;
-        crc = crc32c_append(crc, &recordbuf[XLOG_RECORD_CRC_OFFS + 4..]);
-        crc = crc32c_append(crc, &recordbuf[0..XLOG_RECORD_CRC_OFFS]);
+        crc = crc32c_append(crc, &recordbuf[data_start..data_end]);
+        let crc_after_data = crc;
+        crc = crc32c_append(crc, &recordbuf[hdr_start..hdr_end]);
+        
+        tracing::info!(
+            "TESTDBG complete_record: CRC calc: crc_after_data=0x{:08x}, final_crc=0x{:08x}, stored_crc=0x{:08x}, match={}",
+            crc_after_data, crc, xlogrec.xl_crc, crc == xlogrec.xl_crc
+        );
+        
         if crc != xlogrec.xl_crc {
+            tracing::warn!(
+                "WAL record CRC mismatch at {}: computed=0x{:08x}, stored=0x{:08x}, xl_tot_len={}, record_len={}",
+                self.lsn,
+                crc,
+                xlogrec.xl_crc,
+                xlogrec.xl_tot_len,
+                recordbuf.len()
+            );
             return Err(WalDecodeError {
-                msg: "WAL record crc mismatch".into(),
+                msg: format!(
+                    "WAL record crc mismatch: computed=0x{:08x}, stored=0x{:08x}",
+                    crc, xlogrec.xl_crc
+                ),
                 lsn: self.lsn,
             });
         }
@@ -239,7 +336,7 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
             trace!("saw xlog switch record at {}", self.lsn);
             self.lsn + self.lsn.calc_padding(WAL_SEGMENT_SIZE as u64)
         } else {
-            // Pad to an 8-byte boundary
+            // openGauss: All records are aligned to MAXALIGN (8 bytes)
             self.lsn.align()
         };
         self.state = State::SkippingEverything {

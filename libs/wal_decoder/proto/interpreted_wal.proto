@@ -13,7 +13,7 @@ message InterpretedWalRecord {
   SerializedValueBatch batch = 2;
   uint64 next_record_lsn = 3;
   bool flush_uncommitted = 4;
-  uint32 xid = 5;
+  uint64 xid = 5;
 }
 
 message SerializedValueBatch {

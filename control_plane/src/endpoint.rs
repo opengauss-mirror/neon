@@ -150,7 +150,8 @@ impl ComputeControlPlane {
         1 + self
             .endpoints
             .values()
-            .map(|ep| std::cmp::max(ep.pg_address.port(), ep.external_http_address.port()))
+            .map(|ep| std::cmp::max(ep.pg_address.port(),
+            std::cmp::max(ep.internal_http_address.port(), ep.external_http_address.port())))
             .max()
             .unwrap_or(self.base_port)
     }
@@ -455,6 +456,11 @@ impl Endpoint {
     // Generate postgresql.conf with default configuration
     fn setup_pg_conf(&self) -> Result<PostgresConf> {
         let mut conf = PostgresConf::new();
+        let is_gaussdb = self
+            .env
+            .pg_bin_dir(self.pg_version)?
+            .join("gaussdb")
+            .exists();
         conf.append("max_wal_senders", "10");
         conf.append("wal_log_hints", "off");
         conf.append("max_replication_slots", "10");
@@ -463,7 +469,7 @@ impl Endpoint {
         // Postgres to operate. Everything smaller might be not enough for Postgres under load,
         // and can cause errors like 'no unpinned buffers available', see
         // <https://github.com/neondatabase/neon/issues/9956>
-        conf.append("shared_buffers", "1MB");
+        conf.append("shared_buffers", "1024MB");
         // Postgres defaults to effective_io_concurrency=1, which does not exercise the pageserver's
         // batching logic.  Set this to 2 so that we exercise the code a bit without letting
         // individual tests do a lot of concurrent work on underpowered test machines
@@ -476,7 +482,9 @@ impl Endpoint {
         conf.append("wal_sender_timeout", "5s");
         conf.append("listen_addresses", &self.pg_address.ip().to_string());
         conf.append("port", &self.pg_address.port().to_string());
-        conf.append("wal_keep_size", "0");
+        if !is_gaussdb {
+            conf.append("wal_keep_size", "0");
+        }
         // walproposer panics when basebackup is invalid, it is pointless to restart in this case.
         conf.append("restart_after_crash", "off");
 
@@ -501,8 +509,10 @@ impl Endpoint {
                 //   To be able to restore database in case of pageserver node crash, safekeeper should not
                 //   remove WAL beyond this point. Too large lag can cause space exhaustion in safekeepers
                 //   (if they are not able to upload WAL to S3).
-                conf.append("max_replication_write_lag", "15MB");
-                conf.append("max_replication_flush_lag", "10GB");
+                if !is_gaussdb {
+                    conf.append("max_replication_write_lag", "15MB");
+                    conf.append("max_replication_flush_lag", "10GB");
+                }
 
                 if !self.env.safekeepers.is_empty() {
                     // Configure Postgres to connect to the safekeepers
@@ -512,7 +522,10 @@ impl Endpoint {
                         .env
                         .safekeepers
                         .iter()
-                        .map(|sk| format!("localhost:{}", sk.get_compute_port()))
+                        .map(|sk| {
+                            let sk_node = crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
+                            format!("{}:{}", sk_node.listen_addr, sk.get_compute_port())
+                        })
                         .collect::<Vec<String>>()
                         .join(",");
                     conf.append("neon.safekeepers", &safekeepers);
@@ -544,7 +557,16 @@ impl Endpoint {
                     .map(|x| x.get_compute_port().to_string())
                     .collect::<Vec<_>>()
                     .join(",");
-                let sk_hosts = vec!["localhost"; self.env.safekeepers.len()].join(",");
+                let sk_hosts = self
+                    .env
+                    .safekeepers
+                    .iter()
+                    .map(|sk| {
+                        let sk_node = crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
+                        sk_node.listen_addr
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
 
                 let connstr = format!(
                     "host={} port={} options='-c timeline_id={} tenant_id={}' application_name=replica replication=true",
@@ -563,6 +585,20 @@ impl Endpoint {
                 if self.pg_version >= PgMajorVersion::PG15 {
                     conf.append("recovery_prefetch", "off");
                 }
+
+                // Configure neon.safekeepers for the replica so that it can consume WAL
+                // to update its LSN position and read pages at the latest LSN
+                let safekeepers = self
+                    .env
+                    .safekeepers
+                    .iter()
+                    .map(|sk| {
+                        let sk_node = crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
+                        format!("{}:{}", sk_node.listen_addr, sk.get_compute_port())
+                    })
+                    .collect::<Vec<String>>()
+                    .join(",");
+                conf.append("neon.safekeepers", &safekeepers);
             }
         }
 
@@ -591,7 +627,7 @@ impl Endpoint {
     }
 
     fn pg_ctl(&self, args: &[&str], auth_token: &Option<String>) -> Result<()> {
-        let pg_ctl_path = self.env.pg_bin_dir(self.pg_version)?.join("pg_ctl");
+        let pg_ctl_path = self.env.pg_bin_dir(self.pg_version)?.join("gs_ctl");
         let mut cmd = Command::new(&pg_ctl_path);
         cmd.args(
             [
@@ -681,7 +717,8 @@ impl Endpoint {
                     .iter()
                     .find(|node| node.id == sk_id)
                     .ok_or_else(|| anyhow!("safekeeper {sk_id} does not exist"))?;
-                safekeeper_connstrings.push(format!("127.0.0.1:{}", sk.get_compute_port()));
+                let sk_node = crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
+                safekeeper_connstrings.push(format!("{}:{}", sk_node.listen_addr, sk.get_compute_port()));
             }
         }
         Ok(safekeeper_connstrings)
@@ -707,7 +744,19 @@ impl Endpoint {
             anyhow::bail!("The endpoint is already running");
         }
 
-        let postgresql_conf = self.read_postgresql_conf()?;
+        // Read postgresql.conf, or generate it if it doesn't exist
+        let postgresql_conf = {
+            let conf = self.read_postgresql_conf()?;
+            if conf.is_empty() {
+                // If the config file doesn't exist or is empty, generate a default one
+                let default_conf = self.setup_pg_conf()?.to_string();
+                let postgresql_conf_path = self.endpoint_path().join("postgresql.conf");
+                std::fs::write(&postgresql_conf_path, &default_conf)?;
+                default_conf
+            } else {
+                conf
+            }
+        };
 
         // We always start the compute node from scratch, so if the Postgres
         // data dir exists from a previous launch, remove it first.
@@ -854,15 +903,15 @@ impl Endpoint {
         .args(["--pgdata", self.pgdata().to_str().unwrap()])
         .args(["--connstr", &conn_str])
         .arg("--config")
-        .arg(self.endpoint_path().join("config.json").as_os_str())
-        .args([
-            "--pgbin",
-            self.env
-                .pg_bin_dir(self.pg_version)?
-                .join("postgres")
-                .to_str()
-                .unwrap(),
-        ])
+        .arg(self.endpoint_path().join("config.json").as_os_str());
+
+        let pg_bin_dir = self.env.pg_bin_dir(self.pg_version)?;
+        let pg_binary = if pg_bin_dir.join("gaussdb").exists() {
+            pg_bin_dir.join("gaussdb")
+        } else {
+            pg_bin_dir.join("postgres")
+        };
+        cmd.args(["--pgbin", pg_binary.to_str().unwrap()])
         // TODO: It would be nice if we generated compute IDs with the same
         // algorithm as the real control plane.
         .args(["--compute-id", &self.endpoint_id])

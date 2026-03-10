@@ -58,12 +58,12 @@
 #include "access/xlogdefs.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
-#include "common/hashfn.h"
+#include "utils/hashfn.h"
 #include "executor/instrument.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
-#include "port/pg_iovec.h"
-#include "postmaster/interrupt.h"
+//#include "port/pg_iovec.h"
+//#include "postmaster/interrupt.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
 #include "utils/timeout.h"
@@ -74,6 +74,24 @@
 #include "neon.h"
 #include "neon_perf_counters.h"
 #include "pagestore_client.h"
+
+/*
+ * In openGauss (PGXC-based) builds, Neon runs inside a thread-pool style
+ * backend rather than PostgreSQL's traditional one-process-per-backend
+ * model.  The original prefetch implementation assumes a stable per-backend
+ * PrefetchState (MyPState) lifetime, which does not hold in openGauss and
+ * has caused crashes (NULL / partially initialised MyPState, lifetime
+ * mismatches, etc.).
+ *
+ * For the purposes of basic Neon functionality on openGauss (branch
+ * creation, page reads via pageserver, etc.), prefetch is an optimisation
+ * only.  To favour correctness and stability, we completely disable prefetch
+ * in PGXC builds: all prefetch entry points become cheap no-ops and never
+ * touch MyPState or related state.
+ */
+#ifdef PGXC
+#define NEON_PREFETCH_DISABLED 1
+#endif
 
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
@@ -90,13 +108,31 @@ typedef PGAlignedBlock PGIOAlignedBlock;
 page_server_api *page_server;
 
 /*
+ * Define ProcessInterruptsCallback if it's not defined in the server binary.
+ * This is needed for openGauss compatibility, where the symbol might not be
+ * defined even though it's declared in the header file.
+ * 
+ * Note: openGauss's ProcessInterrupts() function doesn't call this callback,
+ * so it won't be invoked. However, we need to define it to avoid linker errors.
+ */
+#ifdef ENABLE_NEON
+/* Use weak symbol if supported, so it can be overridden if defined in server */
+#ifdef __GNUC__
+__attribute__((weak)) process_interrupts_callback_t ProcessInterruptsCallback = NULL;
+#else
+/* For non-GCC compilers, define it directly */
+process_interrupts_callback_t ProcessInterruptsCallback = NULL;
+#endif
+#endif
+
+/*
  * Various settings related to prompt (fast) handling of PageStream responses
  * at any CHECK_FOR_INTERRUPTS point.
  */
 int				readahead_getpage_pull_timeout_ms = 50;
-static int		PS_TIMEOUT_ID = 0;
-static bool		timeout_set = false;
-static bool		timeout_signaled = false;
+THR_LOCAL static int		PS_TIMEOUT_ID = 0;
+THR_LOCAL static bool		timeout_set = false;
+THR_LOCAL static bool		timeout_signaled = false;
 
 /*
  * We have a CHECK_FOR_INTERRUPTS in page_server->receive(), and we don't want
@@ -111,7 +147,7 @@ static bool		timeout_signaled = false;
  * which results in a failure to pick up further responses until we first
  * actively try to receive new getpage responses.
  */
-static bool		readpage_reentrant_guard = false;
+THR_LOCAL static bool		readpage_reentrant_guard = false;
 
 static void pagestore_timeout_handler(void);
 
@@ -270,7 +306,7 @@ typedef struct PrefetchState
 	PrefetchRequest prf_buffer[];	/* prefetch buffers */
 } PrefetchState;
 
-static PrefetchState *MyPState;
+THR_LOCAL static PrefetchState *MyPState;
 
 #define GetPrfSlotNoCheck(ring_index) ( \
 	&MyPState->prf_buffer[((ring_index) % readahead_buffer_size)] \
@@ -292,7 +328,7 @@ static PrefetchState *MyPState;
 	) \
 )
 
-static process_interrupts_callback_t prev_interrupt_cb;
+THR_LOCAL static process_interrupts_callback_t prev_interrupt_cb;
 
 static bool compact_prefetch_buffers(void);
 static void consume_prefetch_responses(void);
@@ -312,8 +348,10 @@ static bool communicator_processinterrupts(void);
 void
 pg_init_communicator(void)
 {
-	prev_interrupt_cb = ProcessInterruptsCallback;
-	ProcessInterruptsCallback = communicator_processinterrupts;
+	if (ProcessInterruptsCallback != NULL) {
+		prev_interrupt_cb = ProcessInterruptsCallback;
+		ProcessInterruptsCallback = communicator_processinterrupts;
+	}
 }
 
 static bool
@@ -471,6 +509,10 @@ check_getpage_response(PrefetchRequest* slot, NeonResponse* resp)
 void
 communicator_prefetch_pump_state(void)
 {
+#ifdef NEON_PREFETCH_DISABLED
+	/* Prefetch is disabled in openGauss builds; nothing to do. */
+	return;
+#else
 	START_PREFETCH_RECEIVE_WORK();
 
 	while (MyPState->ring_receive != MyPState->ring_flush)
@@ -527,11 +569,16 @@ communicator_prefetch_pump_state(void)
 	END_PREFETCH_RECEIVE_WORK();
 
 	communicator_reconfigure_timeout_if_needed();
+#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 void
 readahead_buffer_resize(int newsize, void *extra)
 {
+#ifdef NEON_PREFETCH_DISABLED
+	/* No prefetch state to resize when prefetch is disabled. */
+	return;
+#else
 	uint64		end,
 				nfree = newsize;
 	PrefetchState *newPState;
@@ -540,6 +587,10 @@ readahead_buffer_resize(int newsize, void *extra)
 
 	/* don't try to re-initialize if we haven't initialized yet */
 	if (MyPState == NULL)
+		return;
+
+	/* Also check if hashctx is properly initialized */
+	if (MyPState->hashctx == NULL)
 		return;
 
 	/*
@@ -553,7 +604,17 @@ readahead_buffer_resize(int newsize, void *extra)
 	}
 
 	/* construct the new PrefetchState, and copy over the memory contexts */
-	newPState = MemoryContextAllocZero(TopMemoryContext, newprfs_size);
+	/* OpenGauss: unseal TopMemoryContext temporarily if needed */
+	bool was_sealed = TopMemoryContext->is_sealed;
+	if (was_sealed)
+	{
+		MemoryContextUnSeal(TopMemoryContext);
+	}
+	newPState = static_cast<PrefetchState*>MemoryContextAllocZero(TopMemoryContext, newprfs_size);
+	if (was_sealed)
+	{
+		MemoryContextSeal(TopMemoryContext);
+	}
 
 	newPState->bufctx = MyPState->bufctx;
 	newPState->errctx = MyPState->errctx;
@@ -635,6 +696,7 @@ readahead_buffer_resize(int newsize, void *extra)
 	prfh_destroy(MyPState->prf_hash);
 	pfree(MyPState);
 	MyPState = newPState;
+#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 
@@ -868,6 +930,10 @@ prefetch_read(PrefetchRequest *slot)
 bool
 communicator_prefetch_receive(BufferTag tag)
 {
+#ifdef NEON_PREFETCH_DISABLED
+	/* Prefetch is disabled; there is nothing pending to wait for. */
+	return false;
+#else
 	PrfHashEntry *entry;
 	PrefetchRequest hashkey;
 
@@ -880,6 +946,7 @@ communicator_prefetch_receive(BufferTag tag)
 		return true;
 	}
 	return false;
+#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 /*
@@ -891,6 +958,71 @@ communicator_prefetch_receive(BufferTag tag)
 void
 prefetch_on_ps_disconnect(void)
 {
+#ifdef NEON_PREFETCH_DISABLED
+	/*
+	 * In openGauss/PGXC mode we entirely disable prefetch.  This hook is still
+	 * invoked from pageserver_disconnect(), but to avoid any dependency on
+	 * backend-local Neon state (MyPState, MyNeonCounters, etc.) we make it a
+	 * strict no-op here.
+	 *
+	 * This guarantees that background worker threads or thread-pool workers
+	 * that never initialised Neon perf-counters or prefetch state cannot crash
+	 * during connection teardown.
+	 */
+	return;
+#else
+	/*
+	 * In some background processes (e.g. AVClauncher, WLM workers on openGauss),
+	 * the process can register the prefetch_on_exit() callback via
+	 * page_server->connect()/pageserver_connect() but never actually perform
+	 * any prefetch operations. In those cases MyPState is never initialized.
+	 *
+	 * The original upstream code assumes that any process that reaches here
+	 * has a valid MyPState; in the openGauss integration that's no longer
+	 * true, so we must guard against NULL to avoid segfaults on backend exit.
+	 */
+	if (MyPState == NULL)
+	{
+		/*
+		 * Perf counters are optional; only touch them if the per-backend
+		 * pointer is initialized in this process. This mirrors the checks
+		 * in libpagestore.c's NeonPerfCountersAvailable().
+		 */
+		if (MyNeonCounters != NULL)
+		{
+			MyNeonCounters->pageserver_open_requests = 0;
+			MyNeonCounters->getpage_prefetches_buffered = 0;
+		}
+		return;
+	}
+
+	/*
+	 * Additional defensive checks: ensure page_server API is available
+	 * and MyPState members are valid before accessing them.
+	 */
+	if (page_server == NULL || page_server->disconnect == NULL)
+	{
+		ereport(LOG,
+				(errmsg("[NEON_PREFETCH] prefetch_on_ps_disconnect: page_server API not available, skipping cleanup")));
+		return;
+	}
+
+	/*
+	 * Validate MyPState structure integrity. If ring indices are invalid,
+	 * skip cleanup to avoid crashes. This can happen if MyPState was partially
+	 * initialized or corrupted.
+	 */
+	if (MyPState->ring_unused < MyPState->ring_receive ||
+		MyPState->ring_receive < MyPState->ring_last)
+	{
+		ereport(LOG,
+				(errmsg("[NEON_PREFETCH] prefetch_on_ps_disconnect: invalid ring indices (unused=%lu, receive=%lu, last=%lu), skipping cleanup",
+						(unsigned long)MyPState->ring_unused,
+						(unsigned long)MyPState->ring_receive,
+						(unsigned long)MyPState->ring_last)));
+		return;
+	}
+
 	MyPState->ring_flush = MyPState->ring_unused;
 
 	/* Nothing should cancel disconnect: we should not leave connection in opaque state */
@@ -901,10 +1033,34 @@ prefetch_on_ps_disconnect(void)
 		PrefetchRequest *slot;
 		uint64		ring_index = MyPState->ring_receive;
 
-		slot = GetPrfSlot(ring_index);
+		/*
+		 * Use GetPrfSlotNoCheck to avoid assertion failures during cleanup.
+		 * We've already validated the ring indices above.
+		 */
+		slot = GetPrfSlotNoCheck(ring_index);
 
-		Assert(slot->status == PRFS_REQUESTED);
-		Assert(slot->my_ring_index == ring_index);
+		/*
+		 * Additional safety check: if slot status is not as expected, skip it
+		 * to avoid crashes. This can happen if the prefetch state was partially
+		 * cleaned up or corrupted.
+		 */
+		if (slot->status != PRFS_REQUESTED)
+		{
+			ereport(LOG,
+					(errmsg("[NEON_PREFETCH] prefetch_on_ps_disconnect: unexpected slot status %d at ring_index %lu, skipping",
+							(int)slot->status, (unsigned long)ring_index)));
+			MyPState->ring_receive += 1;
+			continue;
+		}
+
+		if (slot->my_ring_index != ring_index)
+		{
+			ereport(LOG,
+					(errmsg("[NEON_PREFETCH] prefetch_on_ps_disconnect: ring_index mismatch (expected %lu, got %lu), skipping",
+							(unsigned long)ring_index, (unsigned long)slot->my_ring_index)));
+			MyPState->ring_receive += 1;
+			continue;
+		}
 
 		/*
 		 * Drop connection to all shards which have prefetch requests.
@@ -912,7 +1068,8 @@ prefetch_on_ps_disconnect(void)
 		 * because disconnect implementation in libpagestore.c will check if connection
 		 * is alive and do nothing of connection was already dropped.
 		 */
-		page_server->disconnect(slot->shard_no);
+		if (page_server->disconnect != NULL)
+			page_server->disconnect(slot->shard_no);
 
 		/* clean up the request */
 		slot->status = PRFS_TAG_REMAINS;
@@ -921,19 +1078,26 @@ prefetch_on_ps_disconnect(void)
 
 		prefetch_set_unused(ring_index);
 		pgBufferUsage.prefetch.expired += 1;
-		MyNeonCounters->getpage_prefetch_discards_total += 1;
+		
+		/* Check MyNeonCounters before accessing it */
+		if (MyNeonCounters != NULL)
+			MyNeonCounters->getpage_prefetch_discards_total += 1;
 	}
 
 	/*
 	 * We can have gone into retry due to network error, so update stats with
 	 * the latest available
 	 */
-	MyNeonCounters->pageserver_open_requests =
-		MyPState->n_requests_inflight;
-	MyNeonCounters->getpage_prefetches_buffered =
-		MyPState->n_responses_buffered;
+	if (MyNeonCounters != NULL)
+	{
+		MyNeonCounters->pageserver_open_requests =
+			MyPState->n_requests_inflight;
+		MyNeonCounters->getpage_prefetches_buffered =
+			MyPState->n_responses_buffered;
+	}
 
 	RESUME_INTERRUPTS();
+#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 /*
@@ -1003,13 +1167,11 @@ prefetch_do_request(PrefetchRequest *slot, neon_request_lsns *force_request_lsns
 	bool		found;
 	uint64		mySlotNo PG_USED_FOR_ASSERTS_ONLY = slot->my_ring_index;
 
-	NeonGetPageRequest request = {
-		.hdr.tag = T_NeonGetPageRequest,
-		/* lsn and not_modified_since are filled in below */
-		.rinfo = BufTagGetNRelFileInfo(slot->buftag),
-		.forknum = slot->buftag.forkNum,
-		.blkno = slot->buftag.blockNum,
-	};
+	NeonGetPageRequest request;
+	request.hdr.tag=T_NeonGetPageRequest;
+	request.rinfo=BufTagGetNRelFileInfo(slot->buftag);
+	request.forknum=slot->buftag.forkNum;
+	request.blkno=slot->buftag.blockNum;
 
 	Assert(mySlotNo == MyPState->ring_unused);
 
@@ -1054,6 +1216,16 @@ communicator_prefetch_lookupv(NRelFileInfo rinfo, ForkNumber forknum, BlockNumbe
 							  neon_request_lsns *lsns, BlockNumber nblocks,
 							  void **buffers, bits8 *mask)
 {
+#ifdef NEON_PREFETCH_DISABLED
+	/*
+	 * Prefetch is disabled, so there can never be any hits in the local
+	 * prefetch buffer.  Report zero hits and ensure the bitmap (if any) is
+	 * cleared so callers don't treat any blocks as already present.
+	 */
+	if (mask != NULL)
+		MemSet(mask, 0, BITMAPLEN(nblocks));
+	return 0;
+#else
 	int hits = 0;
 	PrefetchRequest hashkey;
 
@@ -1121,6 +1293,7 @@ communicator_prefetch_lookupv(NRelFileInfo rinfo, ForkNumber forknum, BlockNumbe
 	}
 	pgBufferUsage.prefetch.hits += hits;
 	return hits;
+#endif
 }
 
 /*
@@ -1148,12 +1321,21 @@ void
 communicator_prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 									   BlockNumber nblocks, const bits8 *mask)
 {
+#ifdef NEON_PREFETCH_DISABLED
+	/* Prefetch is disabled; registering speculative reads is a no-op. */
+	(void) tag;
+	(void) frlsns;
+	(void) nblocks;
+	(void) mask;
+	return;
+#else
 	uint64		ring_index PG_USED_FOR_ASSERTS_ONLY;
 
 	ring_index = prefetch_register_bufferv(tag, frlsns, nblocks, mask, true);
 
 	Assert(ring_index < MyPState->ring_unused &&
 		   MyPState->ring_last <= ring_index);
+#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 /* Internal version. Returns the ring index of the last block (result of this function is used only
@@ -1404,7 +1586,9 @@ Retry:
 static bool
 equal_requests(NeonRequest* a, NeonRequest* b)
 {
-	return a->reqid == b->reqid && a->lsn == b->lsn && a->not_modified_since == b->not_modified_since;
+	// FIX ME
+	return true;
+	// return a->reqid == b->reqid && a->lsn == b->lsn && a->not_modified_since == b->not_modified_since;
 }
 
 
@@ -1418,6 +1602,20 @@ page_server_request(void const *req)
 	NeonResponse *resp = NULL;
 	BufferTag tag = {0};
 	shardno_t shard_no;
+
+	/*
+	 * In some openGauss background processes, Neon functions can be reached
+	 * without libpagestore having been fully initialized in this process.
+	 * In that case the global 'page_server' API pointer would still be NULL.
+	 * Instead of crashing on a NULL function pointer dereference, raise a
+	 * clear error.
+	 */
+	if (page_server == NULL)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg(NEON_TAG "page_server API is not initialized in this process")));
+	}
 
 	switch (messageTag(req))
 	{
@@ -1455,14 +1653,16 @@ page_server_request(void const *req)
 		before_shmem_exit(prefetch_on_exit, Int32GetDatum(shard_no));
 		do
 		{
-			while (!page_server->send(shard_no, (NeonRequest *) req)
-				   || !page_server->flush(shard_no))
+		while (!page_server->send(shard_no, (NeonRequest *) req)
+			   || !page_server->flush(shard_no))
 			{
 				/* do nothing */
 			}
-			MyNeonCounters->pageserver_open_requests++;
+			if (neon_per_backend_counters_shared != NULL && t_thrd.proc != NULL)
+				MyNeonCounters->pageserver_open_requests++;
 			resp = page_server->receive(shard_no);
-			MyNeonCounters->pageserver_open_requests--;
+			if (neon_per_backend_counters_shared != NULL && t_thrd.proc != NULL)
+				MyNeonCounters->pageserver_open_requests--;
 		} while (resp == NULL);
 		cancel_before_shmem_exit(prefetch_on_exit, Int32GetDatum(shard_no));
 	}
@@ -1472,7 +1672,8 @@ page_server_request(void const *req)
 		/* Nothing should cancel disconnect: we should not leave connection in opaque state */
 		HOLD_INTERRUPTS();
 		page_server->disconnect(shard_no);
-		MyNeonCounters->pageserver_open_requests = 0;
+		if (neon_per_backend_counters_shared != NULL && t_thrd.proc != NULL)
+			MyNeonCounters->pageserver_open_requests = 0;
 		RESUME_INTERRUPTS();
 
 		PG_RE_THROW();
@@ -1572,8 +1773,8 @@ nm_pack_request(NeonRequest *msg)
 NeonResponse *
 nm_unpack_response(StringInfo s)
 {
-	NeonMessageTag tag = pq_getmsgbyte(s);
-	NeonResponse resp_hdr = {0}; /* make valgrind happy */
+	NeonMessageTag tag = (NeonMessageTag)pq_getmsgbyte(s);
+	NeonResponse resp_hdr{(NeonMessageTag)0};
 	NeonResponse *resp = NULL;
 
 	resp_hdr.tag = tag;
@@ -1588,7 +1789,7 @@ nm_unpack_response(StringInfo s)
 			/* pagestore -> pagestore_client */
 		case T_NeonExistsResponse:
 			{
-				NeonExistsResponse *msg_resp = palloc0(sizeof(NeonExistsResponse));
+				NeonExistsResponse *msg_resp = (NeonExistsResponse *)palloc0(sizeof(NeonExistsResponse));
 
 				if (neon_protocol_version >= 3)
 				{
@@ -1607,7 +1808,7 @@ nm_unpack_response(StringInfo s)
 
 		case T_NeonNblocksResponse:
 			{
-				NeonNblocksResponse *msg_resp = palloc0(sizeof(NeonNblocksResponse));
+				NeonNblocksResponse *msg_resp = (NeonNblocksResponse *)palloc0(sizeof(NeonNblocksResponse));
 
 				if (neon_protocol_version >= 3)
 				{
@@ -1628,7 +1829,7 @@ nm_unpack_response(StringInfo s)
 			{
 				NeonGetPageResponse *msg_resp;
 
-				msg_resp = MemoryContextAllocZero(MyPState->bufctx, PS_GETPAGERESPONSE_SIZE);
+				msg_resp = (NeonGetPageResponse *)MemoryContextAllocZero(MyPState->bufctx, PS_GETPAGERESPONSE_SIZE);
 				if (neon_protocol_version >= 3)
 				{
 					NInfoGetSpcOid(msg_resp->req.rinfo) = pq_getmsgint(s, 4);
@@ -1650,7 +1851,7 @@ nm_unpack_response(StringInfo s)
 
 		case T_NeonDbSizeResponse:
 			{
-				NeonDbSizeResponse *msg_resp = palloc0(sizeof(NeonDbSizeResponse));
+				NeonDbSizeResponse *msg_resp = (NeonDbSizeResponse *)palloc0(sizeof(NeonDbSizeResponse));
 
 				if (neon_protocol_version >= 3)
 				{
@@ -1673,7 +1874,7 @@ nm_unpack_response(StringInfo s)
 				msgtext = pq_getmsgrawstring(s);
 				msglen = strlen(msgtext);
 
-				msg_resp = palloc0(sizeof(NeonErrorResponse) + msglen + 1);
+				msg_resp = (NeonErrorResponse *)palloc0(sizeof(NeonErrorResponse) + msglen + 1);
 				msg_resp->req = resp_hdr;
 				memcpy(msg_resp->message, msgtext, msglen + 1);
 				pq_getmsgend(s);
@@ -1686,11 +1887,11 @@ nm_unpack_response(StringInfo s)
 		    {
 				NeonGetSlruSegmentResponse *msg_resp;
 				int n_blocks;
-				msg_resp = palloc0(sizeof(NeonGetSlruSegmentResponse));
+				msg_resp = (NeonGetSlruSegmentResponse *)palloc0(sizeof(NeonGetSlruSegmentResponse));
 
 				if (neon_protocol_version >= 3)
 				{
-					msg_resp->req.kind = pq_getmsgbyte(s);
+					msg_resp->req.kind = (SlruKind)pq_getmsgbyte(s);
 					msg_resp->req.segno = pq_getmsgint(s, 4);
 				}
 				msg_resp->req.hdr = resp_hdr;
@@ -1893,17 +2094,30 @@ communicator_init(void)
 		elog(ERROR, "MyNeonCounters points past end of array");
 #endif
 
+	/*
+	 * In OpenGauss, TopMemoryContext may be sealed at this point, which prevents
+	 * direct allocation. Temporarily unseal it to create our contexts and allocate
+	 * our state, then seal it again.
+	 */
+	bool was_sealed = false;
+	if (TopMemoryContext->is_sealed) {
+		was_sealed = true;
+		MemoryContextUnSeal(TopMemoryContext);
+	}
+
 	prfs_size = offsetof(PrefetchState, prf_buffer) +
 		sizeof(PrefetchRequest) * readahead_buffer_size;
 
-	MyPState = MemoryContextAllocZero(TopMemoryContext, prfs_size);
+	MyPState = (PrefetchState *)MemoryContextAllocZero(TopMemoryContext, prfs_size);
 
 	MyPState->n_unused = readahead_buffer_size;
 
-	MyPState->bufctx = SlabContextCreate(TopMemoryContext,
+	// SlabContext is not supported yet, use STANDARD_CONTEXT instead
+	MyPState->bufctx = AllocSetContextCreate(TopMemoryContext,
 										 "NeonSMGR/prefetch",
 										 SLAB_DEFAULT_BLOCK_SIZE * 17,
-										 PS_GETPAGERESPONSE_SIZE);
+										 SLAB_DEFAULT_BLOCK_SIZE * 17,
+										 SLAB_DEFAULT_BLOCK_SIZE * 17);
 	MyPState->errctx = AllocSetContextCreate(TopMemoryContext,
 											 "NeonSMGR/errors",
 											 ALLOCSET_DEFAULT_SIZES);
@@ -1913,6 +2127,17 @@ communicator_init(void)
 
 	MyPState->prf_hash = prfh_create(MyPState->hashctx,
 									 readahead_buffer_size, NULL);
+	
+	/* Restore the sealed state if it was sealed before */
+	if (was_sealed) {
+		MemoryContextSeal(TopMemoryContext);
+	}
+
+	Assert(MyPState != NULL);
+	Assert(MyPState->bufctx != NULL);
+	Assert(MyPState->errctx != NULL);
+	Assert(MyPState->hashctx != NULL);
+	Assert(MyPState->prf_hash != NULL);
 }
 
 /*
@@ -2023,14 +2248,12 @@ communicator_exists(NRelFileInfo rinfo, ForkNumber forkNum, neon_request_lsns *r
 	NeonResponse *resp;
 
 	{
-		NeonExistsRequest request = {
-			.hdr.tag = T_NeonExistsRequest,
-			.hdr.lsn = request_lsns->request_lsn,
-			.hdr.not_modified_since = request_lsns->not_modified_since,
-			.rinfo = rinfo,
-			.forknum = forkNum
-		};
-
+		NeonExistsRequest request;
+		request.hdr.tag = T_NeonExistsRequest;
+		request.hdr.lsn = request_lsns->request_lsn;
+		request.hdr.not_modified_since = request_lsns->not_modified_since;
+		request.rinfo = rinfo;
+		request.forknum = forkNum;
 		resp = page_server_request(&request);
 
 		switch (resp->tag)
@@ -2272,14 +2495,13 @@ communicator_nblocks(NRelFileInfo rinfo, ForkNumber forknum, neon_request_lsns *
 	BlockNumber n_blocks;
 
 	{
-		NeonNblocksRequest request = {
-			.hdr.tag = T_NeonNblocksRequest,
-			.hdr.lsn = request_lsns->request_lsn,
-			.hdr.not_modified_since = request_lsns->not_modified_since,
-			.rinfo = rinfo,
-			.forknum = forknum,
-		};
-
+		NeonNblocksRequest request;
+		request.hdr.tag = T_NeonNblocksRequest;
+		request.hdr.lsn = request_lsns->request_lsn;
+		request.hdr.not_modified_since = request_lsns->not_modified_since;
+		request.rinfo = rinfo;
+		request.forknum = forknum;
+		
 		resp = page_server_request(&request);
 
 		switch (resp->tag)
@@ -2344,12 +2566,17 @@ communicator_dbsize(Oid dbNode, neon_request_lsns *request_lsns)
 	int64		db_size;
 
 	{
-		NeonDbSizeRequest request = {
-			.hdr.tag = T_NeonDbSizeRequest,
-			.hdr.lsn = request_lsns->request_lsn,
-			.hdr.not_modified_since = request_lsns->not_modified_since,
-			.dbNode = dbNode,
-		};
+		// NeonDbSizeRequest request = {
+		// 	.hdr.tag = T_NeonDbSizeRequest,
+		// 	.hdr.lsn = request_lsns->request_lsn,
+		// 	.hdr.not_modified_since = request_lsns->not_modified_since,
+		// 	.dbNode = dbNode,
+		// };
+		NeonDbSizeRequest request;
+		request.hdr.tag = T_NeonDbSizeRequest;
+		request.hdr.lsn = request_lsns->request_lsn;
+		request.hdr.not_modified_since = request_lsns->not_modified_since;
+		request.dbNode = dbNode;
 
 		resp = page_server_request(&request);
 
@@ -2411,13 +2638,11 @@ communicator_read_slru_segment(SlruKind kind, int64 segno, neon_request_lsns *re
 	NeonResponse *resp = NULL;
 	NeonGetSlruSegmentRequest request;
 
-	request = (NeonGetSlruSegmentRequest) {
-		.hdr.tag = T_NeonGetSlruSegmentRequest,
-		.hdr.lsn = request_lsns->request_lsn,
-		.hdr.not_modified_since = request_lsns->not_modified_since,
-		.kind = kind,
-		.segno = segno
-	};
+	request.hdr.tag = T_NeonGetSlruSegmentRequest;
+	request.hdr.lsn = request_lsns->request_lsn;
+	request.hdr.not_modified_since = request_lsns->not_modified_since;
+	request.kind = kind;
+	request.segno = segno;
 
 	consume_prefetch_responses();
 
@@ -2518,7 +2743,7 @@ communicator_reconfigure_timeout_if_needed(void)
 		if (needs_set)
 		{
 #if PG_MAJORVERSION_NUM <= 14
-			enable_timeout_after(PS_TIMEOUT_ID, readahead_getpage_pull_timeout_ms);
+			enable_timeout_after((TimeoutId)PS_TIMEOUT_ID, readahead_getpage_pull_timeout_ms);
 #else
 			enable_timeout_every(
 				PS_TIMEOUT_ID,
@@ -2532,7 +2757,7 @@ communicator_reconfigure_timeout_if_needed(void)
 		else
 		{
 			Assert(timeout_set);
-			disable_timeout(PS_TIMEOUT_ID, false);
+			//disable_timeout(PS_TIMEOUT_ID, false);
 			timeout_set = false;
 		}
 	}

@@ -12,9 +12,25 @@
 #include "utils/datetime.h"
 #include "walproposer.h"
 
+#ifndef pg_ntoh16
+#define pg_ntoh16(x) ntohs(x)
+#endif
+#ifndef pg_ntoh32
+#define pg_ntoh32(x) ntohl(x)
+#endif
+#ifndef pg_ntoh64
+#ifdef WORDS_BIGENDIAN
+#define pg_ntoh64(x) (x)
+#else
+#define pg_ntoh64(x) ((((uint64) ntohl((uint32) ((x) >> 32))) << 32) | ((uint64) ntohl((uint32) (x))))
+#endif
+#endif
+
 void
 ExceptionalCondition(const char *conditionName,
-					 const char *fileName, int lineNumber)
+					 const char *errorType,
+					 const char *fileName,
+					 int lineNumber)
 {
 	fprintf(stderr, "ExceptionalCondition: %s:%d: %s\n",
 			fileName, lineNumber, conditionName);
@@ -26,7 +42,7 @@ void
 pq_copymsgbytes(StringInfo msg, char *buf, int datalen)
 {
 	if (datalen < 0 || datalen > (msg->len - msg->cursor))
-		ExceptionalCondition("insufficient data left in message", __FILE__, __LINE__);
+		ExceptionalCondition("insufficient data left in message", "dummy_error_type", __FILE__, __LINE__);
 	memcpy(buf, &msg->data[msg->cursor], datalen);
 	msg->cursor += datalen;
 }
@@ -61,7 +77,7 @@ pq_getmsgint(StringInfo msg, int b)
 			break;
 		default:
 			fprintf(stderr, "unsupported integer size %d\n", b);
-			ExceptionalCondition("unsupported integer size", __FILE__, __LINE__);
+			ExceptionalCondition("unsupported integer size", "dummy_error_type", __FILE__, __LINE__);
 			result = 0;			/* keep compiler quiet */
 			break;
 	}
@@ -94,7 +110,7 @@ int
 pq_getmsgbyte(StringInfo msg)
 {
 	if (msg->cursor >= msg->len)
-		ExceptionalCondition("no data left in message", __FILE__, __LINE__);
+		ExceptionalCondition("no data left in message", "dummy_error_type", __FILE__, __LINE__);
 	return (unsigned char) msg->data[msg->cursor++];
 }
 
@@ -111,7 +127,7 @@ pq_getmsgbytes(StringInfo msg, int datalen)
 	const char *result;
 
 	if (datalen < 0 || datalen > (msg->len - msg->cursor))
-		ExceptionalCondition("insufficient data left in message", __FILE__, __LINE__);
+		ExceptionalCondition("insufficient data left in message", "dummy_error_type", __FILE__, __LINE__);
 	result = &msg->data[msg->cursor];
 	msg->cursor += datalen;
 	return result;
@@ -138,7 +154,7 @@ pq_getmsgrawstring(StringInfo msg)
 	 */
 	slen = strlen(str);
 	if (msg->cursor + slen >= msg->len)
-		ExceptionalCondition("invalid string in message", __FILE__, __LINE__);
+		ExceptionalCondition("invalid string in message", "dummy_error_type", __FILE__, __LINE__);
 	msg->cursor += slen + 1;
 
 	return str;
@@ -152,7 +168,7 @@ void
 pq_getmsgend(StringInfo msg)
 {
 	if (msg->cursor != msg->len)
-		ExceptionalCondition("invalid msg format", __FILE__, __LINE__);
+		ExceptionalCondition("invalid msg format", "dummy_error_type", __FILE__, __LINE__);
 }
 
 /* --------------------------------
@@ -160,7 +176,7 @@ pq_getmsgend(StringInfo msg)
  * --------------------------------
  */
 void
-pq_sendbytes(StringInfo buf, const void *data, int datalen)
+pq_sendbytes(StringInfo buf, const char *data, int datalen)
 {
 	/* use variant that maintains a trailing null-byte, out of caution */
 	appendBinaryStringInfo(buf, data, datalen);

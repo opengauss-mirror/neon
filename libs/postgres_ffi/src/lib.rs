@@ -58,10 +58,7 @@ macro_rules! postgres_ffi {
 #[macro_export]
 macro_rules! for_all_postgres_versions {
     ($macro:tt) => {
-        $macro!(v14);
-        $macro!(v15);
-        $macro!(v16);
-        $macro!(v17);
+        $macro!(V702);
     };
 }
 
@@ -93,10 +90,7 @@ macro_rules! dispatch_pgversion {
             $version => $code,
             default = $invalid_pgver_handling,
             pgversions = [
-                $crate::PgMajorVersion::PG14 => v14,
-                $crate::PgMajorVersion::PG15 => v15,
-                $crate::PgMajorVersion::PG16 => v16,
-                $crate::PgMajorVersion::PG17 => v17,
+                $crate::PgMajorVersion::PG14 => V702,
             ]
         )
     };
@@ -125,10 +119,7 @@ macro_rules! enum_pgversion_dispatch {
             typ = $typ,
             code = $code,
             pgversions = [
-                V14 : v14,
-                V15 : v15,
-                V16 : v16,
-                V17 : v17,
+                V14 : V702,
             ]
         )
     };
@@ -155,10 +146,7 @@ macro_rules! enum_pgversion {
             name = $name,
             typ = $t,
             pgversions = [
-                V14 : v14,
-                V15 : v15,
-                V16 : v16,
-                V17 : v17,
+                V14 : V702,
             ]
         }
     };
@@ -168,10 +156,7 @@ macro_rules! enum_pgversion {
             path = $p,
             typ = $t,
             pgversions = [
-                V14 : v14,
-                V15 : v15,
-                V16 : v16,
-                V17 : v17,
+                V14 : V702,
             ]
         }
     };
@@ -225,13 +210,13 @@ pub mod relfile_utils;
 pub mod walrecord;
 
 // Export some widely used datatypes that are unlikely to change across Postgres versions
-pub use v14::bindings::{
+pub use V702::bindings::{
     BlockNumber, CheckPoint, ControlFileData, MultiXactId, OffsetNumber, Oid, PageHeaderData,
     RepOriginId, TimeLineID, TransactionId, XLogRecPtr, XLogRecord, XLogSegNo, uint32, uint64,
 };
 // Likewise for these, although the assumption that these don't change is a little more iffy.
-pub use v14::bindings::{MultiXactOffset, MultiXactStatus};
-pub use v14::xlog_utils::{
+pub use V702::bindings::{MultiXactOffset, MultiXactStatus};
+pub use V702::xlog_utils::{
     XLOG_SIZE_OF_XLOG_LONG_PHD, XLOG_SIZE_OF_XLOG_RECORD, XLOG_SIZE_OF_XLOG_SHORT_PHD,
 };
 
@@ -245,8 +230,8 @@ pub const WAL_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_SEND_SIZE: usize = XLOG_BLCKSZ * 16;
 
 // Export some version independent functions that are used outside of this mod
-pub use v14::bindings::DBState_DB_SHUTDOWNED;
-pub use v14::xlog_utils::{
+pub use V702::bindings::DBState_DB_SHUTDOWNED;
+pub use V702::xlog_utils::{
     XLogFileName, encode_logical_message, get_current_timestamp, to_pg_timestamp,
     try_from_pg_timestamp,
 };
@@ -293,7 +278,7 @@ pub const PG_TLI: u32 = 1;
 
 //  See TransactionIdIsNormal in transam.h
 pub const fn transaction_id_is_normal(id: TransactionId) -> bool {
-    id > pg_constants::FIRST_NORMAL_TRANSACTION_ID
+    id > pg_constants::FIRST_NORMAL_TRANSACTION_ID as u64
 }
 
 // See TransactionIdPrecedes in transam.c
@@ -407,11 +392,27 @@ pub mod waldecoder {
         }
 
         pub fn feed_bytes(&mut self, buf: &[u8]) {
+            // TESTDBG: Log input data to decoder
+            if !buf.is_empty() {
+                tracing::info!(
+                    "TESTDBG WalStreamDecoder::feed_bytes: lsn={}, buf_len={}, first_32_bytes={:02x?}",
+                    self.lsn,
+                    buf.len(),
+                    &buf[..std::cmp::min(buf.len(), 32)]
+                );
+                // Also print end bytes if buffer is longer
+                if buf.len() > 64 {
+                    tracing::info!(
+                        "TESTDBG WalStreamDecoder::feed_bytes: last_32_bytes={:02x?}",
+                        &buf[buf.len()-32..]
+                    );
+                }
+            }
             self.inputbuf.extend_from_slice(buf);
         }
 
         pub fn poll_decode(&mut self) -> Result<Option<(Lsn, Bytes)>, WalDecodeError> {
-            dispatch_pgversion!(
+            let result = dispatch_pgversion!(
                 self.pg_version,
                 {
                     use pgv::waldecoder_handler::WalStreamDecoderHandler;
@@ -421,7 +422,67 @@ pub mod waldecoder {
                     msg: format!("Unknown version {}", self.pg_version),
                     lsn: self.lsn,
                 })
-            )
+            );
+            
+            // TESTDBG: Log decoded record
+            match &result {
+                Ok(Some((next_lsn, recdata))) => {
+                    // Parse the XLogRecord header for logging
+                    if recdata.len() >= 32 {
+                        let xl_tot_len = u32::from_le_bytes([recdata[0], recdata[1], recdata[2], recdata[3]]);
+                        let xl_term = u32::from_le_bytes([recdata[4], recdata[5], recdata[6], recdata[7]]);
+                        let xl_xid = u64::from_le_bytes([recdata[8], recdata[9], recdata[10], recdata[11], recdata[12], recdata[13], recdata[14], recdata[15]]);
+                        let xl_prev = u64::from_le_bytes([recdata[16], recdata[17], recdata[18], recdata[19], recdata[20], recdata[21], recdata[22], recdata[23]]);
+                        let xl_info = recdata[24];
+                        let xl_rmid = recdata[25];
+                        let xl_bucket_id = u16::from_le_bytes([recdata[26], recdata[27]]);
+                        let xl_crc = u32::from_le_bytes([recdata[28], recdata[29], recdata[30], recdata[31]]);
+                        
+                        tracing::info!(
+                            "TESTDBG WalStreamDecoder::poll_decode: SUCCESS next_lsn={}, record_len={}, xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
+                            next_lsn,
+                            recdata.len(),
+                            xl_tot_len,
+                            xl_term,
+                            xl_xid,
+                            (xl_prev >> 32) as u32, xl_prev as u32,
+                            xl_info,
+                            xl_rmid,
+                            xl_bucket_id,
+                            xl_crc
+                        );
+                        
+                        // Print the full record in hex for complete comparison
+                        if recdata.len() <= 256 {
+                            tracing::info!(
+                                "TESTDBG WalStreamDecoder::poll_decode: record_hex={:02x?}",
+                                &recdata[..]
+                            );
+                        } else {
+                            tracing::info!(
+                                "TESTDBG WalStreamDecoder::poll_decode: record_hex (first 128)={:02x?}",
+                                &recdata[..128]
+                            );
+                            tracing::info!(
+                                "TESTDBG WalStreamDecoder::poll_decode: record_hex (last 64)={:02x?}",
+                                &recdata[recdata.len()-64..]
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Not enough data yet, this is normal
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "TESTDBG WalStreamDecoder::poll_decode: ERROR at lsn={}: {}",
+                        self.lsn,
+                        e.msg
+                    );
+                }
+            }
+            
+            result
         }
     }
 }

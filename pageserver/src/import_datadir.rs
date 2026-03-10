@@ -16,6 +16,7 @@ use postgres_ffi::{
     BLCKSZ, ControlFileData, DBState_DB_SHUTDOWNED, Oid, WAL_SEGMENT_SIZE, XLogFileName,
     pg_constants,
 };
+use postgres_ffi_types::forknum::FilePathError;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_tar::Archive;
 use tracing::*;
@@ -28,6 +29,8 @@ use crate::metrics::WAL_INGEST;
 use crate::pgdatadir_mapping::*;
 use crate::tenant::Timeline;
 use crate::walingest::{WalIngest, WalIngestErrorKind};
+
+const RELMAP_SIZE_OPEN_GAUSS: usize = 4096;
 
 // Returns checkpoint LSN from controlfile
 pub fn get_lsn_from_controlfile(path: &Utf8Path) -> Result<Lsn> {
@@ -60,10 +63,10 @@ pub async fn import_timeline_from_postgres_datadir(
     let mut modification = tline.begin_modification_for_import(pgdata_lsn);
     modification.init_empty()?;
 
-    // Import all but pg_wal
+    // Import all but pg_xlog
     let all_but_wal = WalkDir::new(pgdata_path)
         .into_iter()
-        .filter_entry(|entry| !entry.path().ends_with("pg_wal"));
+        .filter_entry(|entry| !entry.path().ends_with("pg_xlog"));
     for entry in all_but_wal {
         let entry = entry?;
         let metadata = entry.metadata().expect("error getting dir entry metadata");
@@ -100,7 +103,7 @@ pub async fn import_timeline_from_postgres_datadir(
     // this reads the checkpoint record itself, advancing the tip of the timeline to
     // *after* the checkpoint record. And crucially, it initializes the 'prev_lsn'.
     import_wal(
-        &pgdata_path.join("pg_wal"),
+        &pgdata_path.join("pg_xlog"),
         tline,
         Lsn(pg_control.checkPointCopy.redo),
         pgdata_lsn,
@@ -417,11 +420,11 @@ pub async fn import_wal_from_tar(
 
     // Ingest wal until end_lsn
     info!("importing wal until {}", end_lsn);
-    let mut pg_wal_tar = Archive::new(reader);
-    let mut pg_wal_entries = pg_wal_tar.entries()?;
+    let mut pg_xlog_tar = Archive::new(reader);
+    let mut pg_xlog_entries = pg_xlog_tar.entries()?;
     while last_lsn <= end_lsn {
         let bytes = {
-            let mut entry = pg_wal_entries
+            let mut entry = pg_xlog_entries
                 .next()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("expected more wal"))??;
@@ -491,7 +494,7 @@ pub async fn import_wal_from_tar(
     }
 
     // Log any extra unused files
-    while let Some(e) = pg_wal_entries.next().await {
+    while let Some(e) = pg_xlog_entries.next().await {
         let entry = e?;
         let header = entry.header();
         let file_path = header.path()?.into_owned();
@@ -519,6 +522,11 @@ async fn import_file(
         return Ok(None);
     }
 
+    if file_name == "pg_filenode.map.backup" {
+        debug!("ignored relmap backup file {}", file_path.display());
+        return Ok(None);
+    }
+
     if file_path.starts_with("global") {
         let spcnode = postgres_ffi_types::constants::GLOBALTABLESPACE_OID;
         let dbnode = 0;
@@ -539,6 +547,7 @@ async fn import_file(
             }
             "pg_filenode.map" => {
                 let bytes = read_all_bytes(reader).await?;
+                validate_relmap_file(bytes.len())?;
                 modification
                     .put_relmap_file(spcnode, dbnode, bytes, ctx)
                     .await?;
@@ -548,7 +557,23 @@ async fn import_file(
                 debug!("ignored PG_VERSION file");
             }
             _ => {
-                import_rel(modification, file_path, spcnode, dbnode, reader, len, ctx).await?;
+                if let Err(err) =
+                    import_rel(modification, file_path, spcnode, dbnode, reader, len, ctx).await
+                {
+                    if let Some(file_path_err) = err.downcast_ref::<FilePathError>() {
+                        match file_path_err {
+                            FilePathError::InvalidFileName | FilePathError::InvalidForkName => {
+                                debug!(
+                                    "skipping non-relation file \"{}\" ({file_path_err})",
+                                    file_path.display()
+                                );
+                            }
+                        }
+                        return Ok(None);
+                    } else {
+                        return Err(err);
+                    }
+                }
                 debug!("imported rel creation");
             }
         }
@@ -564,6 +589,7 @@ async fn import_file(
         match file_name.as_ref() {
             "pg_filenode.map" => {
                 let bytes = read_all_bytes(reader).await?;
+                validate_relmap_file(bytes.len())?;
                 modification
                     .put_relmap_file(spcnode, dbnode, bytes, ctx)
                     .await?;
@@ -573,16 +599,33 @@ async fn import_file(
                 debug!("ignored PG_VERSION file");
             }
             _ => {
-                import_rel(modification, file_path, spcnode, dbnode, reader, len, ctx).await?;
+                if let Err(err) =
+                    import_rel(modification, file_path, spcnode, dbnode, reader, len, ctx).await
+                {
+                    if let Some(file_path_err) = err.downcast_ref::<FilePathError>() {
+                        match file_path_err {
+                            FilePathError::InvalidFileName | FilePathError::InvalidForkName => {
+                                debug!(
+                                    "skipping non-relation file \"{}\" ({file_path_err})",
+                                    file_path.display()
+                                );
+                            }
+                        }
+                        return Ok(None);
+                    } else {
+                        return Err(err);
+                    }
+                }
                 debug!("imported rel creation");
             }
         }
-    } else if file_path.starts_with("pg_xact") {
+    } else if file_path.starts_with("pg_xact") || file_path.starts_with("pg_clog") {
+        // PostgreSQL 10+ uses pg_xact, but openGauss still uses pg_clog
         let slru = SlruKind::Clog;
 
         if modification.tline.tenant_shard_id.is_shard_zero() {
             import_slru(modification, slru, file_path, reader, len, ctx).await?;
-            debug!("imported clog slru");
+            info!("imported clog slru from {}", file_path.display());
         }
     } else if file_path.starts_with("pg_multixact/offsets") {
         let slru = SlruKind::MultiXactOffsets;
@@ -598,6 +641,14 @@ async fn import_file(
             import_slru(modification, slru, file_path, reader, len, ctx).await?;
             debug!("imported multixact members slru");
         }
+    } else if file_path.starts_with("pg_csnlog") {
+        // openGauss CSN (Commit Sequence Number) log
+        let slru = SlruKind::Csnlog;
+
+        if modification.tline.tenant_shard_id.is_shard_zero() {
+            import_slru(modification, slru, file_path, reader, len, ctx).await?;
+            info!("imported csnlog slru from {}", file_path.display());
+        }
     } else if file_path.starts_with("pg_twophase") {
         let bytes = read_all_bytes(reader).await?;
 
@@ -608,7 +659,7 @@ async fn import_file(
             .put_twophase_file(xid, Bytes::copy_from_slice(&bytes[..]), ctx)
             .await?;
         debug!("imported twophase file");
-    } else if file_path.starts_with("pg_wal") {
+    } else if file_path.starts_with("pg_xlog") {
         debug!("found wal file in base section. ignore it");
     } else if file_path.starts_with("zenith.signal") || file_path.starts_with("neon.signal") {
         // Parse zenith signal file to set correct previous LSN
@@ -653,4 +704,12 @@ async fn read_all_bytes(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes> 
     let mut buf: Vec<u8> = vec![];
     reader.read_to_end(&mut buf).await?;
     Ok(Bytes::from(buf))
+}
+
+fn validate_relmap_file(len: usize) -> Result<()> {
+    ensure!(
+        matches!(len, 512 | 524 | RELMAP_SIZE_OPEN_GAUSS),
+        "unsupported relmap file size {len}"
+    );
+    Ok(())
 }

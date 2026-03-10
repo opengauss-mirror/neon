@@ -16,3 +16,10 @@ rustflags = ["-Cforce-frame-pointers=yes"]
 [alias]
 build_testing = ["build", "--features", "testing"]
 neon = ["run", "--bin", "neon_local"]
+[env]
+CC = "gcc"
+CXX = "g++"
+CC_aarch64_unknown_linux_gnu = "gcc"
+CXX_aarch64_unknown_linux_gnu = "g++"
+CC_x86_64_unknown_linux_gnu = "gcc"
+CXX_x84_64_unknown_linux_gnu = "g++"

@@ -28,7 +28,7 @@ use crate::endpoint_storage::{
 use crate::pageserver::{PAGESERVER_REMOTE_STORAGE_DIR, PageServerNode};
 use crate::safekeeper::SafekeeperNode;
 
-pub const DEFAULT_PG_VERSION: u32 = 17;
+pub const DEFAULT_PG_VERSION: u32 = 14;
 
 //
 // This data structures represents neon_local CLI config
@@ -434,9 +434,20 @@ impl LocalEnv {
     }
 
     pub fn pg_distrib_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<PathBuf> {
-        let path = self.pg_distrib_dir.clone();
-
-        Ok(path.join(pg_version.v_str()))
+        let base = self.pg_distrib_dir.clone();
+        let og_dir = base.join("V702");
+        if og_dir.exists() {
+            return Ok(og_dir);
+        }
+        let mut fallback = base.join(pg_version.v_str());
+        for dir in pg_version.distrib_dir_candidates() {
+            let candidate = base.join(dir);
+            fallback = candidate.clone();
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Ok(fallback)
     }
 
     pub fn pg_dir(&self, pg_version: PgMajorVersion, dir_name: &str) -> anyhow::Result<PathBuf> {
@@ -917,16 +928,16 @@ impl LocalEnv {
             endpoint_storage,
         } = conf;
 
-        // Find postgres binaries.
-        // Follow POSTGRES_DISTRIB_DIR if set, otherwise look in "pg_install".
+        // Find postgres/openGauss binaries.
+        // Follow OPENGAUSS_DISTRIB_DIR if set, then POSTGRES_DISTRIB_DIR if set, otherwise look in "og_install".
         // Note that later in the code we assume, that distrib dirs follow the same pattern
         // for all postgres versions.
         let pg_distrib_dir = pg_distrib_dir.unwrap_or_else(|| {
-            if let Some(postgres_bin) = env::var_os("POSTGRES_DISTRIB_DIR") {
-                postgres_bin.into()
+            if let Some(opengauss_bin) = env::var_os("OPENGAUSS_DISTRIB_DIR") {
+                opengauss_bin.into()
             } else {
                 let cwd = env::current_dir().unwrap();
-                cwd.join("pg_install")
+                cwd.join("og_install")
             }
         });
 

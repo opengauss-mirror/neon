@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::background_process;
 use crate::local_env::{LocalEnv, NeonStorageControllerConf};
+use crate::safekeeper::SafekeeperNode;
+use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
 use hyper0::Uri;
 use nix::unistd::Pid;
@@ -17,7 +19,7 @@ use pageserver_api::controller_api::{
     TenantCreateResponse, TenantLocateResponse,
 };
 use pageserver_api::models::{
-    TenantConfig, TenantConfigRequest, TimelineCreateRequest, TimelineInfo,
+    TenantConfig, TenantConfigRequest, TenantWaitLsnRequest, TimelineCreateRequest, TimelineInfo,
 };
 use pageserver_api::shard::TenantShardId;
 use pageserver_client::mgmt_api::ResponseErrorMessageExt;
@@ -33,6 +35,8 @@ use url::Url;
 use utils::auth::{Claims, Scope, encode_from_key_file};
 use utils::id::{NodeId, TenantId};
 use whoami::username;
+
+use tokio_opengauss::tls::NoTls;
 
 pub struct StorageController {
     env: LocalEnv,
@@ -51,6 +55,19 @@ const COMMAND: &str = "storage_controller";
 const STORAGE_CONTROLLER_POSTGRES_VERSION: PgMajorVersion = PgMajorVersion::PG16;
 
 const DB_NAME: &str = "storage_controller";
+
+const OPENGAUSS_HOST: &str = "127.0.0.1";
+
+fn opengauss_user() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "postgres".to_string())
+}
+
+fn opengauss_conninfo(postgres_port: u16, dbname: &str) -> String {
+    let opengauss_user = opengauss_user();
+    format!(
+        "host={OPENGAUSS_HOST} port={postgres_port} user={opengauss_user} dbname={dbname}"
+    )
+}
 
 pub struct NeonStorageControllerStartArgs {
     pub instance_id: u8,
@@ -180,30 +197,20 @@ impl StorageController {
         .expect("non-Unicode path")
     }
 
-    /// Find the directory containing postgres subdirectories, such `bin` and `lib`
-    ///
-    /// This usually uses STORAGE_CONTROLLER_POSTGRES_VERSION of postgres, but will fall back
-    /// to other versions if that one isn't found.  Some automated tests create circumstances
-    /// where only one version is available in pg_distrib_dir, such as `test_remote_extensions`.
+    /// Find the directory containing openGauss subdirectories, such `bin` and `lib`
+    /// For openGauss, it will try to find V702 directory.
     async fn get_pg_dir(&self, dir_name: &str) -> anyhow::Result<Utf8PathBuf> {
-        const PREFER_VERSIONS: [PgMajorVersion; 5] = [
-            STORAGE_CONTROLLER_POSTGRES_VERSION,
-            PgMajorVersion::PG16,
-            PgMajorVersion::PG15,
-            PgMajorVersion::PG14,
-            PgMajorVersion::PG17,
-        ];
-
-        for v in PREFER_VERSIONS {
-            let path = Utf8PathBuf::from_path_buf(self.env.pg_dir(v, dir_name)?).unwrap();
+        const OPENGAUSS_VERSIONS: &[&str] = &["V702"];
+        for v in OPENGAUSS_VERSIONS {
+            let path =
+                Utf8PathBuf::from_path_buf(self.env.pg_distrib_dir.join(v).join(dir_name)).unwrap();
             if tokio::fs::try_exists(&path).await? {
                 return Ok(path);
             }
         }
 
-        // Fall through
         anyhow::bail!(
-            "Postgres directory '{}' not found in {}",
+            "openGauss directory '{}' not found in {}",
             dir_name,
             self.env.pg_distrib_dir.display(),
         );
@@ -217,32 +224,30 @@ impl StorageController {
         self.get_pg_dir("lib").await
     }
 
-    /// Readiness check for our postgres process
-    async fn pg_isready(&self, pg_bin_dir: &Utf8Path, postgres_port: u16) -> anyhow::Result<bool> {
-        let bin_path = pg_bin_dir.join("pg_isready");
-        let args = [
-            "-h",
-            "localhost",
-            "-U",
-            &username(),
-            "-d",
-            DB_NAME,
-            "-p",
-            &format!("{postgres_port}"),
-        ];
-        let pg_lib_dir = self.get_pg_lib_dir().await.unwrap();
-        let envs = [
-            ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
-            ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
-        ];
-        let exitcode = Command::new(bin_path)
-            .args(args)
-            .envs(envs)
-            .spawn()?
-            .wait()
-            .await?;
+    async fn pg_isready(&self, _pg_bin_dir: &Utf8Path, postgres_port: u16) -> anyhow::Result<bool> {
+        // TODO: 检查openGauss是否就绪，目前只是连接，用户密码硬编码，后续优化。
+        let conn_str = opengauss_conninfo(postgres_port, "postgres");
 
-        Ok(exitcode.success())
+        match tokio_opengauss::connect(&conn_str, NoTls).await {
+            Ok((client, connection)) => {
+                println!(
+                    "openGauss readiness check success: connected on port {}",
+                    postgres_port
+                );
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                drop(client);
+                Ok(true)
+            }
+            Err(e) => {
+                println!(
+                    "openGauss readiness check failed on port {}: {}",
+                    postgres_port, e
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Create our database if it doesn't exist
@@ -253,42 +258,38 @@ impl StorageController {
     ///
     /// Returns the database url
     pub async fn setup_database(&self, postgres_port: u16) -> anyhow::Result<String> {
-        let database_url = format!(
-            "postgresql://{}@localhost:{}/{DB_NAME}",
-            &username(),
-            postgres_port
-        );
+        let database_url = opengauss_conninfo(postgres_port, DB_NAME);
 
-        let pg_bin_dir = self.get_pg_bin_dir().await?;
-        let createdb_path = pg_bin_dir.join("createdb");
-        let pg_lib_dir = self.get_pg_lib_dir().await.unwrap();
-        let envs = [
-            ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
-            ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
-        ];
-        let output = Command::new(&createdb_path)
-            .args([
-                "-h",
-                "localhost",
-                "-p",
-                &format!("{postgres_port}"),
-                "-U",
-                &username(),
-                "-O",
-                &username(),
-                DB_NAME,
-            ])
-            .envs(envs)
-            .output()
+        // Connect to postgres database to create the target database
+        let conn_str = opengauss_conninfo(postgres_port, "postgres");
+
+        let (client, connection) = tokio_opengauss::connect(&conn_str, NoTls)
             .await
-            .expect("Failed to spawn createdb");
+            .context("Failed to connect to postgres database")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8(output.stderr).expect("Non-UTF8 output from createdb");
-            if stderr.contains("already exists") {
-                tracing::info!("Database {DB_NAME} already exists");
-            } else {
-                anyhow::bail!("createdb failed with status {}: {stderr}", output.status);
+        // Spawn the connection task
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Connection error: {}", e);
+            }
+        });
+
+        // Try to create the database (it may already exist)
+        let create_db_query = format!("CREATE DATABASE {DB_NAME} OWNER {}", opengauss_user());
+        match client.execute(create_db_query.as_str(), &[]).await {
+            Ok(_) => {
+                println!("Database {DB_NAME} created successfully");
+                tracing::info!("Database {DB_NAME} created successfully");
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("already exists") || error_msg.contains("duplicate") {
+                    println!("Database {DB_NAME} already exists");
+                    tracing::info!("Database {DB_NAME} already exists");
+                } else {
+                    println!("Failed to create database {DB_NAME}: {}", e);
+                    anyhow::bail!("Failed to create database {DB_NAME}: {}", e);
+                }
             }
         }
 
@@ -299,35 +300,23 @@ impl StorageController {
         &self,
         postgres_port: u16,
     ) -> anyhow::Result<(
-        tokio_postgres::Client,
-        tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+        tokio_opengauss::Client,
+        tokio_opengauss::Connection<tokio_opengauss::Socket, tokio_opengauss::tls::NoTlsStream>,
     )> {
-        tokio_postgres::Config::new()
-            .host("localhost")
-            .port(postgres_port)
-            // The user is the ambient operating system user name.
-            // That is an impurity which we want to fix in => TODO https://github.com/neondatabase/neon/issues/8400
-            //
-            // Until we get there, use the ambient operating system user name.
-            // Recent tokio-postgres versions default to this if the user isn't specified.
-            // But tokio-postgres fork doesn't have this upstream commit:
-            // https://github.com/sfackler/rust-postgres/commit/cb609be758f3fb5af537f04b584a2ee0cebd5e79
-            // => we should rebase our fork => TODO https://github.com/neondatabase/neon/issues/8399
-            .user(&username())
-            .dbname(DB_NAME)
-            .connect(tokio_postgres::NoTls)
+        let conn_str = opengauss_conninfo(postgres_port, DB_NAME);
+        tokio_opengauss::connect(&conn_str, NoTls)
             .await
             .map_err(anyhow::Error::new)
     }
 
-    /// Wrapper for the pg_ctl binary, which we spawn as a short-lived subprocess when starting and stopping postgres
+    /// Wrapper for the gs_ctl binary, which we spawn as a short-lived subprocess when starting and stopping openGauss
     async fn pg_ctl<I, S>(&self, args: I) -> ExitStatus
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         let pg_bin_dir = self.get_pg_bin_dir().await.unwrap();
-        let bin_path = pg_bin_dir.join("pg_ctl");
+        let gs_ctl_path = pg_bin_dir.join("gs_ctl");
 
         let pg_lib_dir = self.get_pg_lib_dir().await.unwrap();
         let envs = [
@@ -335,14 +324,14 @@ impl StorageController {
             ("DYLD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
         ];
 
-        Command::new(bin_path)
+        Command::new(gs_ctl_path)
             .args(args)
             .envs(envs)
             .spawn()
-            .expect("Failed to spawn pg_ctl, binary_missing?")
+            .expect("Failed to spawn gs_ctl, binary_missing?")
             .wait()
             .await
-            .expect("Failed to wait for pg_ctl termination")
+            .expect("Failed to wait for gs_ctl termination")
     }
 
     pub async fn start(&self, start_args: NeonStorageControllerStartArgs) -> anyhow::Result<()> {
@@ -396,12 +385,14 @@ impl StorageController {
 
             if !tokio::fs::try_exists(&pg_data_path).await? {
                 let initdb_args = [
-                    "--pgdata",
+                    "-D",
                     pg_data_path.as_ref(),
-                    "--username",
+                    "-U",
                     &username(),
-                    "--no-sync",
-                    "--no-instructions",
+                    "-A",
+                    "trust",
+                    "--nodename",
+                    "neon_node", // node name for openGauss
                 ];
                 tracing::info!(
                     "Initializing storage controller database with args: {:?}",
@@ -409,7 +400,7 @@ impl StorageController {
                 );
 
                 // Initialize empty database
-                let initdb_path = pg_bin_dir.join("initdb");
+                let initdb_path = pg_bin_dir.join("gs_initdb");
                 let mut child = Command::new(&initdb_path)
                     .envs(vec![
                         ("LD_LIBRARY_PATH".to_owned(), pg_lib_dir.to_string()),
@@ -417,10 +408,10 @@ impl StorageController {
                     ])
                     .args(initdb_args)
                     .spawn()
-                    .expect("Failed to spawn initdb");
+                    .expect("Failed to spawn gs_initdb");
                 let status = child.wait().await?;
                 if !status.success() {
-                    anyhow::bail!("initdb failed with status {status}");
+                    anyhow::bail!("gs_initdb failed with status {status}");
                 }
             };
 
@@ -428,12 +419,13 @@ impl StorageController {
             // - Specify the port, since this is chosen dynamically
             // - Switch off fsync, since we're running on lightweight test environments and when e.g. scale testing
             //   the storage controller we don't want a slow local disk to interfere with that.
+            // - Set wal_level to hot_standby to support WAL streaming (required when max_wal_senders > 0)
             //
             // NB: it's important that we rewrite this file on each start command so we propagate changes
             // from `LocalEnv`'s config file (`.neon/config`).
             tokio::fs::write(
                 &pg_data_path.join("postgresql.conf"),
-                format!("port = {postgres_port}\nfsync=off\n"),
+                format!("port = {postgres_port}\nfsync=off\nwal_level=hot_standby\n"),
             )
             .await?;
 
@@ -485,7 +477,7 @@ impl StorageController {
             self.setup_database(postgres_port).await?;
         }
 
-        let database_url = format!("postgresql://localhost:{postgres_port}/{DB_NAME}");
+        let database_url = opengauss_conninfo(postgres_port, DB_NAME);
 
         // We support running a startup SQL script to fiddle with the database before we launch storcon.
         // This is used by the test suite.
@@ -507,7 +499,9 @@ impl StorageController {
                 }
             }
         };
+        println!("Connecting to database {DB_NAME}...");
         let (mut client, conn) = self.connect_to_database(postgres_port).await?;
+        println!("Connected to database {DB_NAME} successfully");
         let conn = tokio::spawn(conn);
         let tx = client.build_transaction();
         let tx = tx.start().await?;
@@ -758,7 +752,7 @@ impl StorageController {
         let pg_status_args = ["-D", &pg_data_path.to_string_lossy(), "status"];
         let status_exitcode = self.pg_ctl(pg_status_args).await;
 
-        // pg_ctl status returns this exit code if postgres is not running: in this case it is
+        // gs_ctl status returns this exit code if postgres is not running: in this case it is
         // fine that stop failed.  Otherwise it is an error that stop failed.
         const PG_STATUS_NOT_RUNNING: i32 = 3;
         const PG_NO_DATA_DIR: i32 = 4;
@@ -768,10 +762,10 @@ impl StorageController {
             Some(PG_NO_DATA_DIR) => Ok(false),
             Some(PG_STATUS_RUNNING) => Ok(true),
             Some(code) => Err(anyhow::anyhow!(
-                "pg_ctl status returned unexpected status code: {:?}",
+                "gs_ctl status returned unexpected status code: {:?}",
                 code
             )),
-            None => Err(anyhow::anyhow!("pg_ctl status returned no status code")),
+            None => Err(anyhow::anyhow!("gs_ctl status returned no status code")),
         }
     }
 
@@ -866,12 +860,13 @@ impl StorageController {
     async fn register_safekeepers(&self) -> anyhow::Result<()> {
         for sk in self.env.safekeepers.iter() {
             let sk_id = sk.id;
+            let sk_node = SafekeeperNode::from_env(&self.env, sk);
             let body = serde_json::json!({
                 "id": sk_id,
                 "created_at": "2023-10-25T09:11:25Z",
                 "updated_at": "2024-08-28T11:32:43Z",
                 "region_id": "aws-us-east-2",
-                "host": "127.0.0.1",
+                "host": sk_node.listen_addr,
                 "port": sk.pg_port,
                 "http_port": sk.http_port,
                 "https_port": sk.https_port,
@@ -1040,6 +1035,24 @@ impl StorageController {
 
     pub async fn set_tenant_config(&self, req: &TenantConfigRequest) -> anyhow::Result<()> {
         self.dispatch(Method::PUT, "v1/tenant/config".to_string(), Some(req))
+            .await
+    }
+
+    /// Wait for pageserver to receive WAL up to the specified LSN for a timeline.
+    /// This is useful before creating a branch to ensure the branch sees all committed data.
+    #[instrument(skip(self))]
+    pub async fn tenant_timeline_wait_lsn(
+        &self,
+        tenant_id: TenantId,
+        req: TenantWaitLsnRequest,
+    ) -> anyhow::Result<()> {
+        // Note: wait_lsn API is on tenant_shard_id, but for single-shard tenants we can use tenant_id
+        let tenant_shard_id = TenantShardId::unsharded(tenant_id);
+        self.dispatch::<_, ()>(
+            Method::POST,
+            format!("v1/tenant/{tenant_shard_id}/wait_lsn"),
+            Some(req),
+        )
             .await
     }
 }

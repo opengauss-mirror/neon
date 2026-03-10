@@ -352,9 +352,20 @@ impl PageServerConf {
     // Postgres distribution paths
     //
     pub fn pg_distrib_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<Utf8PathBuf> {
-        let path = self.pg_distrib_dir.clone();
-
-        Ok(path.join(pg_version.v_str()))
+        let base = self.pg_distrib_dir.clone();
+        let og_dir = base.join("V702");
+        if og_dir.exists() {
+            return Ok(og_dir);
+        }
+        let mut fallback = base.join(pg_version.v_str());
+        for dir in pg_version.distrib_dir_candidates() {
+            let candidate = base.join(dir);
+            fallback = candidate.clone();
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Ok(fallback)
     }
 
     pub fn pg_bin_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<Utf8PathBuf> {

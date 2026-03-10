@@ -5145,12 +5145,12 @@ class Endpoint(PgProtocol, LogUtils):
     ):
         self.stop()
 
-    # Checkpoints running endpoint and returns pg_wal size in MB.
-    def get_pg_wal_size(self):
+    # Checkpoints running endpoint and returns pg_xlog size in MB.
+    def get_pg_xlog_size(self):
         log.info(f"checkpointing at LSN {self.safe_psql('select pg_current_wal_lsn()')[0][0]}")
         self.safe_psql("checkpoint")
         assert self.pgdata_dir is not None  # please mypy
-        return get_dir_size(self.pgdata_dir / "pg_wal") / 1024 / 1024
+        return get_dir_size(self.pgdata_dir / "pg_xlog") / 1024 / 1024
 
     def clear_buffers(self, cursor: Any | None = None):
         """
@@ -5859,7 +5859,7 @@ SMALL_DB_FILE_NAME_REGEX: re.Pattern[str] = re.compile(
 
 SKIP_DIRS = frozenset(
     (
-        "pg_wal",
+        "pg_xlog",
         "pg_stat",
         "pg_stat_tmp",
         "pg_subtrans",
@@ -6305,7 +6305,7 @@ def import_timeline_from_vanilla_postgres(
     # Take backup of the existing PostgreSQL server with pg_basebackup
     basebackup_dir = test_output_dir / "basebackup"
     base_tar = basebackup_dir / "base.tar"
-    wal_tar = basebackup_dir / "pg_wal.tar"
+    wal_tar = basebackup_dir / "pg_xlog.tar"
     os.mkdir(basebackup_dir)
     pg_bin.run(
         [
