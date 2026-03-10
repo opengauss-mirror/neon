@@ -24,9 +24,11 @@ OBJS = \
 	walproposer_pg.o \
 	neon_ddl_handler.o \
 	walsender_hooks.o \
-	$(NEON_CARGO_ARTIFACT_TARGET_DIR)/libcommunicator.a
+	$(NEON_CARGO_ARTIFACT_TARGET_DIR)/libcommunicator.a \
+	spq_io_multiplex.o \
+	wait_events.o
 
-PG_CPPFLAGS = -I$(libpq_srcdir)
+PG_CPPFLAGS += -I$(libpq_srcdir)
 SHLIB_LINK_INTERNAL = $(libpq)
 SHLIB_LINK = -lcurl
 
@@ -53,11 +55,14 @@ DATA = \
 	neon--1.4--1.3.sql \
 	neon--1.3--1.2.sql \
 	neon--1.2--1.1.sql \
-	neon--1.1--1.0.sql
+	neon--1.1--1.0.sql \
+	neon.control
 PGFILEDESC = "neon - cloud storage for PostgreSQL"
 
 EXTRA_CLEAN = \
 	libwalproposer.a
+
+AROPT ?= rcs
 
 WALPROP_OBJS = \
 	$(WIN32RES) \
@@ -96,7 +101,30 @@ pgindent:
 	+@ echo top_srcdir=$(top_srcdir) top_builddir=$(top_builddir) srcdir=$(srcdir)
 	$(FIND_TYPEDEF) . > neon.typedefs
 	INDENT=$(INDENT) $(PGINDENT_SCRIPT) --typedefs neon.typedefs $(srcdir)/*.c $(srcdir)/*.h
-
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+srcdir = $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
+VPATH = $(srcdir)
+
+NEON_KERNEL_CFLAGS := $(shell $(PG_CONFIG) --cflags)
+
+NEON_MACROS := $(filter -D%,$(NEON_KERNEL_CFLAGS))
+
+# Remove -fPIE from NEON_KERNEL_CFLAGS as we need -fPIC for shared libraries
+# -fPIE is for executables, -fPIC is for shared libraries
+NEON_KERNEL_CFLAGS := $(filter-out -fPIE,$(NEON_KERNEL_CFLAGS))
+
+# NEON_KERNEL_CFLAGS already contains -DENABLE_NEON from pg_config --cflags,
+# but we use override to ensure it's not overridden by PGXS or command line
+override CXXFLAGS += $(NEON_KERNEL_CFLAGS) -fPIC -DPGXC -I/$(CODE_BASE)/src/include
+
+override CXXFLAGS += -g3 -fno-omit-frame-pointer
+
+# Add Python include path for plpython.h
+# Python.h is located in OPENGAUSS_BINARYLIBS_DIR/kernel/platform/python3.7/include/python3.7m/
+PYTHON_INCLUDE_PATH := -I$(OPENGAUSS_BINARYLIBS_DIR)/kernel/platform/python3.7/include/python3.7m
+override CXXFLAGS += $(PYTHON_INCLUDE_PATH)
+
+%.o: %.c
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<

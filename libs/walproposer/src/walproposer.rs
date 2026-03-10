@@ -224,6 +224,7 @@ impl Wrapper {
             pgTimeline: 1,
             proto_version: 3,
             callback_data,
+            is_replica: false, // Default to false for library/test usage
         };
         let c_config = Box::into_raw(Box::new(c_config));
 

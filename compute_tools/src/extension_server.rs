@@ -88,14 +88,14 @@ use tracing::log::warn;
 use url::Url;
 use zstd::stream::read::Decoder;
 
+fn pg_bin_dir(pgbin: &str) -> &Path {
+    Path::new(pgbin).parent().expect("bad pgbin")
+}
+
 fn get_pg_config(argument: &str, pgbin: &str) -> String {
     // gives the result of `pg_config [argument]`
     // where argument is a flag like `--version` or `--sharedir`
-    let pgconfig = pgbin
-        .strip_suffix("postgres")
-        .expect("bad pgbin")
-        .to_owned()
-        + "/pg_config";
+    let pgconfig = pg_bin_dir(pgbin).join("pg_config");
     let config_output = std::process::Command::new(pgconfig)
         .arg(argument)
         .output()
@@ -119,6 +119,13 @@ pub fn get_pg_version_string(pgbin: &str) -> String {
 
 fn parse_pg_version(human_version: &str) -> PgMajorVersion {
     use PgMajorVersion::*;
+    // openGauss binaries identify themselves with strings like
+    // "PostgreSQL 9.2.4 openGauss 7.0.0-RC3". Treat these as PG14 so that the
+    // rest of the code (extension store layout, etc.) can reuse the existing
+    // PG14 integration points.
+    if human_version.contains("openGauss") {
+        return PG14;
+    }
     // Normal releases have version strings like "PostgreSQL 15.4". But there
     // are also pre-release versions like "PostgreSQL 17devel" or "PostgreSQL
     // 16beta2" or "PostgreSQL 17rc1". And with the --with-extra-version
@@ -129,6 +136,10 @@ fn parse_pg_version(human_version: &str) -> PgMajorVersion {
         .captures(human_version)
     {
         Some(captures) if captures.len() == 2 => match &captures["major"] {
+            // Accept legacy major versions (e.g. 9.x–13.x) by mapping them onto
+            // the lowest supported one so callers can continue with compatible
+            // extension layouts instead of panicking early.
+            "9" | "10" | "11" | "12" | "13" => return PG14,
             "14" => return PG14,
             "15" => return PG15,
             "16" => return PG16,
@@ -170,20 +181,19 @@ pub async fn download_extension(
     let decoder = Decoder::new(download_buffer.as_ref())?;
     let mut archive = Archive::new(decoder);
 
-    let unzip_dest = pgbin
-        .strip_suffix("/bin/postgres")
+    let unzip_dest = pg_bin_dir(pgbin)
+        .parent()
         .expect("bad pgbin")
-        .to_string()
-        + "/download_extensions";
+        .join("download_extensions");
     archive.unpack(&unzip_dest)?;
     info!("Download + unzip {:?} completed successfully", &ext_path);
 
     let sharedir_paths = (
-        unzip_dest.to_string() + "/share/extension",
+        unzip_dest.join("share/extension"),
         Path::new(&get_pg_config("--sharedir", pgbin)).join("extension"),
     );
     let libdir_paths = (
-        unzip_dest.to_string() + "/lib",
+        unzip_dest.join("lib"),
         Path::new(&get_pg_config("--pkglibdir", pgbin)).to_path_buf(),
     );
     // move contents of the libdir / sharedir in unzipped archive to the correct local paths
@@ -197,7 +207,7 @@ pub async fn download_extension(
                 // to move from the lib/ directory, so note that in the log and
                 // move on.
                 std::io::ErrorKind::NotFound => {
-                    info!("nothing to move from {}", zip_dir);
+                    info!("nothing to move from {zip_dir:?}");
                     continue;
                 }
                 _ => return Err(anyhow::anyhow!(e)),

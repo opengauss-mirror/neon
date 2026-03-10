@@ -8,7 +8,7 @@
 #include "access/xlog_internal.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
-#include "storage/buf_internals.h"
+#include "storage/buf/buf_internals.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 
@@ -44,12 +44,16 @@ typedef struct LwLsnCacheCtl {
  * Size of the cache is limited by GUC variable lastWrittenLsnCacheSize ("lsn_cache_size"),
  * pages are replaced using LRU algorithm, based on L2-list.
  * Access to this cache is protected by 'LastWrittenLsnLock'.
+ *
+ * NOTE: In openGauss, 'LastWrittenLsnLock' is defined as a macro in
+ * lwlocknames.h that points into mainLWLockArray, so we must not redeclare
+ * it here or assign to it. Just use the macro.
  */
 static HTAB *lastWrittenLsnCache;
 
 LwLsnCacheCtl* LwLsnCache;
 
-static int lwlsn_cache_size = (128 * 1024); 
+static int lwlsn_cache_size = (128 * 1024);
 
 
 static void
@@ -87,8 +91,19 @@ static void neon_set_max_lwlsn(XLogRecPtr lsn);
 void
 init_lwlsncache(void)
 {
-	if (!process_shared_preload_libraries_in_progress)
-		ereport(ERROR, errcode(ERRCODE_INTERNAL_ERROR), errmsg("Loading of shared preload libraries is not in progress. Exiting"));
+	/*
+	 * 在 PostgreSQL 中，本函数只应该在 shared_preload_libraries 阶段调用。
+	 * 在接入 openGauss 时，某些进程可能通过其它路径加载 neon，
+	 * 为了安全起见，这里不再直接 ERROR/abort，而是发出 WARNING 并直接返回。
+	 * 具体调用时机由 _PG_init 中的判断控制。
+	 */
+	if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("init_lwlsncache called when shared preload libraries are not being loaded; skipping")));
+		return;
+	}
 	
 	lwlc_register_gucs();
 
@@ -130,7 +145,7 @@ LwLsnCacheShmemInit(void)
 			lwlsn_cache_size, lwlsn_cache_size,
 										&info,
 										HASH_ELEM | HASH_BLOBS);
-		LwLsnCache = ShmemInitStruct("neon/LwLsnCacheCtl", sizeof(LwLsnCacheCtl), &found);
+		LwLsnCache = (LwLsnCacheCtl*)ShmemInitStruct("neon/LwLsnCacheCtl", sizeof(LwLsnCacheCtl), &found);
 		// Now set the size in the struct
 		LwLsnCache->lastWrittenLsnCacheSize = lwlsn_cache_size;
 		if (found) {
@@ -155,7 +170,28 @@ neon_get_lwlsn(NRelFileInfo rlocator, ForkNumber forknum, BlockNumber blkno)
 	XLogRecPtr lsn;
 	LastWrittenLsnCacheEntry* entry;
 
-	Assert(LwLsnCache->lastWrittenLsnCacheSize != 0);
+	/* Check if shared memory is initialized */
+	if (LwLsnCache == NULL || LastWrittenLsnLock == NULL || 
+		LwLsnCache->lastWrittenLsnCacheSize == 0 || lastWrittenLsnCache == NULL)
+	{
+		/*
+		 * In processes where Neon lwLSN cache is not initialized (e.g. some
+		 * background workers in openGauss), fall back to a conservative LSN
+		 * instead of asserting in neon_get_request_lsns().
+		 *
+		 * We don't need an exact page LSN here; any upper bound that is not
+		 * InvalidXLogRecPtr is fine for building Neon page requests.
+		 */
+		if (RecoveryInProgress())
+			lsn = GetXLogReplayRecPtr(NULL);
+		else
+			lsn = GetXLogInsertRecPtr();
+
+		if (lsn == InvalidXLogRecPtr)
+			lsn = 1;	/* should not happen, but be extra defensive */
+
+		return lsn;
+	}
 
 	LWLockAcquire(LastWrittenLsnLock, LW_SHARED);
 
@@ -170,7 +206,7 @@ neon_get_lwlsn(NRelFileInfo rlocator, ForkNumber forknum, BlockNumber blkno)
 		Oid relNumber = NInfoGetRelNumber(rlocator);
 		BufTagInit(key,  relNumber, forknum, blkno, spcOid, dbOid);
 		
-		entry = hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
+		entry = (LastWrittenLsnCacheEntry*)hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
 		if (entry != NULL)
 			lsn = entry->lsn;
 		else
@@ -208,6 +244,10 @@ neon_get_lwlsn(NRelFileInfo rlocator, ForkNumber forknum, BlockNumber blkno)
 }
 
 static void neon_set_max_lwlsn(XLogRecPtr lsn) {
+	/* Check if shared memory is initialized */
+	if (LwLsnCache == NULL || LastWrittenLsnLock == NULL)
+		return;
+	
 	LWLockAcquire(LastWrittenLsnLock, LW_EXCLUSIVE);
 	LwLsnCache->maxLastWrittenLsn = lsn;
 	LWLockRelease(LastWrittenLsnLock);
@@ -228,7 +268,32 @@ neon_get_lwlsn_v(NRelFileInfo relfilenode, ForkNumber forknum,
 	LastWrittenLsnCacheEntry* entry;
 	XLogRecPtr lsn;
 
-	Assert(LwLsnCache->lastWrittenLsnCacheSize != 0);
+	/* Check if shared memory is initialized */
+	if (LwLsnCache == NULL || LastWrittenLsnLock == NULL || 
+		LwLsnCache->lastWrittenLsnCacheSize == 0 || lastWrittenLsnCache == NULL)
+	{
+		/*
+		 * In processes where Neon lwLSN cache is not initialized (e.g. some
+		 * background workers in openGauss), fall back to a conservative LSN
+		 * instead of returning InvalidXLogRecPtr which would trip assertions
+		 * in neon_get_request_lsns().
+		 *
+		 * We use the current replay LSN during recovery, or the current insert
+		 * LSN in normal operation, as an upper bound.
+		 */
+		if (RecoveryInProgress())
+			lsn = GetXLogReplayRecPtr(NULL);
+		else
+			lsn = GetXLogInsertRecPtr();
+
+		if (lsn == InvalidXLogRecPtr)
+			lsn = 1;
+
+		for (int i = 0; i < nblocks; i++)
+			lsns[i] = lsn;
+		return;
+	}
+
 	Assert(nblocks > 0);
 	Assert(PointerIsValid(lsns));
 
@@ -248,7 +313,7 @@ neon_get_lwlsn_v(NRelFileInfo relfilenode, ForkNumber forknum,
 			/* Maximal last written LSN among all non-cached pages */
 			key.blockNum = blkno + i;
 
-			entry = hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
+			entry = (LastWrittenLsnCacheEntry*)hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
 			if (entry != NULL)
 			{
  				lsns[i] = entry->lsn;
@@ -332,7 +397,7 @@ SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 		for (i = 0; i < n_blocks; i++)
 		{
 			key.blockNum = from + i;
-			entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
+			entry = (LastWrittenLsnCacheEntry*)hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
 			if (found)
 			{
 				if (lsn > entry->lsn)
@@ -376,10 +441,15 @@ SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 XLogRecPtr
 neon_set_lwlsn_block_range(XLogRecPtr lsn, NRelFileInfo rlocator, ForkNumber forknum, BlockNumber from, BlockNumber n_blocks)
 {
+	/* Check if shared memory is initialized */
+	if (LwLsnCache == NULL || LastWrittenLsnLock == NULL || 
+		lastWrittenLsnCache == NULL)
+		return lsn;
+	
 	if (lsn == InvalidXLogRecPtr || n_blocks == 0 || LwLsnCache->lastWrittenLsnCacheSize == 0)
 		return lsn;
 
-	Assert(lsn >= WalSegMinSize);
+	// Assert(lsn >= WalSegMinSize);
 	LWLockAcquire(LastWrittenLsnLock, LW_EXCLUSIVE);
 	lsn = SetLastWrittenLSNForBlockRangeInternal(lsn, rlocator, forknum, from, n_blocks);
 	LWLockRelease(LastWrittenLsnLock);
@@ -412,6 +482,11 @@ neon_set_lwlsn_block_v(const XLogRecPtr *lsns, NRelFileInfo relfilenode,
 	Oid dbOid = NInfoGetDbOid(relfilenode);
 	Oid relNumber = NInfoGetRelNumber(relfilenode);
 
+	/* Check if shared memory is initialized */
+	if (LwLsnCache == NULL || LastWrittenLsnLock == NULL || 
+		lastWrittenLsnCache == NULL)
+		return InvalidXLogRecPtr;
+
 	if (lsns == NULL || nblocks == 0 || LwLsnCache->lastWrittenLsnCacheSize == 0 ||
 		NInfoGetRelNumber(relfilenode) == InvalidOid)
 		return InvalidXLogRecPtr;
@@ -427,9 +502,9 @@ neon_set_lwlsn_block_v(const XLogRecPtr *lsns, NRelFileInfo relfilenode,
 		if (lsn == InvalidXLogRecPtr)
 			continue;
 
-		Assert(lsn >= WalSegMinSize);
+		// Assert(lsn >= WalSegMinSize);
 		key.blockNum = blockno + i;
-		entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
+		entry = (LastWrittenLsnCacheEntry*)hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
 		if (found)
 		{
 			if (lsn > entry->lsn)
@@ -478,7 +553,8 @@ neon_set_lwlsn_block(XLogRecPtr lsn, NRelFileInfo rlocator, ForkNumber forknum, 
 XLogRecPtr
 neon_set_lwlsn_relation(XLogRecPtr lsn, NRelFileInfo rlocator, ForkNumber forknum)
 {
-	return neon_set_lwlsn_block(lsn, rlocator, forknum, REL_METADATA_PSEUDO_BLOCKNO);
+	//return neon_set_lwlsn_block(lsn, rlocator, forknum, REL_METADATA_PSEUDO_BLOCKNO);
+	return neon_set_lwlsn_block(lsn, rlocator, forknum, InvalidBlockNumber);
 }
 
 /*

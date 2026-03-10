@@ -2941,10 +2941,20 @@ impl PageServiceCmd {
                 other,
                 PagestreamProtocolVersion::V2,
             )?)),
-            "pagestream_v3" => Ok(Self::PageStream(PageStreamCmd::parse(
-                other,
-                PagestreamProtocolVersion::V3,
-            )?)),
+            "pagestream_v3" => {
+                // Extra logging to help debug compute <-> pageserver pagestream handshake.
+                // This runs at INFO level so that even default RUST_LOG settings will show it.
+                info!("pagestream_v3 command received: raw_query=\"{query}\" args=\"{other}\"");
+
+                let cmd = PageStreamCmd::parse(other, PagestreamProtocolVersion::V3)?;
+                info!(
+                    "pagestream_v3 parsed successfully: tenant_id={} timeline_id={} protocol=V3",
+                    cmd.tenant_id,
+                    cmd.timeline_id,
+                );
+
+                Ok(Self::PageStream(cmd))
+            }
             "basebackup" => Ok(Self::BaseBackup(BaseBackupCmd::parse(other)?)),
             "fullbackup" => Ok(Self::FullBackup(FullBackupCmd::parse(other)?)),
             "lease" => {
@@ -3097,6 +3107,13 @@ where
                 timeline_id,
                 protocol_version,
             }) => {
+                // Log pagestream session start so we can correlate compute-side requests
+                // with pageserver handling, especially when computes report long waits.
+                info!(
+                    "starting pagestream session: tenant_id={} timeline_id={} protocol={:?}",
+                    tenant_id, timeline_id, protocol_version
+                );
+
                 tracing::Span::current()
                     .record("tenant_id", field::display(tenant_id))
                     .record("timeline_id", field::display(timeline_id));

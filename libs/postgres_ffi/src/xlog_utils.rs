@@ -1,15 +1,50 @@
 //
-// This file contains common utilities for dealing with PostgreSQL WAL files and
+// This file contains common utilities for dealing with openGauss WAL files and
 // LSNs.
 //
-// Many of these functions have been copied from PostgreSQL, and rewritten in
-// Rust. That's why they don't follow the usual Rust naming conventions, they
-// have been named the same as the corresponding PostgreSQL functions instead.
+// Many of these functions have been adapted from PostgreSQL/openGauss, and
+// rewritten in Rust. That's why they don't follow the usual Rust naming 
+// conventions, they have been named the same as the corresponding functions.
+//
+// openGauss XLog format key differences from PostgreSQL:
+// =========================================================
+// 1. XLogRecord: 32 bytes (vs 24 in PG)
+//    - xl_tot_len:    4 bytes (offset 0)
+//    - xl_term:       4 bytes (offset 4)  -- NEW in openGauss
+//    - xl_xid:        8 bytes (offset 8)  -- TransactionId is uint64!
+//    - xl_prev:       8 bytes (offset 16)
+//    - xl_info:       1 byte  (offset 24)
+//    - xl_rmid:       1 byte  (offset 25)
+//    - xl_bucket_id:  2 bytes (offset 26) -- NEW in openGauss
+//    - xl_crc:        4 bytes (offset 28)
+//
+// 2. XLogPageHeaderData: 24 bytes (vs 20 in PG, MAXALIGN to 24)
+//    - xlp_magic:     2 bytes
+//    - xlp_info:      2 bytes
+//    - xlp_tli:       4 bytes
+//    - xlp_pageaddr:  8 bytes
+//    - xlp_rem_len:   4 bytes
+//    - xlp_total_len: 4 bytes -- NEW in openGauss
+//
+// 3. XLogLongPageHeaderData: 40 bytes (vs 40 in PG)
+//    - std:           24 bytes (XLogPageHeaderData)
+//    - xlp_sysid:     8 bytes
+//    - xlp_seg_size:  4 bytes
+//    - xlp_xlog_blcksz: 4 bytes
+//
+// 4. XLOG_PAGE_MAGIC: 0xD074 (vs 0xD10D in PG15, 0xD10E in PG16, etc.)
+//
+// 5. XLogRecordBlockImageHeader: 4 bytes (vs 5 in PG)
+//    - hole_offset:   2 bytes
+//    - hole_length:   2 bytes
+//    (no bimg_info field in openGauss!)
+//
+// 6. RepOriginId: int (4 bytes) vs uint16 (2 bytes) in PG
 //
 
 use super::super::waldecoder::WalStreamDecoder;
 use super::bindings::{
-    CheckPoint, ControlFileData, DBState_DB_SHUTDOWNED, FullTransactionId, TimeLineID,
+    CheckPoint, ControlFileData, DBState_DB_SHUTDOWNED, TimeLineID,
     XLogLongPageHeaderData, XLogPageHeaderData, XLogRecPtr, XLogRecord, XLogSegNo, XLOG_PAGE_MAGIC,
     MY_PGVERSION
 };
@@ -41,11 +76,21 @@ use utils::lsn::Lsn;
 pub const XLOG_FNAME_LEN: usize = 24;
 pub const XLP_BKP_REMOVABLE: u16 = 0x0004;
 pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
+// xlp_rem_len offset in XLogPageHeaderData: xlp_magic(2) + xlp_info(2) + xlp_tli(4) + xlp_pageaddr(8) = 16
 pub const XLP_REM_LEN_OFFS: usize = 2 + 2 + 4 + 8;
-pub const XLOG_RECORD_CRC_OFFS: usize = 4 + 4 + 8 + 1 + 1 + 2;
 
+// XLOG_RECORD_CRC_OFFS is the offset of xl_crc field in XLogRecord.
+// For openGauss: XLogRecord is 32 bytes, xl_crc is at offset 28
+//   Layout: xl_tot_len(4) + xl_term(4) + xl_xid(8) + xl_prev(8) + xl_info(1) + xl_rmid(1) + xl_bucket_id(2) + xl_crc(4)
+//   CRC offset = 4+4+8+8+1+1+2 = 28
+pub const XLOG_RECORD_CRC_OFFS: usize = XLOG_SIZE_OF_XLOG_RECORD - 4;
+
+// openGauss page header sizes (MAXALIGN = 8 bytes)
+// XLogPageHeaderData: 24 bytes (xlp_magic:2 + xlp_info:2 + xlp_tli:4 + xlp_pageaddr:8 + xlp_rem_len:4 + xlp_total_len:4)
 pub const XLOG_SIZE_OF_XLOG_SHORT_PHD: usize = size_of::<XLogPageHeaderData>();
+// XLogLongPageHeaderData: 40 bytes (std:24 + xlp_sysid:8 + xlp_seg_size:4 + xlp_xlog_blcksz:4)
 pub const XLOG_SIZE_OF_XLOG_LONG_PHD: usize = size_of::<XLogLongPageHeaderData>();
+// XLogRecord: 32 bytes in openGauss
 pub const XLOG_SIZE_OF_XLOG_RECORD: usize = size_of::<XLogRecord>();
 #[allow(clippy::identity_op)]
 pub const SIZE_OF_XLOG_RECORD_DATA_HEADER_SHORT: usize = 1 * 2;
@@ -167,13 +212,26 @@ pub fn generate_pg_control(
     // (There's some neon-specific code in Postgres startup to make that work, though.
     // Just setting the redo pointer is not sufficient.)
     let was_shutdown = Lsn(checkpoint.redo) == lsn;
-    checkpoint.redo = normalize_lsn(lsn, WAL_SEGMENT_SIZE).0;
+    
+    // Normalize the LSN to ensure it points to a valid WAL record position
+    let normalized_lsn = normalize_lsn(lsn, WAL_SEGMENT_SIZE);
+    checkpoint.redo = normalized_lsn.0;
 
     // We use DBState_DB_SHUTDOWNED even if it was not a clean shutdown.  The
     // neon-specific code at postgres startup ignores the state stored in the control
     // file, similar to archive recovery in standalone PostgreSQL. Similarly, the
-    // checkPoint pointer is ignored, so just set it to 0.
-    pg_control.checkPoint = 0;
+    // checkPoint pointer is ignored, but we need to set it to a valid value that
+    // passes XRecOffIsValid check in OpenGauss: (checkPoint % XLOG_BLCKSZ >= SizeOfXLogShortPHD)
+    // 
+    // For OpenGauss, we must ensure checkPoint is valid. If the normalized LSN is still 0
+    // (which can happen on fresh initialization), set it to the first valid record position.
+    pg_control.checkPoint = if checkpoint.redo == 0 {
+        // Set to first valid position: beginning of first segment + long page header
+        XLOG_SIZE_OF_XLOG_LONG_PHD as u64
+    } else {
+        checkpoint.redo
+    };
+    
     pg_control.checkPointCopy = checkpoint;
     pg_control.state = DBState_DB_SHUTDOWNED;
 
@@ -387,7 +445,7 @@ impl CheckPoint {
         // XID_CHECKPOINT_INTERVAL should not be larger than BLCKSZ*CLOG_XACTS_PER_BYTE
         new_xid =
             new_xid.wrapping_add(XID_CHECKPOINT_INTERVAL - 1) & !(XID_CHECKPOINT_INTERVAL - 1);
-        let full_xid = self.nextXid.value;
+        let full_xid = self.nextXid;
         let old_xid = full_xid as u32;
         if new_xid.wrapping_sub(old_xid) as i32 > 0 {
             let mut epoch = full_xid >> 32;
@@ -397,8 +455,8 @@ impl CheckPoint {
             }
             let nextXid = (epoch << 32) | new_xid as u64;
 
-            if nextXid != self.nextXid.value {
-                self.nextXid = FullTransactionId { value: nextXid };
+            if nextXid != self.nextXid {
+                self.nextXid = nextXid;
                 return true;
             }
         }
@@ -414,13 +472,13 @@ impl CheckPoint {
     pub fn update_next_multixid(&mut self, multi_xid: u32, multi_offset: u32) -> bool {
         let mut modified = false;
 
-        if multi_xid.wrapping_sub(self.nextMulti) as i32 > 0 {
-            self.nextMulti = multi_xid;
+        if (multi_xid as u64).wrapping_sub(self.nextMulti) as i32 > 0 {
+            self.nextMulti = multi_xid as u64;
             modified = true;
         }
 
-        if multi_offset.wrapping_sub(self.nextMultiOffset) as i32 > 0 {
-            self.nextMultiOffset = multi_offset;
+        if (multi_offset as u64).wrapping_sub(self.nextMultiOffset) as i32 > 0 {
+            self.nextMultiOffset = multi_offset as u64;
             modified = true;
         }
 
@@ -553,6 +611,53 @@ mod tests {
         let round_trip_pg = to_pg_timestamp(try_from_pg_timestamp(now_pg).unwrap());
 
         assert_eq!(now_pg, round_trip_pg);
+    }
+
+    /// Verify that openGauss xlog structure sizes match expected values.
+    /// If these tests fail, the bindings are incorrect and WAL decoding will fail.
+    #[test]
+    fn test_opengauss_xlog_struct_sizes() {
+        // openGauss XLogRecord is 32 bytes:
+        // xl_tot_len(4) + xl_term(4) + xl_xid(8) + xl_prev(8) + xl_info(1) + xl_rmid(1) + xl_bucket_id(2) + xl_crc(4)
+        assert_eq!(
+            XLOG_SIZE_OF_XLOG_RECORD, 32,
+            "XLogRecord size mismatch: expected 32 bytes for openGauss, got {}",
+            XLOG_SIZE_OF_XLOG_RECORD
+        );
+
+        // openGauss XLogPageHeaderData is 24 bytes (MAXALIGN):
+        // xlp_magic(2) + xlp_info(2) + xlp_tli(4) + xlp_pageaddr(8) + xlp_rem_len(4) + xlp_total_len(4)
+        assert_eq!(
+            XLOG_SIZE_OF_XLOG_SHORT_PHD, 24,
+            "XLogPageHeaderData size mismatch: expected 24 bytes for openGauss, got {}",
+            XLOG_SIZE_OF_XLOG_SHORT_PHD
+        );
+
+        // openGauss XLogLongPageHeaderData is 40 bytes:
+        // std(24) + xlp_sysid(8) + xlp_seg_size(4) + xlp_xlog_blcksz(4)
+        assert_eq!(
+            XLOG_SIZE_OF_XLOG_LONG_PHD, 40,
+            "XLogLongPageHeaderData size mismatch: expected 40 bytes for openGauss, got {}",
+            XLOG_SIZE_OF_XLOG_LONG_PHD
+        );
+
+        // CRC offset should be at byte 28 (32 - 4)
+        assert_eq!(
+            XLOG_RECORD_CRC_OFFS, 28,
+            "XLOG_RECORD_CRC_OFFS mismatch: expected 28 for openGauss, got {}",
+            XLOG_RECORD_CRC_OFFS
+        );
+    }
+
+    /// Verify XLOG_PAGE_MAGIC for openGauss
+    #[test]
+    fn test_opengauss_xlog_page_magic() {
+        // openGauss uses 0xD074 as the page magic
+        assert_eq!(
+            XLOG_PAGE_MAGIC, 0xD074,
+            "XLOG_PAGE_MAGIC mismatch: expected 0xD074 for openGauss, got 0x{:04X}",
+            XLOG_PAGE_MAGIC
+        );
     }
 
     // If you need to craft WAL and write tests for this module, put it at wal_craft crate.

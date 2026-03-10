@@ -8,7 +8,7 @@
 #include "catalog/pg_control.h"
 #include "access/xlog_internal.h"
 
-#include "storage/block.h"
-#include "storage/bufpage.h"
+#include "storage/buf/block.h"
+#include "storage/buf/bufpage.h"
 #include "storage/off.h"
 #include "access/multixact.h"

@@ -14,7 +14,7 @@
 
 #include "neon_pgversioncompat.h"
 
-#include "storage/buf_internals.h"
+#include "storage/buf/buf_internals.h"
 
 #include "pagestore_client.h"
 

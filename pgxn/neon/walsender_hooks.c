@@ -16,9 +16,9 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "miscadmin.h"
-#include "utils/wait_event.h"
+#include "wait_events.h"
 #include "utils/guc.h"
-#include "postmaster/interrupt.h"
+// #include "postmaster/interrupt.h"
 
 #include "neon.h"
 #include "neon_walreader.h"
@@ -26,11 +26,10 @@
 
 static NeonWALReader *wal_reader = NULL;
 
-struct WalSnd;
-extern struct WalSnd *MyWalSnd;
+// struct WalSnd;
+// extern struct WalSnd *MyWalSnd;
 extern XLogRecPtr WalSndWaitForWal(XLogRecPtr loc);
 extern bool GetDonorShmem(XLogRecPtr *donor_lsn);
-extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID *replayTLI);
 
 bool disable_wal_prev_lsn_checks = false;
 
@@ -44,7 +43,7 @@ NeonWALReadWaitForWAL(XLogRecPtr loc)
 	}
 
 	// Walsender sends keepalives and stuff, so better use its normal wait
-	if (MyWalSnd != NULL)
+	if (t_thrd.walsender_cxt.MyWalSnd != NULL)
 		return WalSndWaitForWal(loc);
 
 	for (;;)
@@ -57,7 +56,7 @@ NeonWALReadWaitForWAL(XLogRecPtr loc)
 			flush_ptr = GetFlushRecPtr();
 #endif
 		else
-			flush_ptr = GetXLogReplayRecPtr(NULL);
+			flush_ptr = GetXLogReplayRecPtr((TimeLineID *)NULL, (XLogRecPtr*)NULL);
 
 		if (loc <= flush_ptr)
 			return flush_ptr;
@@ -67,13 +66,18 @@ NeonWALReadWaitForWAL(XLogRecPtr loc)
 	}
 }
 
+/**
+ * 添加最后两个参数统一成og的函数
+ */
 static int
 NeonWALPageRead(
 				XLogReaderState *xlogreader,
 				XLogRecPtr targetPagePtr,
 				int reqLen,
 				XLogRecPtr targetRecPtr,
-				char *readBuf)
+				char *readBuf,
+				TimeLineID* pageTLI,
+				char* xlog_path)
 {
 	XLogRecPtr	rem_lsn;
 
@@ -84,7 +88,7 @@ NeonWALPageRead(
 	if (flushptr < targetPagePtr + reqLen)
 		return -1;
 
-	xlogreader->skip_lsn_checks = disable_wal_prev_lsn_checks;
+	// xlogreader->skip_lsn_checks = disable_wal_prev_lsn_checks;
 
 	/* Read at most XLOG_BLCKSZ bytes */
 	if (targetPagePtr + XLOG_BLCKSZ <= flushptr)
@@ -151,16 +155,16 @@ NeonWALPageRead(
 			uint32_t	reader_events = NeonWALReaderEvents(wal_reader);
 			long		timeout_ms = 1000;
 
-			ResetLatch(MyLatch);
+			ResetLatch(&t_thrd.proc->procLatch);
 			CHECK_FOR_INTERRUPTS();
-			if (ConfigReloadPending)
-			{
-				ConfigReloadPending = false;
-				ProcessConfigFile(PGC_SIGHUP);
-			}
+			// if (ConfigReloadPending) FIXME reload
+			// {
+			// 	ConfigReloadPending = false;
+			// 	ProcessConfigFile(PGC_SIGHUP);
+			// }
 
-			WaitLatchOrSocket(
-							  MyLatch,
+			NeonWaitLatchOrSocket(
+							  &t_thrd.proc->procLatch,
 							  WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | reader_events,
 							  sock,
 							  timeout_ms,
@@ -202,7 +206,7 @@ NeonOnDemandXLogReaderRoutines(XLogReaderRoutine *xlr)
 		{
 			elog(ERROR, "unable to start walsender when basebackupLsn is 0");
 		}
-		wal_reader = NeonWALReaderAllocate(wal_segment_size, basebackupLsn, "[walsender] ", 1);
+		wal_reader = NeonWALReaderAllocate(XLogSegSize, basebackupLsn, "[walsender] ", 1);
 	}
 	xlr->page_read = NeonWALPageRead;
 	xlr->segment_open = NeonWALReadSegmentOpen;

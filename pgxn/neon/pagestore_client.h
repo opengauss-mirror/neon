@@ -17,8 +17,8 @@
 #include "access/xlogdefs.h"
 #include RELFILEINFO_HDR
 #include "lib/stringinfo.h"
-#include "storage/block.h"
-#include "storage/buf_internals.h"
+#include "storage/buf/block.h"
+#include "storage/buf/buf_internals.h"
 
 #define MAX_SHARDS 128
 #define MAX_PAGESERVER_CONNSTRING_SIZE 256
@@ -62,7 +62,8 @@ typedef struct
 typedef enum {
 	SLRU_CLOG,
 	SLRU_MULTIXACT_MEMBERS,
-	SLRU_MULTIXACT_OFFSETS
+	SLRU_MULTIXACT_OFFSETS,
+	SLRU_CSNLOG  /* openGauss CSN (Commit Sequence Number) log */
 } SlruKind;
 
 /*--
@@ -287,6 +288,9 @@ extern PGDLLEXPORT void neon_read_at_lsn(NRelFileInfo rnode, ForkNumber forkNum,
 										 neon_request_lsns request_lsns, void *buffer);
 extern int64 neon_dbsize(Oid dbNode);
 
+/* SLRU read hook for reading CLOG, MultiXact etc. from pageserver */
+extern int neon_read_slru_segment_hook(const char* path, int64 segno, void* buffer);
+
 extern void neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum,
 								  BlockNumber blkno, neon_request_lsns *output,
 								  BlockNumber nblocks);
@@ -297,5 +301,8 @@ extern bool get_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumb
 extern void set_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size);
 extern void update_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber size);
 extern void forget_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum);
+
+/* Check if this compute node is running in Neon replica mode */
+extern bool neon_is_replica_mode(void);
 
 #endif							/* PAGESTORE_CLIENT_H */

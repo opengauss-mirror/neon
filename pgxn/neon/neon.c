@@ -24,7 +24,7 @@
 #include "storage/proc.h"
 #include "storage/ipc.h"
 #include "funcapi.h"
-#include "access/htup_details.h"
+//#include "access/htup_details.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 #include "utils/guc.h"
@@ -44,6 +44,7 @@
 #if PG_MAJORVERSION_NUM >= 16
 #include "storage/ipc.h"
 #endif
+#include "wait_events.h"
 
 PG_MODULE_MAGIC;
 void		_PG_init(void);
@@ -105,7 +106,9 @@ static const struct config_enum_entry debug_compare_local_modes[] = {
 /*
  * XXX: These private to procarray.c, but we need them here.
  */
-#define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
+// #define PROCARRAY_MAXPROCS	(MaxBackends + max_prepared_xacts)
+#define PROCARRAY_MAXPROCS      (g_instance.shmem_cxt.MaxBackends + \
+    g_instance.attr.attr_storage.max_prepared_xacts * NUM_TWOPHASE_PARTITIONS)
 #define TOTAL_MAX_CACHED_SUBXIDS \
 	((PGPROC_MAX_CACHED_SUBXIDS + 1) * PROCARRAY_MAXPROCS)
 
@@ -200,7 +203,7 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 	 */
 	from = TransactionIdPrecedes(checkpoint->oldestXid, checkpoint->oldestActiveXid)
 		? checkpoint->oldestActiveXid : checkpoint->oldestXid;
-	till = XidFromFullTransactionId(checkpoint->nextXid);
+	till = checkpoint->nextXid;
 
 	/*
 	 * To avoid "too many KnownAssignedXids" error later during replay, we
@@ -237,7 +240,7 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 	 * pg_subtrans.
 	 */
 	PrescanPreparedTransactions(&prepared_xids, &n_prepared_xids);
-	qsort(prepared_xids, n_prepared_xids, sizeof(TransactionId), xidLogicalComparator);
+	qsort(prepared_xids, n_prepared_xids, sizeof(TransactionId), xidComparator);
 
 	/*
 	 * Scan the CLOG, collecting in-progress XIDs into 'restored_xids'.
@@ -250,9 +253,9 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 	for (TransactionId xid = from; xid != till;)
 	{
 		XLogRecPtr	xidlsn;
-		XidStatus	xidstatus;
+		CLogXidStatus	xidstatus;
 
-		xidstatus = TransactionIdGetStatus(xid, &xidlsn);
+		xidstatus = CLogGetStatus(xid, &xidlsn);
 
 		/*
 		 * "Merge" the prepared transactions into the restored_xids array as
@@ -269,7 +272,7 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 			 */
 
 			/* sanity check */
-			if (xidstatus != TRANSACTION_STATUS_IN_PROGRESS)
+			if (xidstatus != CLOG_XID_STATUS_IN_PROGRESS)
 			{
 				elog(LOG, "prepared transaction %u has unexpected status %X, cannot restore running-xacts from CLOG",
 					 xid, xidstatus);
@@ -280,17 +283,17 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 			elog(DEBUG1, "XID %u: was next prepared xact (%d / %d)", xid, next_prepared_idx, n_prepared_xids);
 			next_prepared_idx++;
 		}
-		else if (xidstatus == TRANSACTION_STATUS_COMMITTED)
+		else if (xidstatus == CLOG_XID_STATUS_COMMITTED)
 		{
 			elog(DEBUG1, "XID %u: was committed", xid);
 			goto skip;
 		}
-		else if (xidstatus == TRANSACTION_STATUS_ABORTED)
+		else if (xidstatus == CLOG_XID_STATUS_ABORTED)
 		{
 			elog(DEBUG1, "XID %u: was aborted", xid);
 			goto skip;
 		}
-		else if (xidstatus == TRANSACTION_STATUS_IN_PROGRESS)
+		else if (xidstatus == CLOG_XID_STATUS_IN_PROGRESS)
 		{
 			/*
 			 * In-progress transactions are included in the array.
@@ -301,7 +304,8 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 			 */
 			if (n_prepared_xids > 0)
 			{
-				TransactionId parent = SubTransGetParent(xid);
+				CLogXidStatus clogXidstatus = CLOG_XID_STATUS_IN_PROGRESS;
+				TransactionId parent = SubTransGetParent(xid, &clogXidstatus, false);
 
 				if (TransactionIdIsValid(parent))
 				{
@@ -319,7 +323,7 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 					 * hierarchy.)
 					 */
 					if (bsearch(&parent, prepared_xids, next_prepared_idx,
-								sizeof(TransactionId), xidLogicalComparator) == NULL)
+								sizeof(TransactionId), xidComparator) == NULL)
 					{
 						elog(LOG, "sub-XID %u has unexpected parent %u, cannot restore running-xacts from CLOG",
 							 xid, parent);
@@ -354,7 +358,7 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 			 */
 			elog(LOG, "too many running xacts to restore from the CLOG; oldestXid=%u oldestActiveXid=%u nextXid %u",
 				 checkpoint->oldestXid, checkpoint->oldestActiveXid,
-				 XidFromFullTransactionId(checkpoint->nextXid));
+				 checkpoint->nextXid);
 
 			switch (running_xacts_overflow_policy)
 			{
@@ -384,7 +388,7 @@ RestoreRunningXactsFromClog(CheckPoint *checkpoint, TransactionId **xids, int *n
 	}
    success:
 	elog(LOG, "restored %d running xacts by scanning the CLOG; oldestXid=%u oldestActiveXid=%u nextXid %u",
-		 n_restored_xids, checkpoint->oldestXid, checkpoint->oldestActiveXid, XidFromFullTransactionId(checkpoint->nextXid));
+		 n_restored_xids, checkpoint->oldestXid, checkpoint->oldestActiveXid, checkpoint->nextXid);
 	*nxids = n_restored_xids;
 	*xids = restored_xids;
 	if (prepared_xids)
@@ -452,9 +456,26 @@ _PG_init(void)
 	 * Also load 'neon_rmgr'. This makes it unnecessary to list both 'neon'
 	 * and 'neon_rmgr' in shared_preload_libraries.
 	 */
+    if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress 
+		|| g_instance.loadedNeonPlugin){
+        return;
+    }
+
+//	if (u_sess == NULL || u_sess->mcxt_group == NULL) {
+//		return;
+//	}
+//
+//    if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress ){
+//        return;
+//    }
+    
+    /* Mark neon plugin as loaded */
+    g_instance.loadedNeonPlugin = true;
+    
 #if PG_VERSION_NUM >= 160000
 	load_file("$libdir/neon_rmgr", false);
 #endif
+    InitialzeCitusWaitEventSet();
 
 	/*
 	 * Initializing a pre-loaded Postgres extension happens in three stages:
@@ -491,30 +512,37 @@ _PG_init(void)
 	relsize_hash_init();
 	lfc_init();
 	pg_init_walproposer();
+	/*
+	 * init_lwlsncache 只应该在 shared_preload_libraries 阶段调用，
+	 * 这里通过 process_shared_preload_libraries_in_progress 做一次保护，
+	 * 避免 walredo 等其它通过 dlopen 加载 neon 的场景误调用。
+	 */
+	if (u_sess->misc_cxt.process_shared_preload_libraries_in_progress)
 	init_lwlsncache();
 
 	pg_init_communicator_process();
 
 	pg_init_communicator();
+
 	Custom_XLogReaderRoutines = NeonOnDemandXLogReaderRoutines;
 
-	InitUnstableExtensionsSupport();
-	InitLogicalReplicationMonitor();
-	InitDDLHandler();
+	// InitUnstableExtensionsSupport();	//插件检查 忽略
+	// InitLogicalReplicationMonitor();	//逻辑复制 忽略
+	// InitDDLHandler();	// DDL拦截（create database等） 先忽略
 
 	pg_init_extension_server();
+	// todo: 先忽略，备机replic hook，内核改动
+	// restore_running_xacts_callback = RestoreRunningXactsFromClog;
 
-	restore_running_xacts_callback = RestoreRunningXactsFromClog;
-
-	DefineCustomBoolVariable(
-							"neon.disable_logical_replication_subscribers",
-							"Disables incomming logical replication",
-							NULL,
-							&disable_logical_replication_subscribers,
-							false,
-							PGC_SIGHUP,
-							0,
-							NULL, NULL, NULL);
+	// DefineCustomBoolVariable(
+	// 						"neon.disable_logical_replication_subscribers",
+	// 						"Disables incomming logical replication",
+	// 						NULL,
+	// 						&disable_logical_replication_subscribers,
+	// 						false,
+	// 						PGC_SIGHUP,
+	// 						0,
+	// 						NULL, NULL, NULL);
 	DefineCustomBoolVariable(
 							"neon.disable_wal_prevlink_checks",
 							"Disable validation of prev link in WAL records",
@@ -534,16 +562,16 @@ _PG_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-							"neon.allow_replica_misconfig",
-							"Allow replica startup when some critical GUCs have smaller value than on primary node",
-							NULL,
-							&allowReplicaMisconfig,
-							true,
-							PGC_POSTMASTER,
-							0,
-							NULL, NULL, NULL);
+	// todo: 
+	// DefineCustomBoolVariable(
+	// 						"neon.allow_replica_misconfig",
+	// 						"Allow replica startup when some critical GUCs have smaller value than on primary node",
+	// 						NULL,
+	// 						&allowReplicaMisconfig,
+	// 						true,
+	// 						PGC_POSTMASTER,
+	// 						0,
+	// 						NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
 							"neon.running_xacts_overflow_policy",
@@ -576,13 +604,14 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomStringVariable(
-							"neon.privileged_role_name",
-							"Name of the 'weak' superuser role, which we give to the users",
-							NULL,
-							&privileged_role_name,
-							"neon_superuser",
-							PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	// todo: 可能需要
+	// DefineCustomStringVariable(
+	// 						"neon.privileged_role_name",
+	// 						"Name of the 'weak' superuser role, which we give to the users",
+	// 						NULL,
+	// 						&privileged_role_name,
+	// 						"neon_superuser",
+	// 						PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 							"neon.lakebase_mode",
@@ -615,8 +644,8 @@ _PG_init(void)
 #endif
 
 	/* Register hooks for stage 3 */
-	prev_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = neon_shmem_startup_hook;
+	prev_shmem_startup_hook = t_thrd.storage_cxt.shmem_startup_hook;
+	t_thrd.storage_cxt.shmem_startup_hook = neon_shmem_startup_hook;
 
 	/* Other misc initialization */
 	prev_ExecutorStart = ExecutorStart_hook;
@@ -656,10 +685,10 @@ backpressure_lsns(PG_FUNCTION_ARGS)
 
 	replication_feedback_get_lsns(&writePtr, &flushPtr, &applyPtr);
 
-	tupdesc = CreateTemplateTupleDesc(3);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "received_lsn", PG_LSNOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "disk_consistent_lsn", PG_LSNOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "remote_consistent_lsn", PG_LSNOID, -1, 0);
+	// tupdesc = CreateTemplateTupleDesc(3);
+	// TupleDescInitEntry(tupdesc, (AttrNumber) 1, "received_lsn", PG_LSNOID, -1, 0);
+	// TupleDescInitEntry(tupdesc, (AttrNumber) 2, "disk_consistent_lsn", PG_LSNOID, -1, 0);
+	// TupleDescInitEntry(tupdesc, (AttrNumber) 3, "remote_consistent_lsn", PG_LSNOID, -1, 0);
 	tupdesc = BlessTupleDesc(tupdesc);
 
 	MemSet(nulls, 0, sizeof(nulls));
@@ -673,7 +702,8 @@ backpressure_lsns(PG_FUNCTION_ARGS)
 Datum
 backpressure_throttling_time(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_UINT64(BackpressureThrottlingTime());
+	// PG_RETURN_UINT64(BackpressureThrottlingTime());
+	PG_RETURN_INT64(BackpressureThrottlingTime());
 }
 
 Datum
@@ -718,7 +748,7 @@ neon_shmem_request_hook(void)
 		prev_shmem_request_hook();
 #endif
 
-	LfcShmemRequest();
+	LfcShmemRequest(); // lfc默认关闭，先屏蔽
 	NeonPerfCountersShmemRequest();
 	PagestoreShmemRequest();
 	RelsizeCacheShmemRequest();
@@ -762,6 +792,14 @@ neon_shmem_startup_hook(void)
 #endif
 
 	LWLockRelease(AddinShmemInitLock);
+
+//	/*
+//	 * Register background workers after shared memory initialization.
+//	 * This must be done after InitBgworkerGlobal() has been called in
+//	 * CreateSharedMemoryAndSemaphores(), otherwise g_instance.bgw_base will be NULL.
+//	 */
+//	walprop_register_bgworker();
+	//communicator_register_bgworker();
 }
 
 /*
@@ -787,7 +825,7 @@ neon_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			MemoryContext oldcxt;
 
 			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_TIMER, false);
+			// queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_TIMER, false);
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}

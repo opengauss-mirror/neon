@@ -32,6 +32,8 @@ use tokio_tar::{Builder, EntryType, Header};
 use tracing::*;
 use utils::lsn::Lsn;
 
+const RELMAP_SIZE_OPEN_GAUSS: usize = 4096;
+
 use crate::context::RequestContext;
 use crate::pgdatadir_mapping::Version;
 use crate::tenant::storage_layer::IoConcurrency;
@@ -268,6 +270,15 @@ where
                     return Err(BasebackupError::Server(anyhow!(
                         "invalid {:?} record: block.len()={}",
                         kind,
+                        block.len()
+                    )));
+                }
+            }
+            SlruKind::Csnlog => {
+                // openGauss CSN log, same format as Clog
+                if !(block.len() == BLCKSZ as usize || block.len() == BLCKSZ as usize + 8) {
+                    return Err(BasebackupError::Server(anyhow!(
+                        "invalid SlruKind::Csnlog record: block.len()={}",
                         block.len()
                     )));
                 }
@@ -642,9 +653,9 @@ where
                 .get_relmap_file(spcnode, dbnode, Version::at(self.lsn), self.ctx)
                 .await?;
 
-            if img.len()
-                != dispatch_pgversion!(self.timeline.pg_version, pgv::bindings::SIZEOF_RELMAPFILE)
-            {
+            let expected_len =
+                dispatch_pgversion!(self.timeline.pg_version, pgv::bindings::SIZEOF_RELMAPFILE);
+            if img.len() != expected_len && img.len() != RELMAP_SIZE_OPEN_GAUSS {
                 return Err(BasebackupError::Server(anyhow!(
                     "img.len() != SIZE_OF_RELMAPFILE, img.len()={}",
                     img.len(),
@@ -805,7 +816,7 @@ where
         //send wal segment
         let segno = self.lsn.segment_number(WAL_SEGMENT_SIZE);
         let wal_file_name = XLogFileName(PG_TLI, segno, WAL_SEGMENT_SIZE);
-        let wal_file_path = format!("pg_wal/{wal_file_name}");
+        let wal_file_path = format!("pg_xlog/{wal_file_name}");
         let header = new_tar_header(&wal_file_path, WAL_SEGMENT_SIZE as u64)?;
 
         let wal_seg = postgres_ffi::generate_wal_segment(

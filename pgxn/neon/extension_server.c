@@ -18,7 +18,7 @@ int	hadron_extension_server_port = 0;
 static int	extension_server_request_timeout = 60;
 static int	extension_server_connect_timeout = 60;
 
-static download_extension_file_hook_type prev_download_extension_file_hook = NULL;
+//static download_extension_file_hook_type prev_download_extension_file_hook = NULL;
 
 /*
   * to download all SQL (and data) files for an extension:
@@ -107,6 +107,6 @@ pg_init_extension_server()
 							NULL, NULL, NULL);
 
 	/* set download_extension_file_hook */
-	prev_download_extension_file_hook = download_extension_file_hook;
-	download_extension_file_hook = neon_download_extension_file_http;
+	//prev_download_extension_file_hook = download_extension_file_hook;
+	//download_extension_file_hook = neon_download_extension_file_http;
 }

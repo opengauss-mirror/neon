@@ -1,0 +1,175 @@
+-- ============================================================================
+-- Neon Test Environment Setup
+-- ============================================================================
+-- This script initializes the test environment for Neon regression tests.
+-- It MUST be run first before any other test cases.
+--
+-- Actions:
+--   1. Display connection and version info
+--   2. Create test schema for isolation
+--   3. Create test results tracking table
+--   4. Verify basic connectivity
+-- ============================================================================
+\echo '=============================================='
+==============================================
+\echo '  Neon Test Environment Initialization'
+  Neon Test Environment Initialization
+\echo '=============================================='
+==============================================
+-- Display current connection info
+\echo '--- Connection Info ---'
+--- Connection Info ---
+\conninfo
+You are connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+-- Show PostgreSQL/openGauss version
+\echo '--- Database Version ---'
+--- Database Version ---
+SELECT version();
+                                                                                version                                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (openGauss 7.0.0-RC3 build 3cfd8054) compiled at 2025-12-30 09:23:55 commit 497 last mr 8538 debug on aarch64-unknown-linux-gnu, compiled by g++ (GCC) 10.3.1, 64-bit
+(1 row)
+
+-- Show current database and user
+SELECT current_database() AS database, current_user AS user;
+ database |    user     
+----------+-------------
+ postgres | cloud_admin
+(1 row)
+
+-- ============================================================================
+-- Create Test Schema
+-- ============================================================================
+\echo '--- Creating Test Schema ---'
+--- Creating Test Schema ---
+-- Drop existing test schema if present (clean start)
+DROP SCHEMA IF EXISTS neon_test CASCADE;
+gsql:NEON_ROOT/sql/neon_setup.sql:35: NOTICE:  schema "neon_test" does not exist, skipping
+DROP SCHEMA
+-- Create fresh test schema
+CREATE SCHEMA neon_test;
+CREATE SCHEMA
+-- Set search path for subsequent tests
+SET search_path TO neon_test, public;
+SET
+-- Verify schema was created
+SELECT nspname AS schema_name 
+FROM pg_namespace 
+WHERE nspname = 'neon_test';
+ schema_name 
+-------------
+ neon_test
+(1 row)
+
+-- ============================================================================
+-- Create Test Results Tracking Table
+-- ============================================================================
+\echo '--- Creating Test Results Table ---'
+--- Creating Test Results Table ---
+CREATE TABLE neon_test.test_results (
+    id SERIAL PRIMARY KEY,
+    test_name VARCHAR(100) NOT NULL,
+    test_phase VARCHAR(50) NOT NULL,
+    test_status VARCHAR(20) NOT NULL,
+    message TEXT,
+    start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    end_time TIMESTAMP,
+    duration_ms INT
+);
+gsql:NEON_ROOT/sql/neon_setup.sql:62: NOTICE:  CREATE TABLE will create implicit sequence "test_results_id_seq" for serial column "test_results.id"
+gsql:NEON_ROOT/sql/neon_setup.sql:62: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_results_pkey" for table "test_results"
+CREATE TABLE
+-- Create index for fast lookups
+CREATE INDEX idx_test_results_status ON neon_test.test_results(test_status);
+CREATE INDEX
+CREATE INDEX idx_test_results_phase ON neon_test.test_results(test_phase);
+CREATE INDEX
+-- Insert setup start record
+INSERT INTO neon_test.test_results (test_name, test_phase, test_status, message)
+VALUES ('neon_setup', 'initialization', 'RUNNING', 'Starting environment setup');
+INSERT 0 1
+-- ============================================================================
+-- Create Environment Info Table
+-- ============================================================================
+\echo '--- Recording Environment Info ---'
+--- Recording Environment Info ---
+CREATE TABLE neon_test.env_info (
+    key VARCHAR(50) PRIMARY KEY,
+    value TEXT,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_setup.sql:81: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "env_info_pkey" for table "env_info"
+CREATE TABLE
+-- Record environment information
+INSERT INTO neon_test.env_info (key, value) VALUES
+    ('database', current_database()),
+    ('user', current_user),
+    ('pg_version', version()),
+    ('init_time', CURRENT_TIMESTAMP::TEXT);
+INSERT 0 4
+SELECT key, value FROM neon_test.env_info ORDER BY key;
+    key     |                                                                                 value                                                                                 
+------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ database   | postgres
+ init_time  | 2025-12-30 02:43:24.165996+00
+ pg_version | (openGauss 7.0.0-RC3 build 3cfd8054) compiled at 2025-12-30 09:23:55 commit 497 last mr 8538 debug on aarch64-unknown-linux-gnu, compiled by g++ (GCC) 10.3.1, 64-bit
+ user       | cloud_admin
+(4 rows)
+
+-- ============================================================================
+-- Verify Basic Operations
+-- ============================================================================
+\echo '--- Verifying Basic Operations ---'
+--- Verifying Basic Operations ---
+-- Test table creation
+CREATE TABLE neon_test.verify_ops (
+    id INT PRIMARY KEY,
+    data VARCHAR(50)
+);
+gsql:NEON_ROOT/sql/neon_setup.sql:101: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "verify_ops_pkey" for table "verify_ops"
+CREATE TABLE
+-- Test insert
+INSERT INTO neon_test.verify_ops VALUES (1, 'test_insert');
+INSERT 0 1
+-- Test select
+SELECT * FROM neon_test.verify_ops;
+ id |    data     
+----+-------------
+  1 | test_insert
+(1 row)
+
+-- Test update
+UPDATE neon_test.verify_ops SET data = 'test_update' WHERE id = 1;
+UPDATE 1
+-- Test delete
+DELETE FROM neon_test.verify_ops WHERE id = 1;
+DELETE 1
+-- Cleanup verification table
+DROP TABLE neon_test.verify_ops;
+DROP TABLE
+-- ============================================================================
+-- Update Setup Status
+-- ============================================================================
+UPDATE neon_test.test_results 
+SET test_status = 'PASSED',
+    end_time = CURRENT_TIMESTAMP,
+    duration_ms = EXTRACT(MILLISECONDS FROM (CURRENT_TIMESTAMP - start_time))::INT,
+    message = 'Environment setup completed successfully'
+WHERE test_name = 'neon_setup';
+UPDATE 1
+-- Show setup result
+SELECT test_name, test_status, message 
+FROM neon_test.test_results 
+WHERE test_name = 'neon_setup';
+ test_name  | test_status |                 message                  
+------------+-------------+------------------------------------------
+ neon_setup | PASSED      | Environment setup completed successfully
+(1 row)
+
+\echo '=============================================='
+==============================================
+\echo '  Environment Initialization Complete'
+  Environment Initialization Complete
+\echo '=============================================='
+==============================================
+total time: 3569  ms

@@ -609,6 +609,7 @@ pub fn slru_dir_to_key(kind: SlruKind) -> Key {
             SlruKind::Clog => 0x00,
             SlruKind::MultiXactMembers => 0x01,
             SlruKind::MultiXactOffsets => 0x02,
+            SlruKind::Csnlog => 0x03,
         },
         field3: 0,
         field4: 0,
@@ -629,6 +630,7 @@ pub fn slru_dir_kind(key: &Key) -> Option<Result<SlruKind, u32>> {
             0 => Some(Ok(SlruKind::Clog)),
             1 => Some(Ok(SlruKind::MultiXactMembers)),
             2 => Some(Ok(SlruKind::MultiXactOffsets)),
+            3 => Some(Ok(SlruKind::Csnlog)),
             x => Some(Err(x)),
         }
     } else {
@@ -644,6 +646,7 @@ pub fn slru_block_to_key(kind: SlruKind, segno: u32, blknum: BlockNumber) -> Key
             SlruKind::Clog => 0x00,
             SlruKind::MultiXactMembers => 0x01,
             SlruKind::MultiXactOffsets => 0x02,
+            SlruKind::Csnlog => 0x03,
         },
         field3: 1,
         field4: segno,
@@ -660,6 +663,7 @@ pub fn slru_segment_size_to_key(kind: SlruKind, segno: u32) -> Key {
             SlruKind::Clog => 0x00,
             SlruKind::MultiXactMembers => 0x01,
             SlruKind::MultiXactOffsets => 0x02,
+            SlruKind::Csnlog => 0x03,
         },
         field3: 1,
         field4: segno,
@@ -688,6 +692,7 @@ pub fn slru_segment_key_range(kind: SlruKind, segno: u32) -> Range<Key> {
         SlruKind::Clog => 0x00,
         SlruKind::MultiXactMembers => 0x01,
         SlruKind::MultiXactOffsets => 0x02,
+        SlruKind::Csnlog => 0x03,
     };
 
     Key {
@@ -887,6 +892,7 @@ impl Key {
                     0x00 => SlruKind::Clog,
                     0x01 => SlruKind::MultiXactMembers,
                     0x02 => SlruKind::MultiXactOffsets,
+                    0x03 => SlruKind::Csnlog,
                     _ => anyhow::bail!("unrecognized slru kind 0x{:02x}", self.field2),
                 };
                 let segno = self.field4;

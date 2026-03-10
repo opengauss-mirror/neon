@@ -44,7 +44,8 @@ impl Record {
             xl_prev: prev_lsn.into(),
             xl_info: self.info,
             xl_rmid: self.rmid,
-            __bindgen_padding_0: [0; 2],
+            xl_term: 0,
+            xl_bucket_id: 0,
             xl_crc: 0, // see below
         };
 
@@ -145,7 +146,7 @@ impl<R: RecordGenerator> WalGenerator<R> {
                     xlp_tli: Self::TIMELINE_ID,
                     xlp_pageaddr: lsn.0,
                     xlp_rem_len: 0,
-                    __bindgen_padding_0: [0; 4],
+                    xlp_total_len: 0,
                 };
                 // If the record was split across page boundaries, mark as continuation.
                 if remaining.len() < record.len() {

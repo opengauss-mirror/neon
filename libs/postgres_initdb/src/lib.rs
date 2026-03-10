@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use postgres_versioninfo::PgMajorVersion;
 
 pub struct RunInitdbArgs<'a> {
@@ -16,6 +16,7 @@ pub struct RunInitdbArgs<'a> {
     pub pg_version: PgMajorVersion,
     pub library_search_path: &'a Utf8Path,
     pub pgdata: &'a Utf8Path,
+    pub flavor: InitdbFlavor,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -45,6 +46,29 @@ impl fmt::Display for Error {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitdbFlavor {
+    Postgres,
+    OpenGauss,
+}
+
+pub fn locate_initdb_binary(pg_bin_dir: &Utf8Path) -> anyhow::Result<(InitdbFlavor, Utf8PathBuf)> {
+    for (binary, flavor) in [
+        ("gs_initdb", InitdbFlavor::OpenGauss),
+        ("initdb", InitdbFlavor::Postgres),
+    ] {
+        let path = pg_bin_dir.join(binary);
+        if path.as_std_path().exists() {
+            return Ok((flavor, path));
+        }
+    }
+
+    anyhow::bail!(
+        "could not find a supported initdb binary under {}",
+        pg_bin_dir
+    );
+}
+
 pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
     let RunInitdbArgs {
         superuser,
@@ -53,6 +77,7 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         pg_version,
         library_search_path,
         pgdata,
+        flavor,
     } = args;
     let mut initdb_command = tokio::process::Command::new(initdb_bin_path);
     initdb_command
@@ -60,8 +85,6 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         .args(["--username", superuser])
         .args(["--encoding", "utf8"])
         .args(["--locale", locale])
-        .arg("--no-instructions")
-        .arg("--no-sync")
         .env_clear()
         .env("LD_LIBRARY_PATH", library_search_path)
         .env("DYLD_LIBRARY_PATH", library_search_path)
@@ -79,8 +102,18 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         // we would be interested in the stderr output, if there was any
         .stderr(std::process::Stdio::piped());
 
+    match flavor {
+        InitdbFlavor::Postgres => {
+            initdb_command.arg("--no-instructions").arg("--no-sync");
+        }
+        InitdbFlavor::OpenGauss => {
+            initdb_command.args(["--nodename", "neon_node"]);
+        }
+    }
+
     // Before version 14, only the libc provide was available.
-    if pg_version > PgMajorVersion::PG14 {
+    // openGauss doesn't support --locale-provider regardless of version.
+    if matches!(flavor, InitdbFlavor::Postgres) && pg_version > PgMajorVersion::PG14 {
         // Version 17 brought with it a builtin locale provider which only provides
         // C and C.UTF-8. While being safer for collation purposes since it is
         // guaranteed to be consistent throughout a major release, it is also more

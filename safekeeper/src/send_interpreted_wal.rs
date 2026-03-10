@@ -420,6 +420,24 @@ impl InterpretedWalReader {
 
                     self.state.write().unwrap().update_current_batch_wal_start(wal_start_lsn);
 
+                    // TESTDBG: Log WAL data read from persistent storage
+                    tracing::info!(
+                        "TESTDBG InterpretedWalReader: READ from storage: wal_start_lsn={}, wal_end_lsn={}, wal_len={}, available_wal_end_lsn={}",
+                        wal_start_lsn, wal_end_lsn, wal.len(), available_wal_end_lsn
+                    );
+                    if !wal.is_empty() {
+                        tracing::info!(
+                            "TESTDBG InterpretedWalReader: READ data first_64_bytes={:02x?}",
+                            &wal[..std::cmp::min(wal.len(), 64)]
+                        );
+                        if wal.len() > 128 {
+                            tracing::info!(
+                                "TESTDBG InterpretedWalReader: READ data last_64_bytes={:02x?}",
+                                &wal[wal.len()-64..]
+                            );
+                        }
+                    }
+
                     wal_decoder.feed_bytes(&wal);
 
                     // Deserialize and interpret WAL records from this batch of WAL.

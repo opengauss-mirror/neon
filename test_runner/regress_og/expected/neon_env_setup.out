@@ -1,0 +1,141 @@
+
+==============================================
+  Neon Environment Setup Test
+==============================================
+
+Starting Neon environment initialization...
+This will take approximately 30-60 seconds.
+
+[0;34m[INFO][0m Verifying prerequisites...
+[0;34m[INFO][0m OPENGAUSS_DISTRIB_DIR: /usr1/neon/neon_branch_dev/og_install
+[0;34m[INFO][0m POSTGRES_DISTRIB_DIR: /usr1/neon/neon_branch_dev/og_install
+[0;32m[SUCCESS][0m Prerequisites verified
+
+[0;34m[INFO][0m Initializing Neon repository...
+  Current working directory: /usr1/neon/neon_branch_dev/test_runner/regress_og
+  OPENGAUSS_DISTRIB_DIR: /usr1/neon/neon_branch_dev/og_install
+  POSTGRES_DISTRIB_DIR: /usr1/neon/neon_branch_dev/og_install
+  NEON_ROOT: /usr1/neon/neon_branch_dev
+[1;33m[WARN][0m Removing existing .neon directory
+  Running: /usr1/neon/neon_branch_dev/target/debug/neon_local init
+
+Initializing pageserver node 1 at '127.0.0.1:64000' in "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/pageserver_1"
+Initializing object storage in "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/endpoint_storage"
+[0;32m[SUCCESS][0m Config verified: pg_distrib_dir = /usr1/neon/neon_branch_dev/og_install
+
+[0;32m[SUCCESS][0m Neon repository initialized
+
+[0;34m[INFO][0m Starting Neon services...
+  This may take 30-60 seconds...
+
+  Running: /usr1/neon/neon_branch_dev/target/debug/neon_local start
+
+Starting neon broker at http://127.0.0.1:50051/
+Starting pageserver node 1 at '127.0.0.1:64000' in "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/pageserver_1", retrying for 10s
+Starting safekeeper at '127.0.0.1:5454' in '/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/safekeepers/sk1', retrying for 10s
+Starting endpoint_storage at 127.0.0.1:9993
+.
+endpoint_storage started and passed status check, pid: 2087886
+..[2025-12-30 11:53:12.556][2088030][][gs_ctl]: gs_ctl status,datadir is /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db 
+no server running
+The files belonging to this database system will be owned by user "neon".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "en_US.UTF-8".
+The default database encoding has accordingly been set to "UTF8".
+The default text search configuration will be set to "english".
+
+creating directory /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db ... ok
+creating subdirectories ... in ordinary occasionok
+creating configuration files ... 
+safekeeper-1 started and passed status check, pid: 2087885
+
+pageserver started and passed status check, pid: 2087880
+ok
+selecting default max_connections ... 100
+selecting default shared_buffers ... .1024MB
+Begin init undo subsystem meta.
+[INIT UNDO] Init undo subsystem meta successfully.
+creating template1 database in /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db/base/1 ... 2025-12-30 11:53:13.688 [unknown] [unknown] localhost 281472533540896 0[0:0#0]  [BACKEND] WARNING:  max_imcs_cache * htap_borrow_mem_percent is larger than max_borrow_memory
+2025-12-30 11:53:13.989 [unknown] [unknown] localhost 281472533540896 0[0:0#0]  [BACKEND] WARNING:  macAddr is 63534/1060581336, sysidentifier is 4163780407/802710229, randomNum is 4122370773
+...
+storage_broker has not started yet, continuing to wait.ok
+initializing pg_authid ... ok
+setting password ... .ok
+initializing dependencies ... .ok
+loading PL/pgSQL server-side language ... .ok
+creating system views ... .
+SIGKILL & wait the started process
+ok
+creating performance views ... ok
+loading system objects' descriptions ... ok
+creating collations ... ok
+creating conversions ... ok
+creating dictionaries ... ok
+setting privileges on built-in objects ... ok
+initialize global configure for bucketmap length ... ok
+creating information schema ... ok
+loading foreign-data wrapper for distfs access ... ok
+loading foreign-data wrapper for log access ... ok
+loading hstore extension ... ok
+loading foreign-data wrapper for MOT access ... ok
+loading security plugin ... ok
+update system tables ... ok
+creating snapshots catalog ... ok
+vacuuming database template1 ... ok
+copying template1 to template0 ... ok
+copying template1 to postgres ... ok
+freezing database template0 ... ok
+freezing database template1 ... ok
+freezing database postgres ... ok
+
+WARNING: enabling "trust" authentication for local connections
+You can change this by editing pg_hba.conf or using the option -A, or
+--auth-local and --auth-host, the next time you run gs_initdb.
+
+Success. You can now start the database server of single node using:
+
+    /usr1/neon/neon_branch_dev/og_install/V702/bin/gaussdb -D /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db --single_node
+or
+    /usr1/neon/neon_branch_dev/og_install/V702/bin/gs_ctl start -D /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db -Z single_node -l logfile
+
+Starting storage controller database...
+[2025-12-30 11:53:48.480][2099169][][gs_ctl]: gs_ctl started,datadir is /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db 
+[2025-12-30 11:53:48.531][2099169][][gs_ctl]: port:1235 already in use. /proc/net/tcp:
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode  
+  42: 0100007F:04D3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  6019        0 1753877607 1 00000000cc2ecd1c 100 0 0 10 0                
+[2025-12-30 11:53:48.531][2099169][][gs_ctl]: CheckPort: popen(command:lsof -i:1235 | grep -E 'COMMAND|LISTEN').
+sh: line 1: lsof: command not found
+[2025-12-30 11:53:48.535][2099169][][gs_ctl]: port conflict when start server
+[2025-12-30 11:53:48.535][2099169][][gs_ctl]: waiting for server to start...
+..........[2025-12-30 11:53:58.543][2099169][][gs_ctl]: waitpid 2099207 failed, exitstatus is 256, ret is 2
+
+[2025-12-30 11:53:58.543][2099169][][gs_ctl]: stopped waiting
+[2025-12-30 11:53:58.543][2099169][][gs_ctl]: could not start server
+Examine the log output.
+startup failed because one or more services could not be started
+start storage_broker
+  start storage_broker
+  
+  Caused by:
+      0: Failed to spawn storage_broker subprocess
+      1: storage_broker did not start+pass status checks within 10s seconds
+start storage_controller
+  start storage_controller
+  
+  Caused by:
+      Failed to start postgres 1
+No process is holding the pidfile. The process must have already exited. Leave in place to avoid race conditions: "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/endpoint_storage/endpoint_storage.pid"
+No process is holding the pidfile. The process must have already exited. Leave in place to avoid race conditions: "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/pageserver_1/pageserver.pid"
+No process is holding the pidfile. The process must have already exited. Leave in place to avoid race conditions: "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/safekeepers/sk1/safekeeper.pid"
+No process is holding the pidfile. The process must have already exited. Leave in place to avoid race conditions: "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_broker.pid"
+storage_controller is already stopped: no pid file present at "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_1/storage_controller.pid"
+Stopping storage controller database...
+[2025-12-30 11:53:58.602][2102581][][gs_ctl]: gs_ctl stopped ,datadir is /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db 
+[2025-12-30 11:53:58.602][2102581][][gs_ctl]:  PID file "/usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db/postmaster.pid" does not exist.
+[2025-12-30 11:53:58.602][2102581][][gs_ctl]: Is server running?
+[2025-12-30 11:53:58.608][2102582][][gs_ctl]: gs_ctl status,datadir is /usr1/neon/neon_branch_dev/test_runner/regress_og/.neon/storage_controller_db 
+no server running
+Storage controller database is already stopped
+[0;31m[ERROR][0m Failed to start Neon services
+[0;31m[ERROR][0m Failed to start Neon services

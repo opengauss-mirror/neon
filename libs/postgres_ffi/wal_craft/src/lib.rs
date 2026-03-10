@@ -50,9 +50,16 @@ pub static REQUIRED_POSTGRES_CONFIG: [&str; 4] = [
 
 impl Conf {
     pub fn pg_distrib_dir(&self) -> anyhow::Result<PathBuf> {
-        let path = self.pg_distrib_dir.clone();
-
-        Ok(path.join(self.pg_version.v_str()))
+        let base = self.pg_distrib_dir.clone();
+        let mut fallback = base.join(self.pg_version.v_str());
+        for dir in self.pg_version.distrib_dir_candidates() {
+            let candidate = base.join(dir);
+            fallback = candidate.clone();
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Ok(fallback)
     }
 
     fn pg_bin_dir(&self) -> anyhow::Result<PathBuf> {
@@ -64,7 +71,7 @@ impl Conf {
     }
 
     pub fn wal_dir(&self) -> PathBuf {
-        self.datadir.join("pg_wal")
+        self.datadir.join("pg_xlog")
     }
 
     fn new_pg_command(&self, command: impl AsRef<Path>) -> anyhow::Result<Command> {

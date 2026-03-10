@@ -318,6 +318,9 @@ impl Timeline {
     ) -> Vec<Result<Bytes, PageReconstructError>> {
         debug_assert_current_span_has_tenant_and_timeline_id();
 
+        // [LAYERDBG] Log batched page requests
+        info!("[LAYERDBG] get_rel_page_at_lsn_batched: starting batch request");
+
         let mut slots_filled = 0;
         let page_count = pages.len();
 
@@ -1499,6 +1502,7 @@ impl Timeline {
                 SlruKind::Clog,
                 SlruKind::MultiXactMembers,
                 SlruKind::MultiXactOffsets,
+                SlruKind::Csnlog,
             ] {
                 let slrudir_key = slru_dir_to_key(kind);
                 result.add_key(slrudir_key);
@@ -1838,12 +1842,21 @@ impl DatadirModification<'_> {
                 empty_dir.clone(),
             );
             self.pending_directory_entries.push((
-                DirectoryKind::SlruSegment(SlruKind::Clog),
+                DirectoryKind::SlruSegment(SlruKind::MultiXactMembers),
                 MetricsUpdate::Set(0),
             ));
-            self.put(slru_dir_to_key(SlruKind::MultiXactOffsets), empty_dir);
+            self.put(
+                slru_dir_to_key(SlruKind::MultiXactOffsets),
+                empty_dir.clone(),
+            );
             self.pending_directory_entries.push((
                 DirectoryKind::SlruSegment(SlruKind::MultiXactOffsets),
+                MetricsUpdate::Set(0),
+            ));
+            // openGauss CSN log
+            self.put(slru_dir_to_key(SlruKind::Csnlog), empty_dir);
+            self.pending_directory_entries.push((
+                DirectoryKind::SlruSegment(SlruKind::Csnlog),
                 MetricsUpdate::Set(0),
             ));
         }
@@ -1935,6 +1948,15 @@ impl DatadirModification<'_> {
     ) -> Result<(), WalIngestError> {
         let mut gaps_at_lsns = Vec::default();
 
+        // [LAYERDBG] Log batch info
+        if !batch.metadata.is_empty() {
+            info!(
+                "[LAYERDBG] ingest_batch: processing {} metadata entries at LSN {}",
+                batch.metadata.len(),
+                self.lsn
+            );
+        }
+
         for meta in batch.metadata.iter() {
             let key = Key::from_compact(meta.key());
             let (rel, blkno) = key
@@ -1942,12 +1964,27 @@ impl DatadirModification<'_> {
                 .map_err(|_| WalIngestErrorKind::InvalidKey(key, meta.lsn()))?;
             let new_nblocks = blkno + 1;
 
+            // [LAYERDBG] Log each metadata entry details
+            info!(
+                "[LAYERDBG] ingest_batch entry: key={}, rel={}/{}/{}.{}, blkno={}, lsn={}",
+                key, rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno,
+                meta.lsn()
+            );
+
             let old_nblocks = self.create_relation_if_required(rel, ctx).await?;
             if new_nblocks > old_nblocks {
+                info!(
+                    "[LAYERDBG] ingest_batch: extending rel {}/{}/{}.{} from {} to {} blocks",
+                    rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, old_nblocks, new_nblocks
+                );
                 self.put_rel_extend(rel, new_nblocks, ctx).await?;
             }
 
             if let Some(gaps) = Self::find_gaps(rel, blkno, old_nblocks, shard) {
+                info!(
+                    "[LAYERDBG] ingest_batch: found gap for rel {}/{}/{}.{}, blkno={}, old_nblocks={}",
+                    rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno, old_nblocks
+                );
                 gaps_at_lsns.push((gaps, meta.lsn()));
             }
         }
@@ -2184,7 +2221,9 @@ impl DatadirModification<'_> {
     ) -> Result<(), WalIngestError> {
         // Add it to the directory entry
         let dirbuf = self.get(TWOPHASEDIR_KEY, ctx).await?;
-        let newdirbuf = if self.tline.pg_version >= PgMajorVersion::PG17 {
+        let newdirbuf = if self.tline.pg_version >= PgMajorVersion::PG17
+            || self.tline.pg_version == PgMajorVersion::PG14
+        {
             let mut dir = TwoPhaseDirectoryV17::des(&dirbuf)?;
             if !dir.xids.insert(xid) {
                 Err(WalIngestErrorKind::FileAlreadyExists(xid))?;
@@ -2195,9 +2234,10 @@ impl DatadirModification<'_> {
             ));
             Bytes::from(TwoPhaseDirectoryV17::ser(&dir)?)
         } else {
+            // For older PostgreSQL versions, TransactionId is u32
             let xid = xid as u32;
             let mut dir = TwoPhaseDirectory::des(&dirbuf)?;
-            if !dir.xids.insert(xid) {
+            if !dir.xids.insert(xid as TransactionId) {
                 Err(WalIngestErrorKind::FileAlreadyExists(xid.into()))?;
             }
             self.pending_directory_entries.push((
@@ -2708,7 +2748,9 @@ impl DatadirModification<'_> {
     ) -> Result<(), WalIngestError> {
         // Remove it from the directory entry
         let buf = self.get(TWOPHASEDIR_KEY, ctx).await?;
-        let newdirbuf = if self.tline.pg_version >= PgMajorVersion::PG17 {
+        let newdirbuf = if self.tline.pg_version >= PgMajorVersion::PG17
+            || self.tline.pg_version == PgMajorVersion::PG14
+        {
             let mut dir = TwoPhaseDirectoryV17::des(&buf)?;
 
             if !dir.xids.remove(&xid) {
@@ -2720,11 +2762,12 @@ impl DatadirModification<'_> {
             ));
             Bytes::from(TwoPhaseDirectoryV17::ser(&dir)?)
         } else {
+            // For older PostgreSQL versions, TransactionId is u32
             let xid: u32 = u32::try_from(xid)
                 .map_err(|e| WalIngestErrorKind::LogicalError(anyhow::Error::from(e)))?;
             let mut dir = TwoPhaseDirectory::des(&buf)?;
 
-            if !dir.xids.remove(&xid) {
+            if !dir.xids.remove(&(xid as TransactionId)) {
                 warn!("twophase file for xid {} does not exist", xid);
             }
             self.pending_directory_entries.push((

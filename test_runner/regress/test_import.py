@@ -42,7 +42,7 @@ def test_import_from_vanilla(test_output_dir, pg_bin, vanilla_pg, neon_env_build
     # Take basebackup
     basebackup_dir = os.path.join(test_output_dir, "basebackup")
     base_tar = os.path.join(basebackup_dir, "base.tar")
-    wal_tar = os.path.join(basebackup_dir, "pg_wal.tar")
+    wal_tar = os.path.join(basebackup_dir, "pg_xlog.tar")
     os.mkdir(basebackup_dir)
     vanilla_pg.safe_psql("CHECKPOINT")
     pg_bin.run(

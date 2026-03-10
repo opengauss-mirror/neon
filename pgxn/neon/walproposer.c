@@ -42,6 +42,153 @@
 #include "neon.h"
 #include "walproposer.h"
 #include "neon_utils.h"
+#include "wait_events.h"
+
+/* TESTDBG: Include for XLogRecord debugging */
+#include "access/xlog_basic.h"
+
+/* TESTDBG: WAL structure constants for openGauss */
+#define TESTDBG_XLOG_BLCKSZ 8192
+#define TESTDBG_WAL_SEGMENT_SIZE (16 * 1024 * 1024)
+#define TESTDBG_XLOG_SIZE_OF_XLOG_SHORT_PHD 24
+#define TESTDBG_XLOG_SIZE_OF_XLOG_LONG_PHD 40
+#define TESTDBG_XLP_LONG_HEADER 0x0002
+#define TESTDBG_XLOG_PAGE_MAGIC 0xD074
+
+/* TESTDBG: Helper function to dump XLogRecord info from WAL data with page header handling */
+static void
+DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int wal_len)
+{
+    int offset = 0;
+    int record_count = 0;
+    XLogRecPtr current_lsn = lsn;
+    
+    elog(LOG, "TESTDBG %s: LSN=%X/%X, wal_len=%d",
+         prefix, LSN_FORMAT_ARGS(lsn), wal_len);
+    
+    while (offset < wal_len)
+    {
+        const char *ptr = wal_data + offset;
+        int remaining = wal_len - offset;
+        
+        /* Check if we're at a page boundary */
+        uint64 page_offset = current_lsn % TESTDBG_XLOG_BLCKSZ;
+        uint64 segment_offset = current_lsn % TESTDBG_WAL_SEGMENT_SIZE;
+        
+        /* At the start of a page, we need to skip the page header */
+        if (page_offset == 0)
+        {
+            int hdr_size = (segment_offset == 0) ? TESTDBG_XLOG_SIZE_OF_XLOG_LONG_PHD : TESTDBG_XLOG_SIZE_OF_XLOG_SHORT_PHD;
+            
+            if (remaining >= hdr_size)
+            {
+                /* Parse page header for debugging */
+                uint16 xlp_magic = *(uint16 *)(ptr);
+                uint16 xlp_info = *(uint16 *)(ptr + 2);
+                uint32 xlp_tli = *(uint32 *)(ptr + 4);
+                uint64 xlp_pageaddr = *(uint64 *)(ptr + 8);
+                uint32 xlp_rem_len = *(uint32 *)(ptr + 16);
+                uint32 xlp_total_len = *(uint32 *)(ptr + 20);
+                
+                bool is_long_header = (xlp_info & TESTDBG_XLP_LONG_HEADER) != 0;
+                int actual_hdr_size = is_long_header ? TESTDBG_XLOG_SIZE_OF_XLOG_LONG_PHD : TESTDBG_XLOG_SIZE_OF_XLOG_SHORT_PHD;
+                
+                elog(LOG, "TESTDBG %s: PAGE_HEADER at LSN=%X/%X offset=%d: xlp_magic=0x%04X, xlp_info=0x%04X, xlp_tli=%u, xlp_pageaddr=%X/%X, xlp_rem_len=%u, xlp_total_len=%u, hdr_size=%d",
+                     prefix,
+                     (uint32)(current_lsn >> 32), (uint32)current_lsn,
+                     offset,
+                     xlp_magic,
+                     xlp_info,
+                     xlp_tli,
+                     (uint32)(xlp_pageaddr >> 32), (uint32)xlp_pageaddr,
+                     xlp_rem_len,
+                     xlp_total_len,
+                     actual_hdr_size);
+                
+                /* Validate page magic */
+                if (xlp_magic != TESTDBG_XLOG_PAGE_MAGIC)
+                {
+                    elog(LOG, "TESTDBG %s: WARNING - unexpected page magic 0x%04X (expected 0x%04X)",
+                         prefix, xlp_magic, TESTDBG_XLOG_PAGE_MAGIC);
+                }
+                
+                offset += actual_hdr_size;
+                current_lsn += actual_hdr_size;
+                continue;
+            }
+            else
+            {
+                elog(LOG, "TESTDBG %s: insufficient data for page header at offset=%d, remaining=%d",
+                     prefix, offset, remaining);
+                break;
+            }
+        }
+        
+        /* Not at page boundary, try to parse XLogRecord */
+        if (remaining < (int)sizeof(XLogRecord))
+        {
+            elog(LOG, "TESTDBG %s: insufficient data for XLogRecord at offset=%d, remaining=%d",
+                 prefix, offset, remaining);
+            break;
+        }
+        
+        XLogRecord *record = (XLogRecord *)ptr;
+        uint32 tot_len = record->xl_tot_len;
+        
+        /* Sanity check for xl_tot_len */
+        if (tot_len < sizeof(XLogRecord) || tot_len > 10 * 1024 * 1024)
+        {
+            elog(LOG, "TESTDBG %s: record[%d] INVALID xl_tot_len=%u at LSN=%X/%X offset=%d, remaining=%d, sizeof(XLogRecord)=%lu",
+                 prefix, record_count, tot_len,
+                 (uint32)(current_lsn >> 32), (uint32)current_lsn,
+                 offset, remaining, sizeof(XLogRecord));
+            break;
+        }
+        
+        elog(LOG, "TESTDBG %s: record[%d] at LSN=%X/%X: xl_tot_len=%u, xl_term=%u, xl_xid=%lu, "
+             "xl_prev=%X/%X, xl_info=0x%02X, xl_rmid=%u, xl_bucket_id=%u, xl_crc=0x%08X",
+             prefix, record_count,
+             (uint32)(current_lsn >> 32), (uint32)current_lsn,
+             record->xl_tot_len,
+             record->xl_term,
+             (unsigned long)record->xl_xid,
+             LSN_FORMAT_ARGS(record->xl_prev),
+             record->xl_info,
+             record->xl_rmid,
+             record->xl_bucket_id,
+             record->xl_crc);
+        
+        /* Calculate how much of this record is on the current page */
+        uint64 remaining_in_page = TESTDBG_XLOG_BLCKSZ - page_offset;
+        
+        if (tot_len <= remaining_in_page)
+        {
+            /* Record fits entirely on current page */
+            int aligned_len = MAXALIGN(tot_len);
+            offset += aligned_len;
+            current_lsn += aligned_len;
+        }
+        else
+        {
+            /* Record spans multiple pages */
+            elog(LOG, "TESTDBG %s: record[%d] spans pages: record_len=%u, remaining_in_page=%lu",
+                 prefix, record_count, tot_len, (unsigned long)remaining_in_page);
+            
+            int aligned_len = MAXALIGN(tot_len);
+            offset += aligned_len;
+            current_lsn += aligned_len;
+        }
+        
+        record_count++;
+        
+        /* Limit output to avoid log flooding */
+        if (record_count >= 5)
+        {
+            elog(LOG, "TESTDBG %s: ... (truncated, %d bytes remaining)", prefix, wal_len - offset);
+            break;
+        }
+    }
+}
 
 /* Prototypes for private functions */
 static void WalProposerLoop(WalProposer *wp);
@@ -95,7 +242,7 @@ WalProposerCreate(WalProposerConfig *config, walproposer_api api)
 	char	   *port;
 	WalProposer *wp;
 
-	wp = palloc0(sizeof(WalProposer));
+	wp = (WalProposer *)palloc0(sizeof(WalProposer));
 	wp->config = config;
 	wp->api = api;
 	wp->localTimeLineID = config->pgTimeline;
@@ -648,7 +795,7 @@ SendStartWALPush(Safekeeper *sk)
 	WalProposer *wp = sk->wp;
 
 	/* Forbid implicit timeline creation if generations are enabled. */
-	char	   *allow_timeline_creation = WalProposerGenerationsEnabled(wp) ? "false" : "true";
+	const char	   *allow_timeline_creation = WalProposerGenerationsEnabled(wp) ? "false" : "true";
 #define CMD_LEN 512
 	char		cmd[CMD_LEN];
 
@@ -1303,7 +1450,8 @@ GetLastLogTerm(Safekeeper *sk)
 static XLogRecPtr
 SkipXLogPageHeader(WalProposer *wp, XLogRecPtr lsn)
 {
-	if (XLogSegmentOffset(lsn, wp->config->wal_segment_size) == 0)
+	// if (XLogSegmentOffset(lsn, wp->config->wal_segment_size) == 0)
+	if (lsn % XLogSegSize == 0)
 	{
 		lsn += SizeOfXLogLongPHD;
 	}
@@ -1367,7 +1515,7 @@ ProcessPropStartPos(WalProposer *wp)
 	 */
 	dth = &wp->donor->voteResponse.termHistory;
 	wp->propTermHistory.n_entries = dth->n_entries + 1;
-	wp->propTermHistory.entries = palloc(sizeof(TermSwitchEntry) * wp->propTermHistory.n_entries);
+	wp->propTermHistory.entries = (TermSwitchEntry *)palloc(sizeof(TermSwitchEntry) * wp->propTermHistory.n_entries);
 	if (dth->n_entries > 0)
 		memcpy(wp->propTermHistory.entries, dth->entries, sizeof(TermSwitchEntry) * dth->n_entries);
 	wp->propTermHistory.entries[wp->propTermHistory.n_entries - 1].term = wp->propTerm;
@@ -1383,9 +1531,14 @@ ProcessPropStartPos(WalProposer *wp)
 	 * Ensure the basebackup we are running (at RedoStartLsn) matches LSN
 	 * since which we are going to write according to the consensus. If not,
 	 * we must bail out, as clog and other non rel data is inconsistent.
+	 *
+	 * NEON: Skip this check in replica mode. Replica nodes get pages directly
+	 * from pageserver and don't need local WAL replay. The propTermStartLsn
+	 * from safekeeper may be ahead of our basebackup LSN, which is expected
+	 * because the primary has written more WAL since the replica was created.
 	 */
 	walprop_shared = wp->api.get_shmem_state(wp);
-	if (!wp->config->syncSafekeepers && !walprop_shared->replica_promote)
+	if (!wp->config->syncSafekeepers && !walprop_shared->replica_promote && !wp->config->is_replica)
 	{
 		/*
 		 * Basebackup LSN always points to the beginning of the record (not
@@ -1419,6 +1572,12 @@ ProcessPropStartPos(WalProposer *wp)
 					   LSN_FORMAT_ARGS(wp->api.get_redo_start_lsn(wp)));
 			}
 		}
+	}
+	else if (wp->config->is_replica)
+	{
+		wp_log(LOG, "replica mode: skipping basebackup LSN check (propTermStartLsn=%X/%X, basebackup LSN=%X/%X)",
+			   LSN_FORMAT_ARGS(wp->propTermStartLsn),
+			   LSN_FORMAT_ARGS(wp->api.get_redo_start_lsn(wp)));
 	}
 	pg_atomic_write_u64(&walprop_shared->mineLastElectedTerm, wp->propTerm);
 }
@@ -1708,6 +1867,11 @@ SendAppendRequests(Safekeeper *sk)
 										 &errmsg))
 				{
 					case NEON_WALREAD_SUCCESS:
+						/* TESTDBG: Dump XLogRecord info after reading WAL */
+						DumpXLogRecordInfo("walproposer SEND",
+										   req->beginLsn,
+										   &sk->outbuf.data[sk->outbuf.len],
+										   req_len);
 						break;
 					case NEON_WALREAD_WOULDBLOCK:
 						return true;
@@ -2400,7 +2564,7 @@ MembershipConfigurationDeserialize(MembershipConfiguration *mconf, StringInfo bu
 
 	mconf->generation = pq_getmsgint32(buf);
 	mconf->members.len = pq_getmsgint32(buf);
-	mconf->members.m = palloc0(sizeof(SafekeeperId) * mconf->members.len);
+	mconf->members.m = (SafekeeperId *)palloc0(sizeof(SafekeeperId) * mconf->members.len);
 	for (i = 0; i < mconf->members.len; i++)
 	{
 		const char *buf_host;
@@ -2411,7 +2575,7 @@ MembershipConfigurationDeserialize(MembershipConfiguration *mconf, StringInfo bu
 		mconf->members.m[i].port = pq_getmsgint16(buf);
 	}
 	mconf->new_members.len = pq_getmsgint32(buf);
-	mconf->new_members.m = palloc0(sizeof(SafekeeperId) * mconf->new_members.len);
+	mconf->new_members.m = (SafekeeperId *)palloc0(sizeof(SafekeeperId) * mconf->new_members.len);
 	for (i = 0; i < mconf->new_members.len; i++)
 	{
 		const char *buf_host;
@@ -2486,7 +2650,7 @@ AsyncReadMessage(Safekeeper *sk, AcceptorProposerMessage *anymsg)
 					msg->flushLsn = pq_getmsgint64(&s);
 					msg->truncateLsn = pq_getmsgint64(&s);
 					msg->termHistory.n_entries = pq_getmsgint32(&s);
-					msg->termHistory.entries = palloc(sizeof(TermSwitchEntry) * msg->termHistory.n_entries);
+					msg->termHistory.entries = (TermSwitchEntry *)palloc(sizeof(TermSwitchEntry) * msg->termHistory.n_entries);
 					for (uint32 i = 0; i < msg->termHistory.n_entries; i++)
 					{
 						msg->termHistory.entries[i].term = pq_getmsgint64(&s);
@@ -2551,7 +2715,7 @@ AsyncReadMessage(Safekeeper *sk, AcceptorProposerMessage *anymsg)
 					msg->flushLsn = pq_getmsgint64_le(&s);
 					msg->truncateLsn = pq_getmsgint64_le(&s);
 					msg->termHistory.n_entries = pq_getmsgint32_le(&s);
-					msg->termHistory.entries = palloc(sizeof(TermSwitchEntry) * msg->termHistory.n_entries);
+					msg->termHistory.entries = (TermSwitchEntry *)palloc(sizeof(TermSwitchEntry) * msg->termHistory.n_entries);
 					for (int i = 0; i < msg->termHistory.n_entries; i++)
 					{
 						msg->termHistory.entries[i].term = pq_getmsgint64_le(&s);
@@ -3001,10 +3165,10 @@ MembershipConfigurationCopy(MembershipConfiguration *src, MembershipConfiguratio
 {
 	dst->generation = src->generation;
 	dst->members.len = src->members.len;
-	dst->members.m = palloc0(sizeof(SafekeeperId) * dst->members.len);
+	dst->members.m = (SafekeeperId *)palloc0(sizeof(SafekeeperId) * dst->members.len);
 	memcpy(dst->members.m, src->members.m, sizeof(SafekeeperId) * dst->members.len);
 	dst->new_members.len = src->new_members.len;
-	dst->new_members.m = palloc0(sizeof(SafekeeperId) * dst->new_members.len);
+	dst->new_members.m = (SafekeeperId *)palloc0(sizeof(SafekeeperId) * dst->new_members.len);
 	memcpy(dst->new_members.m, src->new_members.m, sizeof(SafekeeperId) * dst->new_members.len);
 }
 

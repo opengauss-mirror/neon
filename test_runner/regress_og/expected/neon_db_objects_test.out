@@ -1,0 +1,1129 @@
+-- ============================================================================
+-- Database Objects Test
+-- ============================================================================
+-- Description: Test database object operations with branching
+-- ============================================================================
+-- ============================================================================
+-- Test Case 66: Table and Index Inheritance
+-- ============================================================================
+-- Step 1: Create test table with indexes on MAIN
+CREATE TABLE test_db_obj_66 (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    value INTEGER,
+    status VARCHAR(20),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:18: NOTICE:  CREATE TABLE will create implicit sequence "test_db_obj_66_id_seq" for serial column "test_db_obj_66.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:18: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_db_obj_66_pkey" for table "test_db_obj_66"
+CREATE TABLE
+-- Create indexes
+CREATE INDEX idx_66_name ON test_db_obj_66(name);
+CREATE INDEX
+CREATE INDEX idx_66_value ON test_db_obj_66(value);
+CREATE INDEX
+CREATE INDEX idx_66_status ON test_db_obj_66(status);
+CREATE INDEX
+-- Insert test data
+INSERT INTO test_db_obj_66 (name, value, status) VALUES 
+    ('main_record_1', 100, 'active'),
+    ('main_record_2', 200, 'active'),
+    ('main_record_3', 300, 'inactive');
+INSERT 0 3
+-- Verify data on MAIN
+SELECT 'MAIN branch - Initial data:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ MAIN branch - Initial data:
+(1 row)
+
+SELECT id, name, value, status FROM test_db_obj_66 ORDER BY id;
+ id |     name      | value |  status  
+----+---------------+-------+----------
+  1 | main_record_1 |   100 | active
+  2 | main_record_2 |   200 | active
+  3 | main_record_3 |   300 | inactive
+(3 rows)
+
+-- Verify indexes exist on MAIN
+SELECT 'MAIN branch - Indexes:' AS checkpoint;
+       checkpoint       
+------------------------
+ MAIN branch - Indexes:
+(1 row)
+
+SELECT indexname 
+FROM pg_indexes 
+WHERE tablename = 'test_db_obj_66' 
+ORDER BY indexname;
+      indexname      
+---------------------
+ idx_66_name
+ idx_66_status
+ idx_66_value
+ test_db_obj_66_pkey
+(4 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_66 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/283CBE8
+Waiting for pageserver to sync WAL to 0/283CBE8...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'b54d6f733d4b400b96c9bd391d9d48b8' at Lsn 0/283CBE8 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+-- Start branch endpoint
+\! neon_local endpoint create ep_test_66 --branch-name test_branch_66 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_66
+Starting existing endpoint ep_test_66...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Switch to branch and verify inheritance
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited data:' AS checkpoint;
+        checkpoint        
+--------------------------
+ BRANCH - Inherited data:
+(1 row)
+
+SELECT id, name, value, status FROM test_db_obj_66 ORDER BY id;
+ id |     name      | value |  status  
+----+---------------+-------+----------
+  1 | main_record_1 |   100 | active
+  2 | main_record_2 |   200 | active
+  3 | main_record_3 |   300 | inactive
+(3 rows)
+
+-- Verify indexes inherited
+SELECT 'BRANCH - Inherited indexes:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - Inherited indexes:
+(1 row)
+
+SELECT indexname 
+FROM pg_indexes 
+WHERE tablename = 'test_db_obj_66' 
+ORDER BY indexname;
+      indexname      
+---------------------
+ idx_66_name
+ idx_66_status
+ idx_66_value
+ test_db_obj_66_pkey
+(4 rows)
+
+-- Verify sequence inherited and working
+SELECT 'BRANCH - Sequence test:' AS checkpoint;
+       checkpoint        
+-------------------------
+ BRANCH - Sequence test:
+(1 row)
+
+INSERT INTO test_db_obj_66 (name, value, status) 
+VALUES ('branch_record_1', 400, 'active');
+INSERT 0 1
+SELECT id, name, value, status 
+FROM test_db_obj_66 
+WHERE name LIKE 'branch%' 
+ORDER BY id;
+ id |      name       | value | status 
+----+-----------------+-------+--------
+  4 | branch_record_1 |   400 | active
+(1 row)
+
+-- Step 4: Add branch-specific objects
+-- Add new index on branch
+CREATE INDEX idx_66_branch_combo ON test_db_obj_66(status, value);
+CREATE INDEX
+-- Add more data on branch
+INSERT INTO test_db_obj_66 (name, value, status) VALUES 
+    ('branch_record_2', 500, 'pending'),
+    ('branch_record_3', 600, 'pending');
+INSERT 0 2
+SELECT 'BRANCH - All data after additions:' AS checkpoint;
+             checkpoint             
+------------------------------------
+ BRANCH - All data after additions:
+(1 row)
+
+SELECT id, name, value, status FROM test_db_obj_66 ORDER BY id;
+ id |      name       | value |  status  
+----+-----------------+-------+----------
+  1 | main_record_1   |   100 | active
+  2 | main_record_2   |   200 | active
+  3 | main_record_3   |   300 | inactive
+  4 | branch_record_1 |   400 | active
+  5 | branch_record_2 |   500 | pending
+  6 | branch_record_3 |   600 | pending
+(6 rows)
+
+SELECT 'BRANCH - All indexes (including branch-specific):' AS checkpoint;
+                    checkpoint                     
+---------------------------------------------------
+ BRANCH - All indexes (including branch-specific):
+(1 row)
+
+SELECT indexname 
+FROM pg_indexes 
+WHERE tablename = 'test_db_obj_66' 
+ORDER BY indexname;
+      indexname      
+---------------------
+ idx_66_branch_combo
+ idx_66_name
+ idx_66_status
+ idx_66_value
+ test_db_obj_66_pkey
+(5 rows)
+
+-- Step 5: Switch back to MAIN and verify isolation
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT id, name, value, status FROM test_db_obj_66 ORDER BY id;
+ id |     name      | value |  status  
+----+---------------+-------+----------
+  1 | main_record_1 |   100 | active
+  2 | main_record_2 |   200 | active
+  3 | main_record_3 |   300 | inactive
+(3 rows)
+
+-- Verify branch-specific index NOT on MAIN
+SELECT 'MAIN - Indexes (should NOT include branch index):' AS checkpoint;
+                    checkpoint                     
+---------------------------------------------------
+ MAIN - Indexes (should NOT include branch index):
+(1 row)
+
+SELECT indexname 
+FROM pg_indexes 
+WHERE tablename = 'test_db_obj_66' 
+ORDER BY indexname;
+      indexname      
+---------------------
+ idx_66_name
+ idx_66_status
+ idx_66_value
+ test_db_obj_66_pkey
+(4 rows)
+
+-- Verify no branch data on MAIN
+SELECT 'MAIN - Branch data isolation check:' AS checkpoint;
+             checkpoint              
+-------------------------------------
+ MAIN - Branch data isolation check:
+(1 row)
+
+SELECT COUNT(*) AS branch_records_on_main 
+FROM test_db_obj_66 
+WHERE name LIKE 'branch%';
+ branch_records_on_main 
+------------------------
+                      0
+(1 row)
+
+-- Step 6: Cleanup
+-- Drop table on MAIN
+DROP TABLE test_db_obj_66;
+DROP TABLE
+-- Stop branch endpoint
+\! neon_local endpoint stop ep_test_66
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 67: Sequence Inheritance and Independence
+-- ============================================================================
+-- Step 1: Create sequence on MAIN
+CREATE SEQUENCE test_seq_67 START WITH 1000 INCREMENT BY 10;
+CREATE SEQUENCE
+-- Use sequence on MAIN
+SELECT 'MAIN - Initial sequence values:' AS checkpoint;
+           checkpoint            
+---------------------------------
+ MAIN - Initial sequence values:
+(1 row)
+
+SELECT nextval('test_seq_67') AS seq_val_1;
+ seq_val_1 
+-----------
+      1000
+(1 row)
+
+SELECT nextval('test_seq_67') AS seq_val_2;
+ seq_val_2 
+-----------
+      1010
+(1 row)
+
+SELECT currval('test_seq_67') AS current_val;
+ current_val 
+-------------
+        1010
+(1 row)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_67 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/2844B40
+Waiting for pageserver to sync WAL to 0/2844B40...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '5b46bd2fb9afdfc872ded315c1ae937e' at Lsn 0/2844B40 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_67 --branch-name test_branch_67 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_67
+Starting existing endpoint ep_test_67...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Use sequence on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Sequence after inheritance:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ BRANCH - Sequence after inheritance:
+(1 row)
+
+SELECT nextval('test_seq_67') AS seq_val_branch_1;
+ seq_val_branch_1 
+------------------
+             1020
+(1 row)
+
+SELECT nextval('test_seq_67') AS seq_val_branch_2;
+ seq_val_branch_2 
+------------------
+             1030
+(1 row)
+
+-- Step 4: Verify independence on MAIN
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Sequence after branch operations:' AS checkpoint;
+                checkpoint                
+------------------------------------------
+ MAIN - Sequence after branch operations:
+(1 row)
+
+SELECT nextval('test_seq_67') AS main_next_val;
+ main_next_val 
+---------------
+          1020
+(1 row)
+
+-- Cleanup
+DROP SEQUENCE test_seq_67;
+DROP SEQUENCE
+\! neon_local endpoint stop ep_test_67
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 68: View Inheritance
+-- ============================================================================
+-- Step 1: Create table and view on MAIN
+CREATE TABLE test_base_68 (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50),
+    amount NUMERIC(10,2)
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:164: NOTICE:  CREATE TABLE will create implicit sequence "test_base_68_id_seq" for serial column "test_base_68.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:164: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_base_68_pkey" for table "test_base_68"
+CREATE TABLE
+INSERT INTO test_base_68 (category, amount) VALUES 
+    ('A', 100.00),
+    ('B', 200.00),
+    ('A', 150.00);
+INSERT 0 3
+CREATE VIEW test_view_68 AS 
+SELECT category, SUM(amount) AS total_amount 
+FROM test_base_68 
+GROUP BY category;
+CREATE VIEW
+SELECT 'MAIN - View data:' AS checkpoint;
+    checkpoint     
+-------------------
+ MAIN - View data:
+(1 row)
+
+SELECT * FROM test_view_68 ORDER BY category;
+ category | total_amount 
+----------+--------------
+ A        |       250.00
+ B        |       200.00
+(2 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_68 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/28522E8
+Waiting for pageserver to sync WAL to 0/28522E8...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '2207bf1490a1d3ad76b9c7cd606f7cd5' at Lsn 0/28522E8 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_68 --branch-name test_branch_68 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_68
+Starting existing endpoint ep_test_68...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Verify view on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited view:' AS checkpoint;
+        checkpoint        
+--------------------------
+ BRANCH - Inherited view:
+(1 row)
+
+SELECT * FROM test_view_68 ORDER BY category;
+ category | total_amount 
+----------+--------------
+ A        |       250.00
+ B        |       200.00
+(2 rows)
+
+-- Add data on branch
+INSERT INTO test_base_68 (category, amount) VALUES ('C', 300.00);
+INSERT 0 1
+SELECT 'BRANCH - View after insert:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - View after insert:
+(1 row)
+
+SELECT * FROM test_view_68 ORDER BY category;
+ category | total_amount 
+----------+--------------
+ A        |       250.00
+ B        |       200.00
+ C        |       300.00
+(3 rows)
+
+-- Step 4: Verify isolation on MAIN
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - View after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - View after branch operations:
+(1 row)
+
+SELECT * FROM test_view_68 ORDER BY category;
+ category | total_amount 
+----------+--------------
+ A        |       250.00
+ B        |       200.00
+(2 rows)
+
+-- Cleanup
+DROP VIEW test_view_68;
+DROP VIEW
+DROP TABLE test_base_68;
+DROP TABLE
+\! neon_local endpoint stop ep_test_68
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 69: Constraint Inheritance
+-- ============================================================================
+-- Step 1: Create table with constraints on MAIN
+CREATE TABLE test_constraint_69 (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    age INTEGER CHECK (age >= 0 AND age <= 150),
+    status VARCHAR(20) DEFAULT 'active'
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:219: NOTICE:  CREATE TABLE will create implicit sequence "test_constraint_69_id_seq" for serial column "test_constraint_69.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:219: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_constraint_69_pkey" for table "test_constraint_69"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:219: NOTICE:  CREATE TABLE / UNIQUE will create implicit index "test_constraint_69_email_key" for table "test_constraint_69"
+CREATE TABLE
+INSERT INTO test_constraint_69 (email, age) VALUES 
+    ('user1@test.com', 25),
+    ('user2@test.com', 30);
+INSERT 0 2
+SELECT 'MAIN - Initial data:' AS checkpoint;
+      checkpoint      
+----------------------
+ MAIN - Initial data:
+(1 row)
+
+SELECT * FROM test_constraint_69 ORDER BY id;
+ id |     email      | age | status 
+----+----------------+-----+--------
+  1 | user1@test.com |  25 | active
+  2 | user2@test.com |  30 | active
+(2 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_69 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/285F2B8
+Waiting for pageserver to sync WAL to 0/285F2B8...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'ecbc0eac7fb512ad73cd7f44d88dfaff' at Lsn 0/285F2B8 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_69 --branch-name test_branch_69 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_69
+Starting existing endpoint ep_test_69...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Test constraints on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Testing constraints:' AS checkpoint;
+          checkpoint           
+-------------------------------
+ BRANCH - Testing constraints:
+(1 row)
+
+-- This should succeed
+INSERT INTO test_constraint_69 (email, age) VALUES ('user3@test.com', 35);
+INSERT 0 1
+-- This should fail (duplicate email) - expect error
+INSERT INTO test_constraint_69 (email, age) VALUES ('user1@test.com', 40);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:243: ERROR:  duplicate key value violates unique constraint "test_constraint_69_email_key"
+DETAIL:  Key (email)=(user1@test.com) already exists.
+SELECT 'BRANCH - Data after operations:' AS checkpoint;
+           checkpoint            
+---------------------------------
+ BRANCH - Data after operations:
+(1 row)
+
+SELECT * FROM test_constraint_69 ORDER BY id;
+ id |     email      | age | status 
+----+----------------+-----+--------
+  1 | user1@test.com |  25 | active
+  2 | user2@test.com |  30 | active
+  3 | user3@test.com |  35 | active
+(3 rows)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS record_count FROM test_constraint_69;
+ record_count 
+--------------
+            2
+(1 row)
+
+-- Cleanup
+DROP TABLE test_constraint_69;
+DROP TABLE
+\! neon_local endpoint stop ep_test_69
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 70: Trigger Inheritance
+-- ============================================================================
+-- Step 1: Create table with trigger on MAIN
+CREATE TABLE test_trigger_70 (
+    id SERIAL PRIMARY KEY,
+    value INTEGER,
+    last_updated TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:268: NOTICE:  CREATE TABLE will create implicit sequence "test_trigger_70_id_seq" for serial column "test_trigger_70.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:268: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_trigger_70_pkey" for table "test_trigger_70"
+CREATE TABLE
+CREATE OR REPLACE FUNCTION update_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.last_updated = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION
+CREATE TRIGGER trg_update_timestamp
+BEFORE INSERT OR UPDATE ON test_trigger_70
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+CREATE TRIGGER
+INSERT INTO test_trigger_70 (value) VALUES (100);
+INSERT 0 1
+SELECT 'MAIN - Data with trigger:' AS checkpoint;
+        checkpoint         
+---------------------------
+ MAIN - Data with trigger:
+(1 row)
+
+SELECT id, value, last_updated IS NOT NULL AS has_timestamp FROM test_trigger_70;
+ id | value | has_timestamp 
+----+-------+---------------
+  1 |   100 | t
+(1 row)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_70 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/2872740
+Waiting for pageserver to sync WAL to 0/2872740...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '6a82c6ec9d42ab2639609fa4996b6013' at Lsn 0/2872740 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_70 --branch-name test_branch_70 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_70
+Starting existing endpoint ep_test_70...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Test trigger on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+INSERT INTO test_trigger_70 (value) VALUES (200);
+INSERT 0 1
+SELECT 'BRANCH - Trigger working:' AS checkpoint;
+        checkpoint         
+---------------------------
+ BRANCH - Trigger working:
+(1 row)
+
+SELECT id, value, last_updated IS NOT NULL AS has_timestamp FROM test_trigger_70 ORDER BY id;
+ id | value | has_timestamp 
+----+-------+---------------
+  1 |   100 | t
+  2 |   200 | t
+(2 rows)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS record_count FROM test_trigger_70;
+ record_count 
+--------------
+            1
+(1 row)
+
+-- Cleanup
+DROP TRIGGER trg_update_timestamp ON test_trigger_70;
+DROP TRIGGER
+DROP FUNCTION update_timestamp();
+DROP FUNCTION
+DROP TABLE test_trigger_70;
+DROP TABLE
+\! neon_local endpoint stop ep_test_70
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 71: Foreign Key Inheritance
+-- ============================================================================
+-- Step 1: Create tables with foreign key on MAIN
+CREATE TABLE test_parent_71 (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50)
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:322: NOTICE:  CREATE TABLE will create implicit sequence "test_parent_71_id_seq" for serial column "test_parent_71.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:322: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_parent_71_pkey" for table "test_parent_71"
+CREATE TABLE
+CREATE TABLE test_child_71 (
+    id SERIAL PRIMARY KEY,
+    parent_id INTEGER REFERENCES test_parent_71(id),
+    description VARCHAR(100)
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:328: NOTICE:  CREATE TABLE will create implicit sequence "test_child_71_id_seq" for serial column "test_child_71.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:328: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_child_71_pkey" for table "test_child_71"
+CREATE TABLE
+INSERT INTO test_parent_71 (name) VALUES ('Parent1'), ('Parent2');
+INSERT 0 2
+INSERT INTO test_child_71 (parent_id, description) VALUES (1, 'Child1'), (1, 'Child2');
+INSERT 0 2
+SELECT 'MAIN - Parent-child data:' AS checkpoint;
+        checkpoint         
+---------------------------
+ MAIN - Parent-child data:
+(1 row)
+
+SELECT p.name, COUNT(c.id) AS child_count 
+FROM test_parent_71 p 
+LEFT JOIN test_child_71 c ON p.id = c.parent_id 
+GROUP BY p.name ORDER BY p.name;
+  name   | child_count 
+---------+-------------
+ Parent1 |           2
+ Parent2 |           0
+(2 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_71 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/288AEE8
+Waiting for pageserver to sync WAL to 0/288AEE8...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '29c796b2dcd9a644658ed00b156a1969' at Lsn 0/288AEE8 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_71 --branch-name test_branch_71 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_71
+Starting existing endpoint ep_test_71...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Test foreign key on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+INSERT INTO test_parent_71 (name) VALUES ('Parent3');
+INSERT 0 1
+INSERT INTO test_child_71 (parent_id, description) VALUES (3, 'Child3');
+INSERT 0 1
+-- This should fail (invalid parent_id) - expect error
+INSERT INTO test_child_71 (parent_id, description) VALUES (999, 'Invalid');
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:352: ERROR:  insert or update on table "test_child_71" violates foreign key constraint "test_child_71_parent_id_fkey"
+DETAIL:  Key (parent_id)=(999) is not present in table "test_parent_71".
+SELECT 'BRANCH - Data after operations:' AS checkpoint;
+           checkpoint            
+---------------------------------
+ BRANCH - Data after operations:
+(1 row)
+
+SELECT COUNT(*) AS parent_count FROM test_parent_71;
+ parent_count 
+--------------
+            3
+(1 row)
+
+SELECT COUNT(*) AS child_count FROM test_child_71;
+ child_count 
+-------------
+           3
+(1 row)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS parent_count FROM test_parent_71;
+ parent_count 
+--------------
+            2
+(1 row)
+
+SELECT COUNT(*) AS child_count FROM test_child_71;
+ child_count 
+-------------
+           2
+(1 row)
+
+-- Cleanup
+DROP TABLE test_child_71;
+DROP TABLE
+DROP TABLE test_parent_71;
+DROP TABLE
+\! neon_local endpoint stop ep_test_71
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 72: Schema Inheritance
+-- ============================================================================
+-- Step 1: Create schema and objects on MAIN
+CREATE SCHEMA test_schema_72;
+CREATE SCHEMA
+CREATE TABLE test_schema_72.data_table (
+    id SERIAL PRIMARY KEY,
+    info VARCHAR(100)
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:381: NOTICE:  CREATE TABLE will create implicit sequence "data_table_id_seq" for serial column "data_table.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:381: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "data_table_pkey" for table "data_table"
+CREATE TABLE
+INSERT INTO test_schema_72.data_table (info) VALUES ('Main data');
+INSERT 0 1
+SELECT 'MAIN - Schema data:' AS checkpoint;
+     checkpoint      
+---------------------
+ MAIN - Schema data:
+(1 row)
+
+SELECT * FROM test_schema_72.data_table;
+ id |   info    
+----+-----------
+  1 | Main data
+(1 row)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_72 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/2899848
+Waiting for pageserver to sync WAL to 0/2899848...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '98bea7e919f2e48ff042a406341a427a' at Lsn 0/2899848 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_72 --branch-name test_branch_72 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_72
+Starting existing endpoint ep_test_72...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Verify schema on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited schema:' AS checkpoint;
+         checkpoint         
+----------------------------
+ BRANCH - Inherited schema:
+(1 row)
+
+SELECT * FROM test_schema_72.data_table;
+ id |   info    
+----+-----------
+  1 | Main data
+(1 row)
+
+INSERT INTO test_schema_72.data_table (info) VALUES ('Branch data');
+INSERT 0 1
+SELECT 'BRANCH - Data after insert:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - Data after insert:
+(1 row)
+
+SELECT COUNT(*) AS record_count FROM test_schema_72.data_table;
+ record_count 
+--------------
+            2
+(1 row)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS record_count FROM test_schema_72.data_table;
+ record_count 
+--------------
+            1
+(1 row)
+
+-- Cleanup
+DROP SCHEMA test_schema_72 CASCADE;
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:412: NOTICE:  drop cascades to table test_schema_72.data_table
+DROP SCHEMA
+\! neon_local endpoint stop ep_test_72
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 73: Composite Index Inheritance
+-- ============================================================================
+-- Step 1: Create table with composite indexes on MAIN
+CREATE TABLE test_composite_73 (
+    id SERIAL PRIMARY KEY,
+    first_name VARCHAR(50),
+    last_name VARCHAR(50),
+    age INTEGER,
+    city VARCHAR(50)
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:427: NOTICE:  CREATE TABLE will create implicit sequence "test_composite_73_id_seq" for serial column "test_composite_73.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:427: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_composite_73_pkey" for table "test_composite_73"
+CREATE TABLE
+CREATE INDEX idx_73_name ON test_composite_73(last_name, first_name);
+CREATE INDEX
+CREATE INDEX idx_73_location ON test_composite_73(city, age);
+CREATE INDEX
+INSERT INTO test_composite_73 (first_name, last_name, age, city) VALUES 
+    ('John', 'Doe', 30, 'NYC'),
+    ('Jane', 'Smith', 25, 'LA');
+INSERT 0 2
+SELECT 'MAIN - Composite indexes:' AS checkpoint;
+        checkpoint         
+---------------------------
+ MAIN - Composite indexes:
+(1 row)
+
+SELECT indexname 
+FROM pg_indexes 
+WHERE tablename = 'test_composite_73' 
+ORDER BY indexname;
+       indexname        
+------------------------
+ idx_73_location
+ idx_73_name
+ test_composite_73_pkey
+(3 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_73 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/28A8E30
+Waiting for pageserver to sync WAL to 0/28A8E30...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '2ce82f7de8bf36facaa67efc813af97e' at Lsn 0/28A8E30 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_73 --branch-name test_branch_73 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_73
+Starting existing endpoint ep_test_73...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Verify indexes on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited indexes:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - Inherited indexes:
+(1 row)
+
+SELECT indexname 
+FROM pg_indexes 
+WHERE tablename = 'test_composite_73' 
+ORDER BY indexname;
+       indexname        
+------------------------
+ idx_73_location
+ idx_73_name
+ test_composite_73_pkey
+(3 rows)
+
+-- Add branch-specific index
+CREATE INDEX idx_73_branch_age ON test_composite_73(age);
+CREATE INDEX
+SELECT 'BRANCH - All indexes:' AS checkpoint;
+      checkpoint       
+-----------------------
+ BRANCH - All indexes:
+(1 row)
+
+SELECT COUNT(*) AS index_count 
+FROM pg_indexes 
+WHERE tablename = 'test_composite_73';
+ index_count 
+-------------
+           4
+(1 row)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Indexes after branch operations:' AS checkpoint;
+               checkpoint                
+-----------------------------------------
+ MAIN - Indexes after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS index_count 
+FROM pg_indexes 
+WHERE tablename = 'test_composite_73';
+ index_count 
+-------------
+           3
+(1 row)
+
+-- Cleanup
+DROP TABLE test_composite_73;
+DROP TABLE
+\! neon_local endpoint stop ep_test_73
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 74: Partial Index Inheritance
+-- ============================================================================
+-- Step 1: Create table with partial index on MAIN
+CREATE TABLE test_partial_74 (
+    id SERIAL PRIMARY KEY,
+    status VARCHAR(20),
+    value INTEGER
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:487: NOTICE:  CREATE TABLE will create implicit sequence "test_partial_74_id_seq" for serial column "test_partial_74.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:487: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_partial_74_pkey" for table "test_partial_74"
+CREATE TABLE
+CREATE INDEX idx_74_active ON test_partial_74(value) WHERE status = 'active';
+CREATE INDEX
+INSERT INTO test_partial_74 (status, value) VALUES 
+    ('active', 100),
+    ('inactive', 200),
+    ('active', 300);
+INSERT 0 3
+SELECT 'MAIN - Partial index data:' AS checkpoint;
+         checkpoint         
+----------------------------
+ MAIN - Partial index data:
+(1 row)
+
+SELECT * FROM test_partial_74 ORDER BY id;
+ id |  status  | value 
+----+----------+-------
+  1 | active   |   100
+  2 | inactive |   200
+  3 | active   |   300
+(3 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_74 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/28B63F8
+Waiting for pageserver to sync WAL to 0/28B63F8...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '83587e0ada4f2e6256d445be770f3106' at Lsn 0/28B63F8 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_74 --branch-name test_branch_74 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_74
+Starting existing endpoint ep_test_74...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Verify partial index on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited partial index:' AS checkpoint;
+            checkpoint             
+-----------------------------------
+ BRANCH - Inherited partial index:
+(1 row)
+
+SELECT indexname, indexdef 
+FROM pg_indexes 
+WHERE tablename = 'test_partial_74' AND indexname = 'idx_74_active';
+   indexname   |                                                            indexdef                                                             
+---------------+---------------------------------------------------------------------------------------------------------------------------------
+ idx_74_active | CREATE INDEX idx_74_active ON test_partial_74 USING btree (value) TABLESPACE pg_default WHERE ((status)::text = 'active'::text)
+(1 row)
+
+INSERT INTO test_partial_74 (status, value) VALUES ('active', 400);
+INSERT 0 1
+SELECT 'BRANCH - Data after insert:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - Data after insert:
+(1 row)
+
+SELECT COUNT(*) AS active_count FROM test_partial_74 WHERE status = 'active';
+ active_count 
+--------------
+            3
+(1 row)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS active_count FROM test_partial_74 WHERE status = 'active';
+ active_count 
+--------------
+            2
+(1 row)
+
+-- Cleanup
+DROP TABLE test_partial_74;
+DROP TABLE
+\! neon_local endpoint stop ep_test_74
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 75: Multiple Object Types Together
+-- ============================================================================
+-- Step 1: Create multiple object types on MAIN
+CREATE TABLE test_multi_75 (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50),
+    value INTEGER
+);
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:538: NOTICE:  CREATE TABLE will create implicit sequence "test_multi_75_id_seq" for serial column "test_multi_75.id"
+gsql:NEON_ROOT/sql/neon_db_objects_test.sql:538: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_multi_75_pkey" for table "test_multi_75"
+CREATE TABLE
+CREATE INDEX idx_75_name ON test_multi_75(name);
+CREATE INDEX
+CREATE SEQUENCE test_seq_75 START WITH 100;
+CREATE SEQUENCE
+CREATE VIEW test_view_75 AS SELECT name, COUNT(*) AS count FROM test_multi_75 GROUP BY name;
+CREATE VIEW
+INSERT INTO test_multi_75 (name, value) VALUES 
+    ('TypeA', 10),
+    ('TypeB', 20),
+    ('TypeA', 30);
+INSERT 0 3
+SELECT 'MAIN - Multiple objects:' AS checkpoint;
+        checkpoint        
+--------------------------
+ MAIN - Multiple objects:
+(1 row)
+
+SELECT * FROM test_view_75 ORDER BY name;
+ name  | count 
+-------+-------
+ TypeA |     2
+ TypeB |     1
+(2 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_75 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/28C78C0
+Waiting for pageserver to sync WAL to 0/28C78C0...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '94380579df6ac3f0f99756856d3e3750' at Lsn 0/28C78C0 for tenant: bbc66e0392b5ba3f3d65f691a2ceaf09. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_75 --branch-name test_branch_75 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_75
+Starting existing endpoint ep_test_75...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Use all objects on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - All inherited objects:' AS checkpoint;
+           checkpoint            
+---------------------------------
+ BRANCH - All inherited objects:
+(1 row)
+
+SELECT * FROM test_view_75 ORDER BY name;
+ name  | count 
+-------+-------
+ TypeA |     2
+ TypeB |     1
+(2 rows)
+
+SELECT nextval('test_seq_75') AS seq_value;
+ seq_value 
+-----------
+       100
+(1 row)
+
+INSERT INTO test_multi_75 (name, value) VALUES ('TypeC', 40);
+INSERT 0 1
+SELECT 'BRANCH - After modifications:' AS checkpoint;
+          checkpoint           
+-------------------------------
+ BRANCH - After modifications:
+(1 row)
+
+SELECT * FROM test_view_75 ORDER BY name;
+ name  | count 
+-------+-------
+ TypeA |     2
+ TypeB |     1
+ TypeC |     1
+(3 rows)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data after branch operations:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN - Data after branch operations:
+(1 row)
+
+SELECT COUNT(*) AS record_count FROM test_multi_75;
+ record_count 
+--------------
+            3
+(1 row)
+
+SELECT COUNT(*) AS view_count FROM test_view_75;
+ view_count 
+------------
+          2
+(1 row)
+
+-- Cleanup
+DROP VIEW test_view_75;
+DROP VIEW
+DROP SEQUENCE test_seq_75;
+DROP SEQUENCE
+DROP TABLE test_multi_75;
+DROP TABLE
+\! neon_local endpoint stop ep_test_75
+.
+\! sleep 2
+total time: 149180  ms

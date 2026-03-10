@@ -21,10 +21,14 @@
 #include "../neon/neon_pgversioncompat.h"
 
 #include "access/xlog.h"
-#include "storage/block.h"
-#include "storage/buf_internals.h"
+
+#include "knl/knl_variable.h"
+#define InRecovery (t_thrd.xlog_cxt.InRecovery)
+
+#include "storage/buf/block.h"
+#include "storage/buf/buf_internals.h"
 #include RELFILEINFO_HDR
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogutils.h"
@@ -64,39 +68,21 @@ locate_page(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno)
 /* neon wal-redo storage manager functionality */
 static void inmem_init(void);
 static void inmem_open(SMgrRelation reln);
-static void inmem_close(SMgrRelation reln, ForkNumber forknum);
+static void inmem_close(SMgrRelation reln, ForkNumber forknum, BlockNumber blockNum);
 static void inmem_create(SMgrRelation reln, ForkNumber forknum, bool isRedo);
-static bool inmem_exists(SMgrRelation reln, ForkNumber forknum);
-static void inmem_unlink(NRelFileInfoBackend rinfo, ForkNumber forknum, bool isRedo);
-#if PG_MAJORVERSION_NUM >= 17
-static bool inmem_prefetch(SMgrRelation reln, ForkNumber forknum,
-						   BlockNumber blocknum, int nblocks);
-#else
-static bool inmem_prefetch(SMgrRelation reln, ForkNumber forknum,
-						   BlockNumber blocknum);
-#endif
-#if PG_MAJORVERSION_NUM < 16
+static bool inmem_exists(SMgrRelation reln, ForkNumber forknum, BlockNumber blockNum);
+static void inmem_unlink(const NRelFileInfoBackend &rinfo, ForkNumber forknum, bool isRedo, BlockNumber blockNum);
+static void inmem_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum);
 static void inmem_extend(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, char *buffer, bool skipFsync);
-static void inmem_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+static SMGR_READ_STATUS inmem_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					   char *buffer);
 static void inmem_write(SMgrRelation reln, ForkNumber forknum,
-						BlockNumber blocknum, char *buffer, bool skipFsync);
-#else
-static void inmem_extend(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum, const void *buffer, bool skipFsync);
-static void inmem_zeroextend(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber blocknum, int nblocks, bool skipFsync);
-static void inmem_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-					   void *buffer);
-static void inmem_write(SMgrRelation reln, ForkNumber forknum,
-						BlockNumber blocknum, const void *buffer, bool skipFsync);
-#endif
+						BlockNumber blocknum, const char *buffer, bool skipFsync);
 static void inmem_writeback(SMgrRelation reln, ForkNumber forknum,
-							BlockNumber blocknum, BlockNumber nblocks);
+							BlockNumber blocknum, BlockNumber nblocks, RelFileNode relNode);
 static BlockNumber inmem_nblocks(SMgrRelation reln, ForkNumber forknum);
-static void inmem_truncate(SMgrRelation reln, ForkNumber forknum,
-						   BlockNumber old_blocks, BlockNumber nblocks);
+static void inmem_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks);
 static void inmem_immedsync(SMgrRelation reln, ForkNumber forknum);
 #if PG_MAJORVERSION_NUM >= 17
 static void inmem_registersync(SMgrRelation reln, ForkNumber forknum);
@@ -115,8 +101,9 @@ inmem_init(void)
  *	inmem_exists() -- Does the physical file exist?
  */
 static bool
-inmem_exists(SMgrRelation reln, ForkNumber forknum)
+inmem_exists(SMgrRelation reln, ForkNumber forknum, BlockNumber blockNum)
 {
+	// TODO: OG_NEON check blockNum
 	NRelFileInfo rinfo = InfoFromSMgrRel(reln);
 
 	for (int i = 0; i < used_pages; i++)
@@ -144,7 +131,7 @@ inmem_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
  *	inmem_unlink() -- Unlink a relation.
  */
 static void
-inmem_unlink(NRelFileInfoBackend rinfo, ForkNumber forknum, bool isRedo)
+inmem_unlink(const NRelFileInfoBackend &rinfo, ForkNumber forknum, bool isRedo, BlockNumber blockNum)
 {
 }
 
@@ -190,57 +177,45 @@ inmem_open(SMgrRelation reln)
  *	inmem_close() -- Close the specified relation, if it isn't closed already.
  */
 static void
-inmem_close(SMgrRelation reln, ForkNumber forknum)
+inmem_close(SMgrRelation reln, ForkNumber forknum, BlockNumber blockNum)
 {
 }
 
-#if PG_MAJORVERSION_NUM >= 17
-static bool
-inmem_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-			   int nblocks)
-{
-	return true;
-}
-#else
-/*
- *	inmem_prefetch() -- Initiate asynchronous read of the specified block of a relation
- */
-static bool
+static void
 inmem_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
-	return true;
+	return;
 }
-#endif
 
 /*
  * inmem_writeback() -- Tell the kernel to write pages back to storage.
  */
 static void
 inmem_writeback(SMgrRelation reln, ForkNumber forknum,
-				BlockNumber blocknum, BlockNumber nblocks)
+				BlockNumber blocknum, BlockNumber nblocks, RelFileNode relNode)
 {
 }
 
 /*
  *	inmem_read() -- Read the specified block from a relation.
  */
-#if PG_MAJORVERSION_NUM < 16
-static void
+static SMGR_READ_STATUS
 inmem_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		   char *buffer)
-#else
-static void
-inmem_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
-		   void *buffer)
-#endif
 {
 	int			pg;
+	NRelFileInfo rinfo = InfoFromSMgrRel(reln);
 
 	pg = locate_page(reln, forknum, blkno);
 	if (pg < 0)
+	{
 		memset(buffer, 0, BLCKSZ);
+	}
 	else
+	{
 		memcpy(buffer, page_body[pg], BLCKSZ);
+	}
+	return SMGR_RD_OK;
 }
 
 #if PG_MAJORVERSION_NUM >= 17
@@ -250,7 +225,7 @@ inmem_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 {
 	for (int i = 0; i < nblocks; i++)
 	{
-		inmem_read(reln, forknum, blkno, buffers[i]);
+		(void)inmem_read(reln, forknum, blkno, buffers[i]);
 	}
 }
 #endif
@@ -264,11 +239,7 @@ inmem_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
  */
 static void
 inmem_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-#if PG_MAJORVERSION_NUM < 16
-			char *buffer, bool skipFsync)
-#else
-			const void *buffer, bool skipFsync)
-#endif
+			const char *buffer, bool skipFsync)
 {
 	int			pg;
 
@@ -287,7 +258,7 @@ inmem_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								   RelFileInfoFmt(InfoFromSMgrRel(reln)),
 								   forknum,
 								   blocknum,
-								   used_pages), errbacktrace()));
+								   used_pages)));
 		if (used_pages == MAX_PAGES)
 			elog(ERROR, "Inmem storage overflow");
 
@@ -305,6 +276,10 @@ inmem_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 used_pages);
 	}
 	memcpy(page_body[pg], buffer, BLCKSZ);
+
+	{
+		NRelFileInfo rinfo = InfoFromSMgrRel(reln);
+	}
 }
 
 #if PG_MAJORVERSION_NUM >= 17
@@ -342,7 +317,7 @@ inmem_nblocks(SMgrRelation reln, ForkNumber forknum)
  *	inmem_truncate() -- Truncate relation to specified number of blocks.
  */
 static void
-inmem_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks, BlockNumber nblocks)
+inmem_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 {
 }
 
@@ -365,7 +340,6 @@ static const struct f_smgr inmem_smgr =
 {
 	.smgr_init = inmem_init,
 	.smgr_shutdown = NULL,
-	.smgr_open = inmem_open,
 	.smgr_close = inmem_close,
 	.smgr_create = inmem_create,
 	.smgr_exists = inmem_exists,
@@ -391,11 +365,6 @@ static const struct f_smgr inmem_smgr =
 #if PG_MAJORVERSION_NUM >= 17
 	.smgr_registersync = inmem_registersync,
 #endif
-
-	.smgr_start_unlogged_build = NULL,
-	.smgr_finish_unlogged_build_phase_1 = NULL,
-	.smgr_end_unlogged_build = NULL,
-	.smgr_read_slru_segment = NULL,
 };
 
 const f_smgr *

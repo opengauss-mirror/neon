@@ -12,6 +12,11 @@
 #include "neon_walreader.h"
 #include "pagestore_client.h"
 
+#ifndef pg_attribute_printf
+#define pg_attribute_printf(format_index, first_variadic_index) \
+	__attribute__((format(PG_PRINTF_ATTRIBUTE, format_index, first_variadic_index)))
+#endif
+
 #define MAX_SAFEKEEPERS 32
 #define MAX_SEND_SIZE (XLOG_BLCKSZ * 16)	/* max size of a single* WAL
 											 * message */
@@ -352,6 +357,52 @@ typedef struct AppendRequestHeaderV2
 	/* in the AppendRequest message, WAL data follows */
 } AppendRequestHeaderV2;
 
+/*
+ * A 64 bit value that contains an epoch and a TransactionId.  This is
+ * wrapped in a struct to prevent implicit conversion to/from TransactionId.
+ * Not all values represent valid normal XIDs.
+ */
+typedef struct FullTransactionId
+{
+	uint64		value;
+} FullTransactionId;
+
+static inline FullTransactionId
+FullTransactionIdFromEpochAndXid(uint32 epoch, TransactionId xid)
+{
+	FullTransactionId result;
+
+	result.value = ((uint64) epoch) << 32 | xid;
+
+	return result;
+}
+
+static inline FullTransactionId
+FullTransactionIdFromXid(TransactionId xid)
+{
+	FullTransactionId result;
+
+	result.value = xid;
+
+	return result;
+}
+
+/* ----------------
+ *		transaction ID manipulation macros
+ * ----------------
+ */
+#define EpochFromFullTransactionId(x)	((uint32) ((x).value >> 32))
+#define XidFromFullTransactionId(x)		((uint32) (x).value)
+#define U64FromFullTransactionId(x)		((x).value)
+#define FullTransactionIdEquals(a, b)	((a).value == (b).value)
+#define FullTransactionIdPrecedes(a, b)	((a).value < (b).value)
+#define FullTransactionIdPrecedesOrEquals(a, b) ((a).value <= (b).value)
+#define FullTransactionIdFollows(a, b) ((a).value > (b).value)
+#define FullTransactionIdFollowsOrEquals(a, b) ((a).value >= (b).value)
+#define FullTransactionIdIsValid(x)		TransactionIdIsValid(XidFromFullTransactionId(x))
+#define InvalidFullTransactionId		FullTransactionIdFromEpochAndXid(0, InvalidTransactionId)
+#define FirstNormalFullTransactionId	FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId)
+#define FullTransactionIdIsNormal(x)	FullTransactionIdFollowsOrEquals(x, FirstNormalFullTransactionId)
 /*
  * Hot standby feedback received from replica
  */
@@ -785,6 +836,13 @@ typedef struct WalProposerConfig
 	TimeLineID	pgTimeline;
 
 	int			proto_version;
+
+	/*
+	 * True if this is a Neon replica node. In replica mode, we skip the
+	 * basebackup LSN check because the replica gets pages directly from
+	 * pageserver and doesn't need local WAL replay.
+	 */
+	bool		is_replica;
 
 #ifdef WALPROPOSER_LIB
 	void	   *callback_data;

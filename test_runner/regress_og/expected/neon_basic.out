@@ -1,0 +1,303 @@
+-- ============================================================================
+-- Neon Basic Functionality Test
+-- ============================================================================
+-- Tests core database operations on Neon storage layer.
+-- This test can run independently without requiring neon_setup.sql
+--
+-- Tests included:
+--   1. Table Creation
+--   2. Data Insertion (single & bulk)
+--   3. Data Update
+--   4. Data Deletion
+--   5. Index Operations
+--   6. Transaction Handling (COMMIT & ROLLBACK)
+--   7. Constraint Validation
+-- ============================================================================
+\echo '=============================================='
+==============================================
+\echo '  Neon Basic Functionality Tests'
+  Neon Basic Functionality Tests
+\echo '=============================================='
+==============================================
+-- ============================================================================
+-- Test 1: Table Creation
+-- ============================================================================
+\echo '--- Test 1: Table Creation ---'
+--- Test 1: Table Creation ---
+DROP TABLE IF EXISTS basic_test CASCADE;
+gsql:NEON_ROOT/sql/neon_basic.sql:26: NOTICE:  table "basic_test" does not exist, skipping
+DROP TABLE
+CREATE TABLE basic_test (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    value INT,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_basic.sql:34: NOTICE:  CREATE TABLE will create implicit sequence "basic_test_id_seq" for serial column "basic_test.id"
+gsql:NEON_ROOT/sql/neon_basic.sql:34: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "basic_test_pkey" for table "basic_test"
+CREATE TABLE
+-- Verify table exists
+SELECT 
+    CASE WHEN EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'basic_test')
+    THEN 'PASS: Table created successfully'
+    ELSE 'FAIL: Table not found'
+    END AS table_creation_check;
+       table_creation_check       
+----------------------------------
+ PASS: Table created successfully
+(1 row)
+
+\echo '  Table creation: PASSED'
+  Table creation: PASSED
+-- ============================================================================
+-- Test 2: Data Insertion
+-- ============================================================================
+\echo '--- Test 2: Data Insertion ---'
+--- Test 2: Data Insertion ---
+-- Single row inserts
+INSERT INTO basic_test (name, value, description) VALUES
+    ('test1', 100, 'First test row'),
+    ('test2', 200, 'Second test row'),
+    ('test3', 300, 'Third test row');
+INSERT 0 3
+-- Verify data inserted
+SELECT 
+    COUNT(*) AS row_count,
+    CASE WHEN COUNT(*) = 3 THEN 'PASS' ELSE 'FAIL' END AS insert_check
+FROM basic_test;
+ row_count | insert_check 
+-----------+--------------
+         3 | PASS
+(1 row)
+
+-- Display inserted data
+SELECT id, name, value FROM basic_test ORDER BY id;
+ id | name  | value 
+----+-------+-------
+  1 | test1 |   100
+  2 | test2 |   200
+  3 | test3 |   300
+(3 rows)
+
+-- Bulk insert using generate_series
+INSERT INTO basic_test (name, value)
+SELECT 'bulk_' || i, i * 10
+FROM generate_series(1, 10) AS i;
+INSERT 0 10
+-- Verify bulk insert
+SELECT 
+    COUNT(*) AS total_rows,
+    CASE WHEN COUNT(*) = 13 THEN 'PASS' ELSE 'FAIL' END AS bulk_insert_check
+FROM basic_test;
+ total_rows | bulk_insert_check 
+------------+-------------------
+         13 | PASS
+(1 row)
+
+\echo '  Data insertion: PASSED'
+  Data insertion: PASSED
+-- ============================================================================
+-- Test 3: Data Update
+-- ============================================================================
+\echo '--- Test 3: Data Update ---'
+--- Test 3: Data Update ---
+-- Single row update
+UPDATE basic_test SET value = value + 1 WHERE name = 'test1';
+UPDATE 1
+-- Verify update
+SELECT 
+    name, value,
+    CASE WHEN value = 101 THEN 'PASS' ELSE 'FAIL' END AS update_check
+FROM basic_test WHERE name = 'test1';
+ name  | value | update_check 
+-------+-------+--------------
+ test1 |   101 | PASS
+(1 row)
+
+-- Bulk update
+UPDATE basic_test SET value = value * 2 WHERE name LIKE 'bulk_%';
+UPDATE 10
+-- Show some updated rows
+SELECT name, value FROM basic_test WHERE name LIKE 'bulk_%' ORDER BY id LIMIT 5;
+  name  | value 
+--------+-------
+ bulk_1 |    20
+ bulk_2 |    40
+ bulk_3 |    60
+ bulk_4 |    80
+ bulk_5 |   100
+(5 rows)
+
+\echo '  Data update: PASSED'
+  Data update: PASSED
+-- ============================================================================
+-- Test 4: Data Deletion
+-- ============================================================================
+\echo '--- Test 4: Data Deletion ---'
+--- Test 4: Data Deletion ---
+-- Get count before delete
+SELECT COUNT(*) AS before_delete FROM basic_test;
+ before_delete 
+---------------
+            13
+(1 row)
+
+-- Delete specific row
+DELETE FROM basic_test WHERE name = 'test2';
+DELETE 1
+-- Verify deletion
+SELECT 
+    COUNT(*) AS after_delete,
+    CASE WHEN COUNT(*) = 12 THEN 'PASS' ELSE 'FAIL' END AS delete_check
+FROM basic_test;
+ after_delete | delete_check 
+--------------+--------------
+           12 | PASS
+(1 row)
+
+-- Verify deleted row is gone
+SELECT 
+    CASE WHEN NOT EXISTS(SELECT 1 FROM basic_test WHERE name = 'test2')
+    THEN 'PASS: Row deleted'
+    ELSE 'FAIL: Row still exists'
+    END AS delete_verify;
+   delete_verify   
+-------------------
+ PASS: Row deleted
+(1 row)
+
+\echo '  Data deletion: PASSED'
+  Data deletion: PASSED
+-- ============================================================================
+-- Test 5: Index Operations
+-- ============================================================================
+\echo '--- Test 5: Index Operations ---'
+--- Test 5: Index Operations ---
+-- Create indexes
+CREATE INDEX idx_basic_test_name ON basic_test(name);
+CREATE INDEX
+CREATE INDEX idx_basic_test_value ON basic_test(value);
+CREATE INDEX
+-- Verify indexes exist
+SELECT 
+    indexname,
+    CASE WHEN indexname IS NOT NULL THEN 'EXISTS' ELSE 'MISSING' END AS status
+FROM pg_indexes 
+WHERE tablename = 'basic_test'
+ORDER BY indexname;
+      indexname       | status 
+----------------------+--------
+ basic_test_pkey      | EXISTS
+ idx_basic_test_name  | EXISTS
+ idx_basic_test_value | EXISTS
+(3 rows)
+
+-- Test index usage (EXPLAIN output)
+EXPLAIN (COSTS OFF) SELECT * FROM basic_test WHERE name = 'test1';
+                QUERY PLAN                
+------------------------------------------
+ Seq Scan on basic_test
+   Filter: ((name)::text = 'test1'::text)
+(2 rows)
+
+\echo '  Index operations: PASSED'
+  Index operations: PASSED
+-- ============================================================================
+-- Test 6: Transaction Handling
+-- ============================================================================
+\echo '--- Test 6: Transaction Handling ---'
+--- Test 6: Transaction Handling ---
+-- Test COMMIT
+BEGIN;
+BEGIN
+INSERT INTO basic_test (name, value) VALUES ('txn_commit_test', 999);
+INSERT 0 1
+COMMIT;
+COMMIT
+SELECT 
+    CASE WHEN EXISTS(SELECT 1 FROM basic_test WHERE name = 'txn_commit_test')
+    THEN 'PASS: Committed row exists'
+    ELSE 'FAIL: Committed row missing'
+    END AS commit_check;
+        commit_check        
+----------------------------
+ PASS: Committed row exists
+(1 row)
+
+-- Test ROLLBACK
+BEGIN;
+BEGIN
+INSERT INTO basic_test (name, value) VALUES ('txn_rollback_test', 888);
+INSERT 0 1
+-- Verify it exists during transaction
+SELECT COUNT(*) AS during_txn FROM basic_test WHERE name = 'txn_rollback_test';
+ during_txn 
+------------
+          1
+(1 row)
+
+ROLLBACK;
+ROLLBACK
+SELECT 
+    CASE WHEN NOT EXISTS(SELECT 1 FROM basic_test WHERE name = 'txn_rollback_test')
+    THEN 'PASS: Rolled back row does not exist'
+    ELSE 'FAIL: Rolled back row still exists'
+    END AS rollback_check;
+            rollback_check            
+--------------------------------------
+ PASS: Rolled back row does not exist
+(1 row)
+
+\echo '  Transaction handling: PASSED'
+  Transaction handling: PASSED
+-- ============================================================================
+-- Test 7: Constraint Validation
+-- ============================================================================
+\echo '--- Test 7: Constraint Validation ---'
+--- Test 7: Constraint Validation ---
+-- Test NOT NULL constraint (should fail)
+INSERT INTO basic_test (name, value) VALUES (NULL, 100);
+gsql:NEON_ROOT/sql/neon_basic.sql:185: ERROR:  null value in column "name" violates not-null constraint
+DETAIL:  Failing row contains (16, null, 100, null, 2025-12-30 02:43:33.153958).
+-- Test PRIMARY KEY constraint - duplicate (should fail)
+INSERT INTO basic_test (id, name, value) VALUES (1, 'duplicate_id', 100);
+gsql:NEON_ROOT/sql/neon_basic.sql:188: ERROR:  duplicate key value violates unique constraint "basic_test_pkey"
+DETAIL:  Key (id)=(1) already exists.
+-- Add CHECK constraint
+ALTER TABLE basic_test ADD CONSTRAINT chk_value_positive CHECK (value >= 0);
+ALTER TABLE
+-- Test CHECK constraint (should fail)
+INSERT INTO basic_test (name, value) VALUES ('negative_test', -1);
+gsql:NEON_ROOT/sql/neon_basic.sql:194: ERROR:  new row for relation "basic_test" violates check constraint "chk_value_positive"
+DETAIL:  N/A
+\echo '  Constraint validation: PASSED (errors above are expected)'
+  Constraint validation: PASSED (errors above are expected)
+-- ============================================================================
+-- Cleanup Test Table
+-- ============================================================================
+\echo '--- Cleaning Up Test Table ---'
+--- Cleaning Up Test Table ---
+DROP TABLE basic_test;
+DROP TABLE
+-- Verify cleanup
+SELECT 
+    CASE WHEN NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'basic_test')
+    THEN 'PASS: Table dropped successfully'
+    ELSE 'FAIL: Table still exists'
+    END AS cleanup_check;
+          cleanup_check           
+----------------------------------
+ PASS: Table dropped successfully
+(1 row)
+
+-- ============================================================================
+-- Test Summary
+-- ============================================================================
+\echo '=============================================='
+==============================================
+\echo '  Basic Functionality Tests Complete'
+  Basic Functionality Tests Complete
+\echo '=============================================='
+==============================================
+total time: 2188  ms

@@ -203,6 +203,11 @@ impl Planner {
                 &self.storage.pgdata().join("pg_multixact/offsets"),
             )
             .await?;
+            // pg_csnlog (01:03 keyspace) - openGauss CSN log (optional, may not exist)
+            let csnlog_path = self.storage.pgdata().join("pg_csnlog");
+            if self.storage.listfilesindir(&csnlog_path).await.is_ok() {
+                self.import_slru(SlruKind::Csnlog, &csnlog_path).await?;
+            }
         }
 
         // Import pg_twophase.

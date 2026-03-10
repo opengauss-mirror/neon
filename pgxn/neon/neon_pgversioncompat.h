@@ -7,7 +7,7 @@
 #define NEON_PGVERSIONCOMPAT_H
 
 #include "fmgr.h"
-#include "storage/buf_internals.h"
+#include "storage/buf/buf_internals.h"
 
 #if PG_MAJORVERSION_NUM < 17
 #define NRelFileInfoBackendIsTemp(rinfo) (rinfo.backend != InvalidBackendId)
@@ -41,7 +41,7 @@ InitBufferTag(BufferTag *tag, const RelFileNode *rnode,
 #if PG_MAJORVERSION_NUM < 16
 #define USE_RELFILENODE
 
-#define RELFILEINFO_HDR "storage/relfilenode.h"
+#define RELFILEINFO_HDR "storage/smgr/relfilenode.h"
 
 #define NRelFileInfo RelFileNode
 #define NRelFileInfoBackend RelFileNodeBackend
@@ -164,7 +164,7 @@ extern TimeLineID GetWALInsertionTimeLine(void);
 #endif
 
 /* format codes not present in PG17-; but available in PG18+ */
-#define INT64_HEX_FORMAT "%" INT64_MODIFIER "x"
-#define UINT64_HEX_FORMAT "%" INT64_MODIFIER "x"
+#define INT64_HEX_FORMAT "%" "ll" "x"
+#define UINT64_HEX_FORMAT "%" "ll" "x"
 
 #endif							/* NEON_PGVERSIONCOMPAT_H */

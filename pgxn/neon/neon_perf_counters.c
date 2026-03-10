@@ -30,11 +30,17 @@ NeonPerfCountersShmemRequest(void)
 #if PG_MAJORVERSION_NUM < 15
 	/* Hack: in PG14 MaxBackends is not initialized at the time of calling NeonPerfCountersShmemRequest function.
 	 * Do it ourselves and then undo to prevent assertion failure
+	 * 
+	 * In OpenGauss, MaxBackends may already be initialized at this point, so we need to handle both cases.
 	 */
-	Assert(MaxBackends == 0); /* not initialized yet */
-	InitializeMaxBackends();
+	bool maxbackends_was_zero = (g_instance.shmem_cxt.MaxBackends == 0);
+	if (maxbackends_was_zero) {
+	CalcMaxBackends();
+	}
 	size = mul_size(NUM_NEON_PERF_COUNTER_SLOTS, sizeof(neon_per_backend_counters));
-	MaxBackends = 0;
+	if (maxbackends_was_zero) {
+	g_instance.shmem_cxt.MaxBackends = 0;
+	}
 #else
 	size = mul_size(NUM_NEON_PERF_COUNTER_SLOTS, sizeof(neon_per_backend_counters));
 #endif
@@ -49,7 +55,7 @@ NeonPerfCountersShmemInit(void)
 	bool		found;
 
 	neon_per_backend_counters_shared =
-		ShmemInitStruct("Neon perf counters",
+		(neon_per_backend_counters*)ShmemInitStruct("Neon perf counters",
 						mul_size(NUM_NEON_PERF_COUNTER_SLOTS,
 								 sizeof(neon_per_backend_counters)),
 						&found);
@@ -221,7 +227,7 @@ static metric_t *
 neon_perf_counters_to_metrics(neon_per_backend_counters *counters)
 {
 #define NUM_METRICS ((2 + NUM_IO_WAIT_BUCKETS) * 3 + (2 + NUM_QT_BUCKETS) + 12)
-	metric_t   *metrics = palloc((NUM_METRICS + 1) * sizeof(metric_t));
+	metric_t   *metrics = (metric_t*)palloc((NUM_METRICS + 1) * sizeof(metric_t));
 	int			i = 0;
 
 #define APPEND_METRIC(_name) do { \
@@ -311,7 +317,7 @@ neon_get_backend_perf_counters(PG_FUNCTION_ARGS)
 
 	for (int procno = 0; procno < NUM_NEON_PERF_COUNTER_SLOTS; procno++)
 	{
-		PGPROC	   *proc = GetPGProcByNumber(procno);
+		PGPROC	   *proc;// = GetPGProcByNumber(procno);
 		int			pid = proc->pid;
 		neon_per_backend_counters *counters = &neon_per_backend_counters_shared[procno];
 		metric_t   *metrics = neon_perf_counters_to_metrics(counters);

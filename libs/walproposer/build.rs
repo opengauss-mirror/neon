@@ -7,21 +7,21 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow};
 
-const WALPROPOSER_PG_VERSION: &str = "v17";
+const WALPROPOSER_PG_VERSION: &str = "V702";
 
 fn main() -> anyhow::Result<()> {
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=bindgen_deps.h");
 
     let root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-
+    println!("opengauss_install_path:{}", root_path.to_str().unwrap());
     // Finding the location of built libraries and Postgres C headers:
     // - if POSTGRES_INSTALL_DIR is set look into it, otherwise look into `<project_root>/pg_install`
     // - if there's a `bin/pg_config` file use it for getting include server, otherwise use `<project_root>/pg_install/{PG_MAJORVERSION}/include/postgresql/server`
-    let pg_install_dir = if let Some(postgres_install_dir) = env::var_os("POSTGRES_INSTALL_DIR") {
+    let pg_install_dir = if let Some(postgres_install_dir) = env::var_os("OPENGAUSS_INSTALL_DIR") {
         postgres_install_dir.into()
     } else {
-        root_path.join("pg_install")
+        root_path.join("og_install")
     };
 
     let pg_install_abs = std::fs::canonicalize(pg_install_dir)?;
@@ -88,6 +88,16 @@ fn main() -> anyhow::Result<()> {
         // The input header we would like to generate
         // bindings for.
         .header("bindgen_deps.h")
+        .clang_arg("-x")
+        .clang_arg("c++")
+        // 补充 C++ 标准库路径（根据系统调整，通常无需手动指定）
+        .clang_arg("-std=c++14")
+        .clang_arg("-I/home/neon/neon/neon_branch_dev/vendor/openGauss/src/include")
+        .clang_arg("-DENABLE_NEON")
+        .clang_arg("-DPGXC")
+        .clang_arg("-Wno-cast-qual") // 禁用对 const 转换的警告（转为非错误）
+        .clang_arg("-Wno-error=cast-qual") // 确保该警告不被视为错误
+        .clang_arg("-Wno-error")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
@@ -123,6 +133,18 @@ fn main() -> anyhow::Result<()> {
         .clang_arg("-DWALPROPOSER_LIB")
         .clang_arg(format!("-I{pgxn_neon}"))
         .clang_arg(format!("-I{inc_server_path}"));
+
+    //
+    // Add Python include path for plpython.h / Python.h if available.
+    // Python.h is located in OPENGAUSS_BINARYLIBS_DIR/kernel/platform/python3.7/include/python3.7m/
+    //
+    if let Ok(opengauss_binarylibs_dir) = env::var("OPENGAUSS_BINARYLIBS_DIR") {
+        let python_include = format!(
+            "-I{}/kernel/platform/python3.7/include/python3.7m",
+            opengauss_binarylibs_dir
+        );
+        builder = builder.clang_arg(python_include);
+    }
 
     for name in unwind_abi_functions {
         builder = builder.override_abi(bindgen::Abi::CUnwind, name);

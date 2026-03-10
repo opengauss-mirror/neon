@@ -50,17 +50,21 @@ fn main() -> anyhow::Result<()> {
     // Finding the location of C headers for the Postgres server:
     // - if POSTGRES_INSTALL_DIR is set look into it, otherwise look into `<project_root>/pg_install`
     // - if there's a `bin/pg_config` file use it for getting include server, otherwise use `<project_root>/pg_install/{PG_MAJORVERSION}/include/postgresql/server`
-    let pg_install_dir = if let Some(postgres_install_dir) = env::var_os("POSTGRES_INSTALL_DIR") {
+    let pg_install_dir = if let Some(postgres_install_dir) = env::var_os("OPENGAUSS_INSTALL_DIR") {
         postgres_install_dir.into()
     } else {
-        PathBuf::from("pg_install")
+        PathBuf::from("og_install")
     };
 
-    for pg_version in &["v14", "v15", "v16", "v17"] {
-        let mut pg_install_dir_versioned = pg_install_dir.join(pg_version);
+    for (module_name, dir_name) in &[("V702", "V702")] {
+        let mut pg_install_dir_versioned = pg_install_dir.join(dir_name);
         if pg_install_dir_versioned.is_relative() {
             let cwd = env::current_dir().context("Failed to get current_dir")?;
             pg_install_dir_versioned = cwd.join("..").join("..").join(pg_install_dir_versioned);
+            println!(
+                "opengauss_install_path:{}",
+                pg_install_dir_versioned.to_str().unwrap()
+            );
         }
 
         let pg_config_bin = pg_install_dir_versioned.join("bin").join("pg_config");
@@ -92,11 +96,21 @@ fn main() -> anyhow::Result<()> {
         // The bindgen::Builder is the main entry point
         // to bindgen, and lets you build up options for
         // the resulting bindings.
-        let bindings = bindgen::Builder::default()
+        let mut builder = bindgen::Builder::default()
             //
             // All the needed PostgreSQL headers are included from 'bindgen_deps.h'
             //
             .header("bindgen_deps.h")
+            .clang_arg("-x")
+            .clang_arg("c++")
+            // 补充 C++ 标准库路径（根据系统调整，通常无需手动指定）
+            .clang_arg("-std=c++14")
+            .clang_arg("-I/home/neon/neon/neon_branch_dev/vendor/openGauss/src/include")
+            .clang_arg("-DENABLE_NEON")
+            .clang_arg("-DPGXC")
+            .clang_arg("-Wno-cast-qual") // 禁用对 const 转换的警告（转为非错误）
+            .clang_arg("-Wno-error=cast-qual") // 确保该警告不被视为错误
+            .clang_arg("-Wno-error")
             //
             // Tell cargo to invalidate the built crate whenever any of the
             // included header files changed.
@@ -131,10 +145,24 @@ fn main() -> anyhow::Result<()> {
             // explicit padding fields.
             .explicit_padding(true)
             //
-            .clang_arg(format!("-I{inc_server_path}"))
-            //
-            // Finish the builder and generate the bindings.
-            //
+            .clang_arg(format!("-I{inc_server_path}"));
+
+        //
+        // Add Python include path for plpython.h / Python.h if available.
+        // Python.h is located in OPENGAUSS_BINARYLIBS_DIR/kernel/platform/python3.7/include/python3.7m/
+        //
+        if let Ok(opengauss_binarylibs_dir) = env::var("OPENGAUSS_BINARYLIBS_DIR") {
+            let python_include = format!(
+                "-I{}/kernel/platform/python3.7/include/python3.7m",
+                opengauss_binarylibs_dir
+            );
+            builder = builder.clang_arg(python_include);
+        }
+
+        //
+        // Finish the builder and generate the bindings.
+        //
+        let bindings = builder
             .generate()
             .context("Unable to generate bindings")?;
 
@@ -142,7 +170,7 @@ fn main() -> anyhow::Result<()> {
         let out_path: PathBuf = env::var("OUT_DIR")
             .context("Couldn't read OUT_DIR environment variable var")?
             .into();
-        let filename = format!("bindings_{pg_version}.rs");
+        let filename = format!("bindings_{module_name}.rs");
 
         bindings
             .write_to_file(out_path.join(filename))

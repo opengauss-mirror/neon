@@ -199,8 +199,20 @@ impl SerializedValueBatch {
                 // in this case. Also some FPI records may contain multiple (up to 32) pages,
                 // so them have to be copied multiple times.
                 //
+                // Instead of storing full-page-image WAL record,
+                // it is better to store extracted image: we can skip wal-redo
+                // in this case. Also some FPI records may contain multiple (up to 32) pages,
+                // so them have to be copied multiple times.
+                //
                 let val = if Self::block_is_image(&decoded, blk, pg_version) {
                     // Extract page image from FPI record
+                    tracing::info!(
+                        "[LAYERDBG] serialized_batch: extracting FPI as Image, \
+                         rel={}/{}/{}.{}, blkno={}, xl_rmid={}, xl_info=0x{:02X}, \
+                         has_image={}, apply_image={}, bimg_len={}",
+                        blk.rnode_spcnode, blk.rnode_dbnode, blk.rnode_relnode, blk.forknum, blk.blkno,
+                        decoded.xl_rmid, decoded.xl_info, blk.has_image, blk.apply_image, blk.bimg_len
+                    );
                     let img_len = blk.bimg_len as usize;
                     let img_offs = blk.bimg_offset as usize;
                     let mut image = BytesMut::with_capacity(BLCKSZ as usize);
@@ -224,8 +236,30 @@ impl SerializedValueBatch {
 
                     Value::Image(image.freeze())
                 } else {
+                    // For NeonWalRecord::Postgres, will_init indicates whether the redo
+                    // function will initialize the page from scratch (starting from a zero page).
+                    //
+                    // blk.will_init (from BKPBLOCK_WILL_INIT flag) is set by PostgreSQL/openGauss
+                    // when the WAL record's redo function will initialize the page. This happens
+                    // for example when inserting the first tuple into a new heap page.
+                    //
+                    // We use blk.will_init directly because:
+                    // 1. If will_init=true, the redo function knows to start from a zero page
+                    // 2. If will_init=false, we need a base image to apply the WAL record
+                    //
+                    // Note: This is different from FPI handling. FPI records are extracted as
+                    // Value::Image in the block_is_image branch above.
+                    tracing::info!(
+                        "[LAYERDBG] serialized_batch: storing WAL record as NeonWalRecord::Postgres, \
+                         rel={}/{}/{}.{}, blkno={}, has_image={}, apply_image={}, blk_will_init={}, \
+                         final_will_init={}, xl_rmid={}, xl_info=0x{:02X}",
+                        blk.rnode_spcnode, blk.rnode_dbnode, blk.rnode_relnode, blk.forknum, blk.blkno,
+                        blk.has_image, blk.apply_image, blk.will_init,
+                        blk.will_init,  // final value used for will_init
+                        decoded.xl_rmid, decoded.xl_info
+                    );
                     Value::WalRecord(NeonWalRecord::Postgres {
-                        will_init: blk.will_init || blk.apply_image,
+                        will_init: blk.will_init,
                         rec: decoded.record.clone(),
                     })
                 };
@@ -308,11 +342,25 @@ impl SerializedValueBatch {
         blk: &DecodedBkpBlock,
         pg_version: PgMajorVersion,
     ) -> bool {
-        blk.apply_image
-            && blk.has_image
-            && decoded.xl_rmid == pg_constants::RM_XLOG_ID
+        // A block can be treated as an image if it has a Full Page Image (FPI)
+        // that can be applied directly to reconstruct the page.
+        //
+        // There are two cases:
+        // 1. Pure FPI records (XLOG_FPI, XLOG_FPI_FOR_HINT) - these contain only the FPI
+        // 2. Other WAL records with FPI (e.g., btree operations, heap operations) -
+        //    if apply_image is true, we can extract the FPI as the page image
+        //
+        // For case 2, we extract the FPI and skip the redo operation, because
+        // the FPI already contains the complete page state after the operation.
+        let is_pure_fpi = decoded.xl_rmid == pg_constants::RM_XLOG_ID
             && (decoded.xl_info == pg_constants::XLOG_FPI
-            || decoded.xl_info == pg_constants::XLOG_FPI_FOR_HINT)
+                || decoded.xl_info == pg_constants::XLOG_FPI_FOR_HINT);
+
+        // For non-pure FPI records, we can still extract the FPI if apply_image is true
+        // This covers B-tree index operations, heap operations with FPI, etc.
+        let can_use_fpi = blk.apply_image && blk.has_image;
+
+        (is_pure_fpi || can_use_fpi)
             // compression of WAL is not yet supported: fall back to storing the original WAL record
             && !postgres_ffi::bkpimage_is_compressed(blk.bimg_info, pg_version)
             // do not materialize null pages because them most likely be soon replaced with real data

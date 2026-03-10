@@ -492,10 +492,10 @@ neon_xlogflush(PG_FUNCTION_ARGS)
 		 * header, back off to page boundary.
 		 */
 		if (lsn % XLOG_BLCKSZ == SizeOfXLogShortPHD &&
-			XLogSegmentOffset(lsn, wal_segment_size) > XLOG_BLCKSZ)
+			XLogSegmentOffset(lsn, XLogSegSize) > XLOG_BLCKSZ)
 			lsn -= SizeOfXLogShortPHD;
 		else if (lsn % XLOG_BLCKSZ == SizeOfXLogLongPHD &&
-				 XLogSegmentOffset(lsn, wal_segment_size) < XLOG_BLCKSZ)
+				 XLogSegmentOffset(lsn, XLogSegSize) < XLOG_BLCKSZ)
 			lsn -= SizeOfXLogLongPHD;
 	}
 

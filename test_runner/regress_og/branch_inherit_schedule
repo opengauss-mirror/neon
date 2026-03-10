@@ -1,0 +1,27 @@
+# Branch Data Inheritance Test Schedule for openGauss
+#
+# Tests branch creation and data inheritance:
+# 1. Creates data on main branch
+# 2. Creates a new branch from main
+# 3. Verifies data is inherited on the new branch
+# 4. Adds new data on branch and verifies isolation
+#
+# Format: test: <test_name>
+
+# Phase 0: Environment Setup (MUST run first)
+# This starts Neon services, creates tenant, and initializes environment
+test: neon_env_setup
+
+# Phase 1: Branch Data Inheritance Test
+# This test uses \c and preset port variables to switch between endpoints
+test: neon_branch_data_inherit_test
+
+# Phase 2: Branch Isolation Test (CRUD operations)
+test: neon_branch_isolation_test
+
+# Phase 3: Branch Creation with Specified LSN
+test: neon_branch_lsn_test
+
+# Phase 4: Cleanup (optional)
+# test: neon_cleanup
+

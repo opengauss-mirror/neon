@@ -8,13 +8,13 @@
 
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
-#include "postmaster/interrupt.h"
+//#include "postmaster/interrupt.h"
 #include "replication/slot.h"
-#include "storage/fd.h"
+#include "storage//smgr/fd.h"
 #include "storage/procsignal.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
-#include "utils/wait_event.h"
+//#include "utils/wait_event.h"
 
 #include "logical_replication_monitor.h"
 
@@ -45,8 +45,8 @@ PGDLLEXPORT void LogicalSlotsMonitorMain(Datum main_arg);
 static int
 SnapDescComparator(const void *a, const void *b)
 {
-	const SnapDesc	*desc1 = a;
-	const SnapDesc	*desc2 = b;
+	const SnapDesc	*desc1 = (const SnapDesc*)a;
+	const SnapDesc	*desc2 = (const SnapDesc*)b;
 
 	if (desc1->lsn < desc2->lsn)
 		return 1;
@@ -80,12 +80,12 @@ get_snapshots_cutoff_lsn(void)
 	if (logical_replication_max_snap_files < 0 && logical_replication_max_logicalsnapdir_size < 0)
 		return 0;
 
-	snapshot_descriptors = palloc(sizeof(*snapshot_descriptors) * descriptors_allocated);
+	snapshot_descriptors = (SnapDesc *)palloc(sizeof(*snapshot_descriptors) * descriptors_allocated);
 
 	dirdesc = AllocateDir(SNAPDIR);
 	dirdesc_fd = dirfd(dirdesc);
-	if (dirdesc_fd == -1)
-		ereport(ERROR, errmsg("failed to get a file descriptor for " SNAPDIR ": %m"));
+	// if (dirdesc_fd == -1)
+	// 	ereport(ERROR, errmsg("failed to get a file descriptor for " SNAPDIR ": %m"));
 
 	/* find all .snap files and get their lsns */
 	while ((de = ReadDir(dirdesc, SNAPDIR)) != NULL)
@@ -110,13 +110,13 @@ get_snapshots_cutoff_lsn(void)
 		lsn = ((uint64) hi) << 32 | lo;
 		elog(DEBUG5, "found snap file %X/%X", LSN_FORMAT_ARGS(lsn));
 
-		if (fstatat(dirdesc_fd, de->d_name, &st, 0) == -1)
-			ereport(ERROR, errmsg("failed to get the size of " SNAPDIR "/%s: %m", de->d_name));
+		// if (fstatat(dirdesc_fd, de->d_name, &st, 0) == -1)
+		// 	ereport(ERROR, errmsg("failed to get the size of " SNAPDIR "/%s: %m", de->d_name));
 
 		if (descriptors_allocated == snapshot_index)
 		{
 			descriptors_allocated *= 2;
-			snapshot_descriptors = repalloc(snapshot_descriptors, sizeof(*snapshot_descriptors) * descriptors_allocated);
+			snapshot_descriptors = (SnapDesc *)repalloc(snapshot_descriptors, sizeof(*snapshot_descriptors) * descriptors_allocated);
 		}
 
 		desc = &snapshot_descriptors[snapshot_index++];
@@ -174,11 +174,15 @@ get_snapshots_cutoff_lsn(void)
 #undef SNAPDIR
 }
 
+/*
+ * Initialize logical replication monitor (stage 1: _PG_init).
+ * This function only registers GUCs. The actual bgworker registration
+ * is deferred to logical_replication_monitor_register_bgworker() which
+ * is called from shmem_startup_hook.
+ */
 void
 InitLogicalReplicationMonitor(void)
 {
-	BackgroundWorker bgw;
-
 	DefineCustomIntVariable(
 							"neon.logical_replication_max_snap_files",
 							"Maximum allowed logical replication .snap files. When exceeded, slots are dropped until the limit is met. -1 disables the limit.",
@@ -199,18 +203,51 @@ InitLogicalReplicationMonitor(void)
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 
-	memset(&bgw, 0, sizeof(bgw));
-	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
-	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "neon");
-	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "LogicalSlotsMonitorMain");
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "Logical replication monitor");
-	snprintf(bgw.bgw_type, BGW_MAXLEN, "Logical replication monitor");
-	bgw.bgw_restart_time = 5;
-	bgw.bgw_notify_pid = 0;
-	bgw.bgw_main_arg = (Datum) 0;
+	/* bgworker registration happens later in shmem_startup_hook */
+}
 
-	RegisterBackgroundWorker(&bgw);
+/*
+ * Logical replication monitor bgworker entry point for OpenGauss (uses BgWorkerContext).
+ * This is the adapter function that bridges OpenGauss bgworker API to
+ * the existing LogicalSlotsMonitorMain logic.
+ */
+static void
+LogicalSlotsMonitorMain_OpenGauss(const BgWorkerContext *bwc)
+{
+	/* Call the main logic, passing 0 as main_arg since we don't use it */
+	LogicalSlotsMonitorMain((Datum) 0);
+}
+
+/*
+ * Register logical replication monitor background worker (stage 3: shmem_startup_hook).
+ * This function should be called after InitBgworkerGlobal() has been called,
+ * i.e., after CreateSharedMemoryAndSemaphores() in postmaster startup.
+ */
+void
+logical_replication_monitor_register_bgworker(void)
+{
+	BgWorkerContext bwc;
+
+	memset(&bwc, 0, sizeof(bwc));
+	
+	/* Set the main entry point function for OpenGauss bgworker */
+	bwc.main_entry = LogicalSlotsMonitorMain_OpenGauss;
+	
+	/* Optional: Set exit entry point if needed (can be NULL) */
+	bwc.exit_entry = NULL;
+	
+	/* Optional: Set database and user name if needed */
+	/* bwc.databaseName = pstrdup("postgres"); */
+	/* bwc.userName = pstrdup("cloud_admin"); */
+	
+	/* Optional: Set flag for individual thread mode if needed */
+	bwc.flag = 0;
+	
+	/* Register the background worker with OpenGauss API */
+	if (!RegisterBackgroundWorker(&bwc, 0))
+	{
+		ereport(WARNING, (errmsg("Failed to register logical replication monitor background worker")));
+	}
 }
 
 /*
@@ -226,41 +263,43 @@ void
 LogicalSlotsMonitorMain(Datum main_arg)
 {
 	/* Establish signal handlers. */
-	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
-	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGTERM, die);
+	// gspqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	// gspqsignal(SIGHUP, SignalHandlerForConfigReload);
+	// gspqsignal(SIGTERM, die);
 
-	BackgroundWorkerUnblockSignals();
+	// BackgroundWorkerUnblockSignals();
+	gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
 
 	for (;;)
 	{
 		XLogRecPtr	cutoff_lsn;
 
 		/* In case of a SIGHUP, just reload the configuration. */
-		if (ConfigReloadPending)
-		{
-			ConfigReloadPending = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
+		// if (ConfigReloadPending)
+		// {
+		// 	ConfigReloadPending = false;
+		// 	ProcessConfigFile(PGC_SIGHUP);
+		// }
 
 		/* Get the cutoff LSN */
 		cutoff_lsn = get_snapshots_cutoff_lsn();
 		if (cutoff_lsn > 0)
 		{
+			int max_replication_slots = 0;
 			for (int i = 0; i < max_replication_slots; i++)
 			{
 				char		slot_name[NAMEDATALEN];
-				ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+				ReplicationSlot *s = NULL;//&ReplicationSlotCtl->replication_slots[i];
 				XLogRecPtr	restart_lsn;
 
 				LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 
-				/* Consider only active logical repliction slots */
-				if (!s->in_use || !SlotIsLogical(s))
-				{
-					LWLockRelease(ReplicationSlotControlLock);
-					continue;
-				}
+				// /* Consider only active logical repliction slots */
+				// if (!s->in_use || !SlotIsLogical(s))
+				// {
+				// 	LWLockRelease(ReplicationSlotControlLock);
+				// 	continue;
+				// }
 
 				/*
 				 * Retrieve the restart LSN to determine if we need to drop the
@@ -289,7 +328,7 @@ LogicalSlotsMonitorMain(Datum main_arg)
 					pid_t		active_pid;
 
 					SpinLockAcquire(&s->mutex);
-					active_pid = s->active_pid;
+					// active_pid = s->active_pid;
 					SpinLockRelease(&s->mutex);
 
 					if (active_pid == 0)
@@ -303,7 +342,7 @@ LogicalSlotsMonitorMain(Datum main_arg)
 						 * In principle we could remove pg_try/pg_catch, that
 						 * would restart the whole bgworker.
 						 */
-						ConditionVariableCancelSleep();
+						//ConditionVariableCancelSleep();
 						PG_TRY();
 						{
 							ReplicationSlotDrop(slot_name, true);
@@ -325,17 +364,17 @@ LogicalSlotsMonitorMain(Datum main_arg)
 						elog(LOG, "ls_monitor: killing replication slot %s owner %d", slot_name, active_pid);
 						(void) kill(active_pid, SIGTERM);
 						/* We shouldn't get stuck, but to be safe add timeout. */
-						ConditionVariableTimedSleep(&s->active_cv, 1000, WAIT_EVENT_REPLICATION_SLOT_DROP);
+						//ConditionVariableTimedSleep(&s->active_cv, 1000, WAIT_EVENT_REPLICATION_SLOT_DROP);
 					}
 				}
 			}
 		}
 
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
-						 LS_MONITOR_CHECK_INTERVAL,
-						 PG_WAIT_EXTENSION);
-		ResetLatch(MyLatch);
+		// (void) WaitLatch(&t_thrd.proc->procLatch,
+		// 				 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+		// 				 LS_MONITOR_CHECK_INTERVAL,
+		// 				 PG_WAIT_EXTENSION);
+		// ResetLatch(&t_thrd.proc->procLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
 }

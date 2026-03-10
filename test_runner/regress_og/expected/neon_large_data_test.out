@@ -1,0 +1,596 @@
+-- ============================================================================
+-- Large Data Volume Test
+-- ============================================================================
+-- Description: Test large data volume operations with branching
+-- Tests data inheritance, isolation, and performance with large datasets
+-- ============================================================================
+-- ============================================================================
+-- Test Case 76: Large Table Data Inheritance
+-- ============================================================================
+-- Step 1: Create large table on MAIN
+CREATE TABLE test_large_76 (
+    id SERIAL PRIMARY KEY,
+    data TEXT,
+    value INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:18: NOTICE:  CREATE TABLE will create implicit sequence "test_large_76_id_seq" for serial column "test_large_76.id"
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:18: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_large_76_pkey" for table "test_large_76"
+CREATE TABLE
+-- Insert 10,000 rows
+INSERT INTO test_large_76 (data, value)
+SELECT 
+    'data_' || i::TEXT,
+    i
+FROM generate_series(1, 10000) AS i;
+INSERT 0 10000
+-- Verify row count on MAIN
+SELECT 'MAIN branch - Row count:' AS checkpoint;
+        checkpoint        
+--------------------------
+ MAIN branch - Row count:
+(1 row)
+
+SELECT COUNT(*) AS row_count FROM test_large_76;
+ row_count 
+-----------
+     10000
+(1 row)
+
+-- Verify data sample
+SELECT 'MAIN branch - Data sample:' AS checkpoint;
+         checkpoint         
+----------------------------
+ MAIN branch - Data sample:
+(1 row)
+
+SELECT id, data, value 
+FROM test_large_76 
+WHERE id IN (1, 5000, 10000)
+ORDER BY id;
+  id   |    data    | value 
+-------+------------+-------
+     1 | data_1     |     1
+  5000 | data_5000  |  5000
+ 10000 | data_10000 | 10000
+(3 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_76 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/2BCC068
+Waiting for pageserver to sync WAL to 0/2BCC068...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '738c38023329a12df3d04248f06b830d' at Lsn 0/2BCC068 for tenant: cdb2a0f68fe65219f0de764f88769742. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_76 --branch-name test_branch_76 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_76
+Starting existing endpoint ep_test_76...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Verify data inherited on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited row count:' AS checkpoint;
+          checkpoint           
+-------------------------------
+ BRANCH - Inherited row count:
+(1 row)
+
+SELECT COUNT(*) AS row_count FROM test_large_76;
+ row_count 
+-----------
+     10000
+(1 row)
+
+SELECT 'BRANCH - Inherited data sample:' AS checkpoint;
+           checkpoint            
+---------------------------------
+ BRANCH - Inherited data sample:
+(1 row)
+
+SELECT id, data, value 
+FROM test_large_76 
+WHERE id IN (1, 5000, 10000)
+ORDER BY id;
+  id   |    data    | value 
+-------+------------+-------
+     1 | data_1     |     1
+  5000 | data_5000  |  5000
+ 10000 | data_10000 | 10000
+(3 rows)
+
+-- Step 4: Add more data on branch
+INSERT INTO test_large_76 (data, value)
+SELECT 
+    'branch_data_' || i::TEXT,
+    i + 10000
+FROM generate_series(1, 5000) AS i;
+INSERT 0 5000
+SELECT 'BRANCH - Row count after insert:' AS checkpoint;
+            checkpoint            
+----------------------------------
+ BRANCH - Row count after insert:
+(1 row)
+
+SELECT COUNT(*) AS row_count FROM test_large_76;
+ row_count 
+-----------
+     15000
+(1 row)
+
+-- Step 5: Verify MAIN isolation
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Row count (should be unchanged):' AS checkpoint;
+               checkpoint                
+-----------------------------------------
+ MAIN - Row count (should be unchanged):
+(1 row)
+
+SELECT COUNT(*) AS row_count FROM test_large_76;
+ row_count 
+-----------
+     10000
+(1 row)
+
+-- Cleanup
+DROP TABLE test_large_76;
+DROP TABLE
+\! neon_local endpoint stop ep_test_76
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 77: Large Data with Index
+-- ============================================================================
+-- Step 1: Create table with index on MAIN
+CREATE TABLE test_indexed_77 (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50),
+    value INTEGER,
+    description TEXT
+);
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:86: NOTICE:  CREATE TABLE will create implicit sequence "test_indexed_77_id_seq" for serial column "test_indexed_77.id"
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:86: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_indexed_77_pkey" for table "test_indexed_77"
+CREATE TABLE
+-- Create index
+CREATE INDEX idx_77_category ON test_indexed_77(category);
+CREATE INDEX
+CREATE INDEX idx_77_value ON test_indexed_77(value);
+CREATE INDEX
+-- Insert 10,000 rows with 10 categories
+INSERT INTO test_indexed_77 (category, value, description)
+SELECT 
+    'category_' || (i % 10)::TEXT,
+    i,
+    'description_' || i::TEXT
+FROM generate_series(1, 10000) AS i;
+INSERT 0 10000
+-- Verify index usage on MAIN
+SELECT 'MAIN branch - Category distribution:' AS checkpoint;
+              checkpoint              
+--------------------------------------
+ MAIN branch - Category distribution:
+(1 row)
+
+SELECT category, COUNT(*) AS count
+FROM test_indexed_77
+GROUP BY category
+ORDER BY category;
+  category  | count 
+------------+-------
+ category_0 |  1000
+ category_1 |  1000
+ category_2 |  1000
+ category_3 |  1000
+ category_4 |  1000
+ category_5 |  1000
+ category_6 |  1000
+ category_7 |  1000
+ category_8 |  1000
+ category_9 |  1000
+(10 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_77 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/317DDF8
+Waiting for pageserver to sync WAL to 0/317DDF8...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'caeed084350d0e5bf0a888cb79c45983' at Lsn 0/317DDF8 for tenant: cdb2a0f68fe65219f0de764f88769742. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_77 --branch-name test_branch_77 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_77
+Starting existing endpoint ep_test_77...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Verify index on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+SELECT 'BRANCH - Inherited category distribution:' AS checkpoint;
+                checkpoint                 
+-------------------------------------------
+ BRANCH - Inherited category distribution:
+(1 row)
+
+SELECT category, COUNT(*) AS count
+FROM test_indexed_77
+GROUP BY category
+ORDER BY category;
+  category  | count 
+------------+-------
+ category_0 |  1000
+ category_1 |  1000
+ category_2 |  1000
+ category_3 |  1000
+ category_4 |  1000
+ category_5 |  1000
+ category_6 |  1000
+ category_7 |  1000
+ category_8 |  1000
+ category_9 |  1000
+(10 rows)
+
+-- Step 4: Add data on branch
+INSERT INTO test_indexed_77 (category, value, description)
+SELECT 
+    'branch_category_' || (i % 5)::TEXT,
+    i + 10000,
+    'branch_description_' || i::TEXT
+FROM generate_series(1, 5000) AS i;
+INSERT 0 5000
+SELECT 'BRANCH - All categories after insert:' AS checkpoint;
+              checkpoint               
+---------------------------------------
+ BRANCH - All categories after insert:
+(1 row)
+
+SELECT category, COUNT(*) AS count
+FROM test_indexed_77
+GROUP BY category
+ORDER BY category;
+     category      | count 
+-------------------+-------
+ branch_category_0 |  1000
+ branch_category_1 |  1000
+ branch_category_2 |  1000
+ branch_category_3 |  1000
+ branch_category_4 |  1000
+ category_0        |  1000
+ category_1        |  1000
+ category_2        |  1000
+ category_3        |  1000
+ category_4        |  1000
+ category_5        |  1000
+ category_6        |  1000
+ category_7        |  1000
+ category_8        |  1000
+ category_9        |  1000
+(15 rows)
+
+-- Step 5: Verify MAIN isolation
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Category distribution (unchanged):' AS checkpoint;
+                checkpoint                 
+-------------------------------------------
+ MAIN - Category distribution (unchanged):
+(1 row)
+
+SELECT category, COUNT(*) AS count
+FROM test_indexed_77
+GROUP BY category
+ORDER BY category;
+  category  | count 
+------------+-------
+ category_0 |  1000
+ category_1 |  1000
+ category_2 |  1000
+ category_3 |  1000
+ category_4 |  1000
+ category_5 |  1000
+ category_6 |  1000
+ category_7 |  1000
+ category_8 |  1000
+ category_9 |  1000
+(10 rows)
+
+-- Cleanup
+DROP TABLE test_indexed_77;
+DROP TABLE
+\! neon_local endpoint stop ep_test_77
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 78: Large Data Update Performance
+-- ============================================================================
+-- Step 1: Create table on MAIN
+CREATE TABLE test_update_78 (
+    id SERIAL PRIMARY KEY,
+    status VARCHAR(20),
+    counter INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:159: NOTICE:  CREATE TABLE will create implicit sequence "test_update_78_id_seq" for serial column "test_update_78.id"
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:159: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_update_78_pkey" for table "test_update_78"
+CREATE TABLE
+-- Insert 10,000 rows
+INSERT INTO test_update_78 (status, counter)
+SELECT 
+    CASE WHEN i % 2 = 0 THEN 'active' ELSE 'inactive' END,
+    0
+FROM generate_series(1, 10000) AS i;
+INSERT 0 10000
+-- Verify initial state
+SELECT 'MAIN branch - Initial status distribution:' AS checkpoint;
+                 checkpoint                 
+--------------------------------------------
+ MAIN branch - Initial status distribution:
+(1 row)
+
+SELECT status, COUNT(*) AS count, AVG(counter) AS avg_counter
+FROM test_update_78
+GROUP BY status
+ORDER BY status;
+  status  | count |      avg_counter       
+----------+-------+------------------------
+ active   |  5000 | 0.00000000000000000000
+ inactive |  5000 | 0.00000000000000000000
+(2 rows)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_78 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/3513210
+Waiting for pageserver to sync WAL to 0/3513210...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'fafbc0d4b7634f77094b2a60296ea698' at Lsn 0/3513210 for tenant: cdb2a0f68fe65219f0de764f88769742. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_78 --branch-name test_branch_78 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_78
+Starting existing endpoint ep_test_78...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Perform updates on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+-- Update counters on branch
+UPDATE test_update_78 
+SET counter = counter + 1, updated_at = CURRENT_TIMESTAMP
+WHERE status = 'active';
+UPDATE 5000
+SELECT 'BRANCH - After update:' AS checkpoint;
+       checkpoint       
+------------------------
+ BRANCH - After update:
+(1 row)
+
+SELECT status, COUNT(*) AS count, AVG(counter) AS avg_counter
+FROM test_update_78
+GROUP BY status
+ORDER BY status;
+  status  | count |      avg_counter       
+----------+-------+------------------------
+ active   |  5000 | 1.00000000000000000000
+ inactive |  5000 | 0.00000000000000000000
+(2 rows)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Status distribution (unchanged):' AS checkpoint;
+               checkpoint                
+-----------------------------------------
+ MAIN - Status distribution (unchanged):
+(1 row)
+
+SELECT status, COUNT(*) AS count, AVG(counter) AS avg_counter
+FROM test_update_78
+GROUP BY status
+ORDER BY status;
+  status  | count |      avg_counter       
+----------+-------+------------------------
+ active   |  5000 | 0.00000000000000000000
+ inactive |  5000 | 0.00000000000000000000
+(2 rows)
+
+-- Cleanup
+DROP TABLE test_update_78;
+DROP TABLE
+\! neon_local endpoint stop ep_test_78
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 79: Large Data Delete Operations
+-- ============================================================================
+-- Step 1: Create table on MAIN
+CREATE TABLE test_delete_79 (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50),
+    value INTEGER,
+    active BOOLEAN DEFAULT true
+);
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:218: NOTICE:  CREATE TABLE will create implicit sequence "test_delete_79_id_seq" for serial column "test_delete_79.id"
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:218: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_delete_79_pkey" for table "test_delete_79"
+CREATE TABLE
+-- Insert 10,000 rows
+INSERT INTO test_delete_79 (category, value, active)
+SELECT 
+    'category_' || (i % 10)::TEXT,
+    i,
+    true
+FROM generate_series(1, 10000) AS i;
+INSERT 0 10000
+SELECT 'MAIN branch - Initial row count:' AS checkpoint;
+            checkpoint            
+----------------------------------
+ MAIN branch - Initial row count:
+(1 row)
+
+SELECT COUNT(*) AS total_rows, COUNT(*) FILTER (WHERE active) AS active_rows
+FROM test_delete_79;
+ total_rows | active_rows 
+------------+-------------
+      10000 |       10000
+(1 row)
+
+-- Step 2: Create branch
+\! neon_local timeline branch --branch-name test_branch_79 --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/3898968
+Waiting for pageserver to sync WAL to 0/3898968...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline 'b4a6b339fde4160e281e4ba146d6c053' at Lsn 0/3898968 for tenant: cdb2a0f68fe65219f0de764f88769742. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_79 --branch-name test_branch_79 --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_79
+Starting existing endpoint ep_test_79...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Delete data on branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+-- Soft delete (update)
+UPDATE test_delete_79 
+SET active = false 
+WHERE value % 2 = 0;
+UPDATE 5000
+SELECT 'BRANCH - After soft delete:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - After soft delete:
+(1 row)
+
+SELECT COUNT(*) AS total_rows, COUNT(*) FILTER (WHERE active) AS active_rows
+FROM test_delete_79;
+ total_rows | active_rows 
+------------+-------------
+      10000 |        5000
+(1 row)
+
+-- Hard delete
+DELETE FROM test_delete_79 WHERE value < 1000;
+DELETE 999
+SELECT 'BRANCH - After hard delete:' AS checkpoint;
+         checkpoint          
+-----------------------------
+ BRANCH - After hard delete:
+(1 row)
+
+SELECT COUNT(*) AS total_rows, COUNT(*) FILTER (WHERE active) AS active_rows
+FROM test_delete_79;
+ total_rows | active_rows 
+------------+-------------
+       9001 |        4500
+(1 row)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Row count (unchanged):' AS checkpoint;
+          checkpoint           
+-------------------------------
+ MAIN - Row count (unchanged):
+(1 row)
+
+SELECT COUNT(*) AS total_rows, COUNT(*) FILTER (WHERE active) AS active_rows
+FROM test_delete_79;
+ total_rows | active_rows 
+------------+-------------
+      10000 |       10000
+(1 row)
+
+-- Cleanup
+DROP TABLE test_delete_79;
+DROP TABLE
+\! neon_local endpoint stop ep_test_79
+.
+\! sleep 2
+-- ============================================================================
+-- Test Case 80: Large Data with Multiple Branches
+-- ============================================================================
+-- Step 1: Create table on MAIN
+CREATE TABLE test_multi_branch_80 (
+    id SERIAL PRIMARY KEY,
+    branch_name VARCHAR(50),
+    data TEXT,
+    value INTEGER
+);
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:278: NOTICE:  CREATE TABLE will create implicit sequence "test_multi_branch_80_id_seq" for serial column "test_multi_branch_80.id"
+gsql:NEON_ROOT/sql/neon_large_data_test.sql:278: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "test_multi_branch_80_pkey" for table "test_multi_branch_80"
+CREATE TABLE
+-- Insert initial data
+INSERT INTO test_multi_branch_80 (branch_name, data, value)
+SELECT 
+    'main',
+    'main_data_' || i::TEXT,
+    i
+FROM generate_series(1, 5000) AS i;
+INSERT 0 5000
+SELECT 'MAIN branch - Initial count:' AS checkpoint;
+          checkpoint          
+------------------------------
+ MAIN branch - Initial count:
+(1 row)
+
+SELECT branch_name, COUNT(*) AS count
+FROM test_multi_branch_80
+GROUP BY branch_name;
+ branch_name | count 
+-------------+-------
+ main        |  5000
+(1 row)
+
+-- Step 2: Create first branch
+\! neon_local timeline branch --branch-name test_branch_80_a --ancestor-branch-name main
+Syncing branch point with endpoint flush LSN: 0/3A6C998
+Waiting for pageserver to sync WAL to 0/3A6C998...
+(This may take a while for large transactions)
+WAL sync complete.
+Created timeline '77086ed4d306b699d844b3b199730cfa' at Lsn 0/3A6C998 for tenant: cdb2a0f68fe65219f0de764f88769742. Ancestor timeline: 'main'
+\! neon_local endpoint create ep_test_80_a --branch-name test_branch_80_a --pg-port ${BRANCH1_PORT}
+\! neon_local endpoint start ep_test_80_a
+Starting existing endpoint ep_test_80_a...
+Starting postgres node at 'postgresql://cloud_admin@127.0.0.1:55435/postgres'
+-- Step 3: Add data on first branch
+\c - - - :branch1_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55435".
+INSERT INTO test_multi_branch_80 (branch_name, data, value)
+SELECT 
+    'branch_a',
+    'branch_a_data_' || i::TEXT,
+    i + 5000
+FROM generate_series(1, 3000) AS i;
+INSERT 0 3000
+SELECT 'BRANCH A - Data count:' AS checkpoint;
+       checkpoint       
+------------------------
+ BRANCH A - Data count:
+(1 row)
+
+SELECT branch_name, COUNT(*) AS count
+FROM test_multi_branch_80
+GROUP BY branch_name
+ORDER BY branch_name;
+ branch_name | count 
+-------------+-------
+ branch_a    |  3000
+ main        |  5000
+(2 rows)
+
+-- Step 4: Verify MAIN unchanged
+\c - - - :main_port
+You are now connected to database "postgres" as user "cloud_admin" on host "127.0.0.1" at port "55432".
+SELECT 'MAIN - Data count (unchanged):' AS checkpoint;
+           checkpoint           
+--------------------------------
+ MAIN - Data count (unchanged):
+(1 row)
+
+SELECT branch_name, COUNT(*) AS count
+FROM test_multi_branch_80
+GROUP BY branch_name;
+ branch_name | count 
+-------------+-------
+ main        |  5000
+(1 row)
+
+-- Cleanup
+DROP TABLE test_multi_branch_80;
+DROP TABLE
+\! neon_local endpoint stop ep_test_80_a
+.
+\! sleep 2
+total time: 308819  ms

@@ -72,7 +72,7 @@ typedef enum
  */
 #ifndef WALPROPOSER_LIB
 
-#include "libpq-fe.h"
+#include "libpq/libpq-fe.h"
 
 /*
  * Sometimes working directly with underlying PGconn is simpler, export the

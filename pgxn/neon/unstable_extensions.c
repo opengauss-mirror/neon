@@ -40,66 +40,66 @@ list_contains(char const* comma_separated_list, char const* val)
 }
 
 
-static void
-CheckUnstableExtension(
-	PlannedStmt *pstmt,
-	const char *queryString,
-	bool readOnlyTree,
-	ProcessUtilityContext context,
-	ParamListInfo params,
-	QueryEnvironment *queryEnv,
-	DestReceiver *dest,
-	QueryCompletion *qc)
-{
-	Node	   *parseTree = pstmt->utilityStmt;
+// static void
+// CheckUnstableExtension(
+// 	PlannedStmt *pstmt,
+// 	const char *queryString,
+// 	bool readOnlyTree,
+// 	ProcessUtilityContext context,
+// 	ParamListInfo params,
+// 	QueryEnvironment *queryEnv,
+// 	DestReceiver *dest,
+// 	QueryCompletion *qc)
+// {
+// 	Node	   *parseTree = pstmt->utilityStmt;
 
-	if (allow_unstable_extensions || unstable_extensions == NULL)
-		goto process;
+// 	if (allow_unstable_extensions || unstable_extensions == NULL)
+// 		goto process;
 
-	switch (nodeTag(parseTree))
-	{
-		case T_CreateExtensionStmt:
-		{
-			CreateExtensionStmt *stmt = castNode(CreateExtensionStmt, parseTree);
-			if (list_contains(unstable_extensions, stmt->extname))
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						 errmsg("%s extension is in beta and may be unstable or introduce backward-incompatible changes.\nWe recommend testing it in a separate, dedicated Neon project.", stmt->extname),
-						 errhint("to proceed with installation, run SET neon.allow_unstable_extensions='true'")));
-			}
-			break;
-		}
-		default:
-			goto process;
-	}
+// 	switch (nodeTag(parseTree))
+// 	{
+// 		case T_CreateExtensionStmt:
+// 		{
+// 			CreateExtensionStmt *stmt = castNode(CreateExtensionStmt, parseTree);
+// 			if (list_contains(unstable_extensions, stmt->extname))
+// 			{
+// 				ereport(ERROR,
+// 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+// 						 errmsg("%s extension is in beta and may be unstable or introduce backward-incompatible changes.\nWe recommend testing it in a separate, dedicated Neon project.", stmt->extname),
+// 						 errhint("to proceed with installation, run SET neon.allow_unstable_extensions='true'")));
+// 			}
+// 			break;
+// 		}
+// 		default:
+// 			goto process;
+// 	}
 
-process:
-	if (PreviousProcessUtilityHook)
-	{
-		PreviousProcessUtilityHook(
-			pstmt,
-			queryString,
-			readOnlyTree,
-			context,
-			params,
-			queryEnv,
-			dest,
-			qc);
-	}
-	else
-	{
-		standard_ProcessUtility(
-			pstmt,
-			queryString,
-			readOnlyTree,
-			context,
-			params,
-			queryEnv,
-			dest,
-			qc);
-	}
-}
+// process:
+// 	if (PreviousProcessUtilityHook)
+// 	{
+// 		PreviousProcessUtilityHook(
+// 			pstmt,
+// 			queryString,
+// 			readOnlyTree,
+// 			context,
+// 			params,
+// 			queryEnv,
+// 			dest,
+// 			qc);
+// 	}
+// 	else
+// 	{
+// 		standard_ProcessUtility(
+// 			pstmt,
+// 			queryString,
+// 			readOnlyTree,
+// 			context,
+// 			params,
+// 			queryEnv,
+// 			dest,
+// 			qc);
+// 	}
+// }
 
 void
 InitUnstableExtensionsSupport(void)
@@ -125,5 +125,5 @@ InitUnstableExtensionsSupport(void)
 		NULL, NULL, NULL);
 
 	PreviousProcessUtilityHook = ProcessUtility_hook;
-	ProcessUtility_hook = CheckUnstableExtension;
+	// ProcessUtility_hook = CheckUnstableExtension;
 }

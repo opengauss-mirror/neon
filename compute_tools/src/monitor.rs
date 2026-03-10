@@ -322,7 +322,7 @@ impl ComputeMonitor {
 
         // Do not suspend compute if autovacuum is running
         const AUTOVACUUM_COUNT_QUERY: &str =
-            "select count(*) from pg_stat_activity where backend_type = 'autovacuum worker'";
+            "select count(*) from pg_stat_activity where application_name = 'autovacuum worker'";
         match cli.query_one(AUTOVACUUM_COUNT_QUERY, &[]) {
             Ok(r) => match r.try_get::<&str, i64>("count") {
                 Ok(num_workers) => {
@@ -447,7 +447,7 @@ fn get_backends_state_change(cli: &mut Client) -> anyhow::Result<Option<DateTime
     let backends = cli.query(
         "SELECT state, to_char(state_change, 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS state_change
                 FROM pg_stat_activity
-                    WHERE backend_type = 'client backend'
+                    WHERE application_name = 'client backend'
                     AND pid != pg_backend_pid()
                     AND usename != 'cloud_admin';", // XXX: find a better way to filter other monitors?
         &[],

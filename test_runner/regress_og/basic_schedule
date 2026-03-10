@@ -1,0 +1,32 @@
+# Basic Functionality Test Schedule for openGauss
+#
+# Tests core database operations: DDL, DML, transactions, constraints.
+# This is a good starting point for regression testing.
+#
+# Format: test: <test_name>
+
+# Phase 0: Environment Setup (MUST run first)
+# This starts Neon services, creates tenant, and initializes environment
+test: neon_env_setup
+
+# Phase 1: SQL Setup
+test: neon_setup
+test: neon_test_helpers
+
+# Phase 2: Basic Tests
+test: neon_basic
+
+test: neon_db_objects_test
+
+test: neon_large_data_test
+
+test: neon_branch_cascade_test
+
+test: neon_branch_data_inherit_test
+
+test: neon_branch_isolation_test
+
+test: neon_branch_lsn_test
+
+# Phase 3: Cleanup
+test: neon_cleanup

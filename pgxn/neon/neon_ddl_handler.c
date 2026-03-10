@@ -51,6 +51,10 @@
 #include "neon_utils.h"
 #include "neon.h"
 
+#ifdef ENABLE_NEON
+#define CurTransactionContext t_thrd.mem_cxt.cur_transaction_mem_cxt
+#endif
+
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static fmgr_hook_type next_fmgr_hook = NULL;
 static needs_fmgr_hook_type next_needs_fmgr_hook = NULL;
@@ -109,17 +113,27 @@ static DdlHashTable *CurrentDdlTable = &RootTable;
 static int SubtransLevel; /* current nesting level of subtransactions */
 
 static void
-PushKeyValue(JsonbParseState **state, char *key, char *value)
+PushKeyValue(JsonbParseState **state, const char *key, const char *value)
 {
 	JsonbValue	k,
 				v;
 
 	k.type = jbvString;
+	#ifdef ENABLE_NEON
+	k.string.len = strlen(key);
+	k.string.val = pstrdup(key);
+	#else
 	k.val.string.len = strlen(key);
-	k.val.string.val = key;
+	k.val.string.val = pstrdup(key);
+	#endif
 	v.type = jbvString;
+	#ifdef ENABLE_NEON
+	v.string.len = strlen(value);
+	v.string.val = pstrdup(value);
+	#else
 	v.val.string.len = strlen(value);
-	v.val.string.val = value;
+	v.val.string.val = pstrdup(value);
+	#endif
 	pushJsonbValue(state, WJB_KEY, &k);
 	pushJsonbValue(state, WJB_VALUE, &v);
 }
@@ -137,20 +151,29 @@ ConstructDeltaMessage()
 		DbEntry    *entry;
 
 		dbs.type = jbvString;
+		#ifdef ENABLE_NEON
+		dbs.string.val = pstrdup("dbs");
+		dbs.string.len = strlen(dbs.string.val);
+		#else
 		dbs.val.string.val = "dbs";
 		dbs.val.string.len = strlen(dbs.val.string.val);
+		#endif
 		pushJsonbValue(&state, WJB_KEY, &dbs);
 		pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
 
 		hash_seq_init(&status, RootTable.db_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
+		while ((entry = (DbEntry *)hash_seq_search(&status)) != NULL)
 		{
 			pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
 			PushKeyValue(&state, "op", entry->type == Op_Set ? "set" : "del");
 			PushKeyValue(&state, "name", entry->name);
 			if (entry->owner != InvalidOid)
 			{
+				#ifdef ENABLE_NEON
+				PushKeyValue(&state, "owner", GetUserNameFromId(entry->owner));
+				#else
 				PushKeyValue(&state, "owner", GetUserNameFromId(entry->owner, false));
+				#endif
 			}
 			if (entry->old_name[0] != '\0')
 			{
@@ -168,13 +191,18 @@ ConstructDeltaMessage()
 		RoleEntry  *entry;
 
 		roles.type = jbvString;
+		#ifdef ENABLE_NEON
+		roles.string.val = pstrdup("roles");
+		roles.string.len = strlen(roles.string.val);
+		#else
 		roles.val.string.val = "roles";
 		roles.val.string.len = strlen(roles.val.string.val);
+		#endif
 		pushJsonbValue(&state, WJB_KEY, &roles);
 		pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
 
 		hash_seq_init(&status, RootTable.role_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
+		while ((entry = (RoleEntry *)hash_seq_search(&status)) != NULL)
 		{
 			pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
 			PushKeyValue(&state, "op", entry->type == Op_Set ? "set" : "del");
@@ -188,7 +216,21 @@ ConstructDeltaMessage()
 #endif
 				char	   *encrypted_password;
 				PushKeyValue(&state, "password", (char *) entry->password);
+				#ifdef ENABLE_NEON
+				{
+					password_info pass_info = {NULL, 0, 0, false, false};
+					if (get_stored_password(entry->name, &pass_info))
+					{
+						encrypted_password = pass_info.shadow_pass;
+					}
+					else
+					{
+						encrypted_password = NULL;
+					}
+				}
+				#else
 				encrypted_password = get_role_password(entry->name, &logdetail);
+				#endif
 
 				if (encrypted_password)
 				{
@@ -211,7 +253,7 @@ ConstructDeltaMessage()
 		JsonbValue *result = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
 		Jsonb	   *jsonb = JsonbValueToJsonb(result);
 
-		return JsonbToCString(NULL, &jsonb->root, 0 /* estimated_len */ );
+		return JsonbToCString(NULL, VARDATA(jsonb), VARSIZE(jsonb));
 	}
 }
 
@@ -227,7 +269,7 @@ static size_t
 ErrorWriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
 	/* Docs say size is always 1 */
-	ErrorString *str = userdata;
+	ErrorString *str = (ErrorString *) userdata;
 
 	size_t		to_write = nmemb;
 
@@ -341,7 +383,7 @@ InitCurrentDdlTableIfNeeded()
 	/* Lazy construction of DllHashTable chain */
 	if (SubtransLevel > CurrentDdlTable->subtrans_level)
 	{
-		DdlHashTable *new_table = MemoryContextAlloc(CurTransactionContext, sizeof(DdlHashTable));
+		DdlHashTable *new_table = (DdlHashTable *)MemoryContextAlloc(CurTransactionContext, sizeof(DdlHashTable));
 		new_table->prev_table = CurrentDdlTable;
 		new_table->subtrans_level = SubtransLevel;
 		new_table->role_table = NULL;
@@ -365,7 +407,12 @@ InitDbTableIfNeeded()
 												"Dbs Created",
 												4,
 												&db_ctl,
-												HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+												#ifdef ENABLE_NEON
+												HASH_ELEM | HASH_CONTEXT
+												#else
+												HASH_ELEM | HASH_STRINGS | HASH_CONTEXT
+												#endif
+												);
 	}
 }
 
@@ -384,7 +431,12 @@ InitRoleTableIfNeeded()
 												  "Roles Created",
 												  4,
 												  &role_ctl,
-												  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+												  #ifdef ENABLE_NEON
+												  HASH_ELEM | HASH_CONTEXT
+												  #else
+												  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT
+												  #endif
+												  );
 	}
 }
 
@@ -416,9 +468,9 @@ MergeTable()
 		InitDbTableIfNeeded();
 
 		hash_seq_init(&status, old_table->db_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
+		while ((entry = (DbEntry *)hash_seq_search(&status)) != NULL)
 		{
-			DbEntry    *to_write = hash_search(
+			DbEntry    *to_write = (DbEntry *)hash_search(
 											   CurrentDdlTable->db_table,
 											   entry->name,
 											   HASH_ENTER,
@@ -431,7 +483,7 @@ MergeTable()
 			if (entry->old_name[0] != '\0')
 			{
 				bool		found_old = false;
-				DbEntry    *old = hash_search(
+				DbEntry    *old = (DbEntry *)hash_search(
 											  CurrentDdlTable->db_table,
 											  entry->old_name,
 											  HASH_FIND,
@@ -462,11 +514,11 @@ MergeTable()
 		InitRoleTableIfNeeded();
 
 		hash_seq_init(&status, old_table->role_table);
-		while ((entry = hash_seq_search(&status)) != NULL)
+		while ((entry = (RoleEntry *)hash_seq_search(&status)) != NULL)
 		{
 			RoleEntry * old;
 			bool found_old = false;
-			RoleEntry  *to_write = hash_search(
+			RoleEntry  *to_write = (RoleEntry *)hash_search(
 											   CurrentDdlTable->role_table,
 											   entry->name,
 											   HASH_ENTER,
@@ -478,7 +530,7 @@ MergeTable()
 			if (entry->old_name[0] == '\0')
 				continue;
 
-			old = hash_search(
+			old = (RoleEntry *)hash_search(
 							  CurrentDdlTable->role_table,
 							  entry->old_name,
 							  HASH_FIND,
@@ -532,10 +584,10 @@ NeonSubXactCallback(
 static void
 NeonXactCallback(XactEvent event, void *arg)
 {
-	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PARALLEL_PRE_COMMIT)
-	{
-		SendDeltasToControlPlane();
-	}
+	// if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PARALLEL_PRE_COMMIT)
+	// {
+	// 	SendDeltasToControlPlane();
+	// }
 	RootTable.role_table = NULL;
 	RootTable.db_table = NULL;
 	Assert(CurrentDdlTable == &RootTable);
@@ -546,7 +598,8 @@ IsPrivilegedRole(const char *role_name)
 {
 	Assert(role_name);
 
-	return strcmp(role_name, privileged_role_name) == 0;
+	// return strcmp(role_name, privileged_role_name) == 0;
+	return false;
 }
 
 static void
@@ -561,13 +614,13 @@ HandleCreateDb(CreatedbStmt *stmt)
 
 	foreach(option, stmt->options)
 	{
-		DefElem    *defel = lfirst(option);
+		DefElem    *defel = (DefElem *)lfirst(option);
 
 		if (strcmp(defel->defname, "owner") == 0)
 			downer = defel;
 	}
 
-	entry = hash_search(CurrentDdlTable->db_table,
+	entry = (DbEntry *)hash_search(CurrentDdlTable->db_table,
 						stmt->dbname,
 						HASH_ENTER,
 						&found);
@@ -579,8 +632,8 @@ HandleCreateDb(CreatedbStmt *stmt)
 	{
 		const char *owner_name = defGetString(downer);
 
-		if (IsPrivilegedRole(owner_name))
-			elog(ERROR, "could not create a database with owner %s", privileged_role_name);
+		// if (IsPrivilegedRole(owner_name))
+		// 	elog(ERROR, "could not create a database with owner %s", privileged_role_name);
 
 		entry->owner = get_role_oid(owner_name, false);
 	}
@@ -603,18 +656,18 @@ HandleAlterOwner(AlterOwnerStmt *stmt)
 	InitDbTableIfNeeded();
 
 	name = strVal(stmt->object);
-	entry = hash_search(CurrentDdlTable->db_table,
+	entry = (DbEntry *)hash_search(CurrentDdlTable->db_table,
 						name,
 						HASH_ENTER,
 						&found);
 	if (!found)
 		memset(entry->old_name, 0, sizeof(entry->old_name));
 
-	new_owner = get_rolespec_name(stmt->newowner);
-	if (IsPrivilegedRole(new_owner))
-		elog(ERROR, "could not alter owner to %s", privileged_role_name);
+	// new_owner = get_rolespec_name(stmt->newowner);
+	//if (IsPrivilegedRole(new_owner))
+	//	elog(ERROR, "could not alter owner to %s", privileged_role_name);
 
-	entry->owner = get_role_oid(new_owner, false);
+	//entry->owner = get_role_oid(new_owner, false);
 	entry->type = Op_Set;
 }
 
@@ -627,12 +680,12 @@ HandleDbRename(RenameStmt *stmt)
 
 	Assert(stmt->renameType == OBJECT_DATABASE);
 	InitDbTableIfNeeded();
-	entry = hash_search(CurrentDdlTable->db_table,
+	entry = (DbEntry *)hash_search(CurrentDdlTable->db_table,
 						stmt->subname,
 						HASH_FIND,
 						&found);
 
-	entry_for_new_name = hash_search(CurrentDdlTable->db_table,
+	entry_for_new_name = (DbEntry *)hash_search(CurrentDdlTable->db_table,
 									 stmt->newname,
 									 HASH_ENTER,
 									 NULL);
@@ -665,7 +718,7 @@ HandleDropDb(DropdbStmt *stmt)
 
 	InitDbTableIfNeeded();
 
-	entry = hash_search(CurrentDdlTable->db_table,
+	entry = (DbEntry *)hash_search(CurrentDdlTable->db_table,
 						stmt->dbname,
 						HASH_ENTER,
 						&found);
@@ -688,13 +741,13 @@ HandleCreateRole(CreateRoleStmt *stmt)
 	dpass = NULL;
 	foreach(option, stmt->options)
 	{
-		DefElem    *defel = lfirst(option);
+		DefElem    *defel = (DefElem *)lfirst(option);
 
 		if (strcmp(defel->defname, "password") == 0)
 			dpass = defel;
 	}
 
-	entry = hash_search(CurrentDdlTable->role_table,
+	entry = (RoleEntry *)hash_search(CurrentDdlTable->role_table,
 						stmt->role,
 						HASH_ENTER,
 						&found);
@@ -718,39 +771,39 @@ HandleAlterRole(AlterRoleStmt *stmt)
 
 	InitRoleTableIfNeeded();
 
-	role_name = get_rolespec_name(stmt->role);
-	if (IsPrivilegedRole(role_name) && !superuser())
-		elog(ERROR, "could not ALTER %s", privileged_role_name);
+	// role_name = get_rolespec_name(stmt->role);
+	// if (IsPrivilegedRole(role_name) && !superuser())
+	// 	elog(ERROR, "could not ALTER %s", privileged_role_name);
 
 	dpass = NULL;
 	foreach(option, stmt->options)
 	{
-		DefElem    *defel = lfirst(option);
+		DefElem    *defel = (DefElem *)lfirst(option);
 
 		if (strcmp(defel->defname, "password") == 0)
 			dpass = defel;
 	}
 
 	/* We only care about updates to the password */
-	if (!dpass)
-	{
-		pfree(role_name);
-		return;
-	}
+	// if (!dpass)
+	// {
+	// 	pfree(role_name);
+	// 	return;
+	// }
 
-	entry = hash_search(CurrentDdlTable->role_table,
-						role_name,
-						HASH_ENTER,
-						&found);
-	if (!found)
-		memset(entry->old_name, 0, sizeof(entry->old_name));
-	if (dpass->arg)
-		entry->password = MemoryContextStrdup(CurTransactionContext, strVal(dpass->arg));
-	else
-		entry->password = NULL;
-	entry->type = Op_Set;
+	// entry = (RoleEntry *)hash_search(CurrentDdlTable->role_table,
+	// 					role_name,
+	// 					HASH_ENTER,
+	// 					&found);
+	// if (!found)
+	// 	memset(entry->old_name, 0, sizeof(entry->old_name));
+	// if (dpass->arg)
+	// 	entry->password = MemoryContextStrdup(CurTransactionContext, strVal(dpass->arg));
+	// else
+	// 	entry->password = NULL;
+	// entry->type = Op_Set;
 
-	pfree(role_name);
+	// pfree(role_name);
 }
 
 static void
@@ -763,12 +816,12 @@ HandleRoleRename(RenameStmt *stmt)
 	Assert(stmt->renameType == OBJECT_ROLE);
 	InitRoleTableIfNeeded();
 
-	entry = hash_search(CurrentDdlTable->role_table,
+	entry = (RoleEntry *)hash_search(CurrentDdlTable->role_table,
 						stmt->subname,
 						HASH_FIND,
 						&found);
 
-	entry_for_new_name = hash_search(CurrentDdlTable->role_table,
+	entry_for_new_name = (RoleEntry *)hash_search(CurrentDdlTable->role_table,
 									 stmt->newname,
 									 HASH_ENTER,
 									 NULL);
@@ -803,18 +856,18 @@ HandleDropRole(DropRoleStmt *stmt)
 
 	foreach(item, stmt->roles)
 	{
-		RoleSpec   *spec = lfirst(item);
-		bool		found = false;
-		RoleEntry  *entry = hash_search(
-										CurrentDdlTable->role_table,
-										spec->rolename,
-										HASH_ENTER,
-										&found);
+		// RoleSpec   *spec = lfirst(item);
+		// bool		found = false;
+		// RoleEntry  *entry = (RoleEntry *)hash_search(
+		// 								CurrentDdlTable->role_table,
+		// 								spec->rolename,
+		// 								HASH_ENTER,
+		// 								&found);
 
-		entry->type = Op_Delete;
-		entry->password = NULL;
-		if (!found)
-			memset(entry->old_name, 0, sizeof(entry->old_name));
+		// entry->type = Op_Delete;
+		// entry->password = NULL;
+		// if (!found)
+		// 	memset(entry->old_name, 0, sizeof(entry->old_name));
 	}
 }
 
@@ -845,8 +898,8 @@ HandleRename(RenameStmt *stmt)
 static bool
 neon_needs_fmgr_hook(Oid functionId) {
 
-	return (next_needs_fmgr_hook && (*next_needs_fmgr_hook) (functionId))
-		|| get_func_rettype(functionId) == EVENT_TRIGGEROID;
+	return (next_needs_fmgr_hook && (*next_needs_fmgr_hook) (functionId));
+		//|| get_func_rettype(functionId) == EVENT_TRIGGEROID;
 }
 
 static void
@@ -897,17 +950,17 @@ force_noop(FmgrInfo *finfo)
  * {privileged_role_name}.
  */
 static void
-neon_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
+neon_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private_data)
 {
 	/*
 	 * It can be other needs_fmgr_hook which cause our hook to be invoked for
 	 * non-trigger function, so recheck that is is trigger function.
 	 */
-	if (flinfo->fn_oid != InvalidOid &&
-		get_func_rettype(flinfo->fn_oid) != EVENT_TRIGGEROID)
+	if (flinfo->fn_oid != InvalidOid)
+		// get_func_rettype(flinfo->fn_oid) != EVENT_TRIGGEROID)
 	{
 		if (next_fmgr_hook)
-			(*next_fmgr_hook) (event, flinfo, private);
+			(*next_fmgr_hook) (event, flinfo, private_data);
 
 		return;
 	}
@@ -927,10 +980,10 @@ neon_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
 	 * same as the {privileged_role_name} role.
 	 */
 	if (event == FHET_START
-		&& !neon_event_triggers
-		&& is_privileged_role())
+		&& !neon_event_triggers)
+		// && is_privileged_role())
 	{
-		Oid weak_superuser_oid = get_role_oid(privileged_role_name, false);
+		// Oid weak_superuser_oid = get_role_oid(privileged_role_name, false);
 
 		/* Find the Function Attributes (owner Oid, security definer) */
 		const char *fun_owner_name = NULL;
@@ -938,10 +991,10 @@ neon_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
 		bool fun_is_secdef = false;
 
 		LookupFuncOwnerSecDef(flinfo->fn_oid, &fun_owner, &fun_is_secdef);
-		fun_owner_name = GetUserNameFromId(fun_owner, false);
+		fun_owner_name = GetUserNameFromId(fun_owner);
 
-		if (IsPrivilegedRole(fun_owner_name)
-			|| has_privs_of_role(fun_owner, weak_superuser_oid))
+		if (IsPrivilegedRole(fun_owner_name))
+			//|| has_privs_of_role(fun_owner, weak_superuser_oid))
 		{
 			elog(WARNING,
 				 "Skipping Event Trigger: neon.event_triggers is false");
@@ -999,8 +1052,8 @@ neon_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
 							   "is owned by non-superuser role \"%s\", "
 							   "and current_user \"%s\" is superuser",
 							   func_name,
-							   GetUserNameFromId(function_owner, false),
-							   GetUserNameFromId(current_role_oid, false))));
+							   GetUserNameFromId(function_owner),
+							   GetUserNameFromId(current_role_oid))));
 
 			/*
 			 * we can't skip execution directly inside the fmgr_hook so
@@ -1013,7 +1066,7 @@ neon_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *private)
 	}
 
 	if (next_fmgr_hook)
-		(*next_fmgr_hook) (event, flinfo, private);
+		(*next_fmgr_hook) (event, flinfo, private_data);
 }
 
 static Oid prev_role_oid = 0;
@@ -1070,18 +1123,14 @@ alter_role_super(const char* rolename, bool make_super)
 	AlterRoleStmt *alter_stmt = makeNode(AlterRoleStmt);
 
 	DefElem *defel_superuser =
-#if PG_MAJORVERSION_NUM <= 14
-		makeDefElem("superuser", (Node *) makeInteger(make_super), -1);
-#else
-		makeDefElem("superuser", (Node *) makeBoolean(make_super), -1);
-#endif
+		makeDefElem("superuser", (Node *) makeInteger(make_super));
 
-	RoleSpec *rolespec   = makeNode(RoleSpec);
-	rolespec->roletype   = ROLESPEC_CSTRING;
-	rolespec->rolename   = pstrdup(rolename);
-	rolespec->location   = -1;
+	// RoleSpec *rolespec   = makeNode(RoleSpec);
+	// rolespec->roletype   = ROLESPEC_CSTRING;
+	// rolespec->rolename   = pstrdup(rolename);
+	// rolespec->location   = -1;
 
-	alter_stmt->role = rolespec;
+	// alter_stmt->role = rolespec;
 	alter_stmt->options = list_make1(defel_superuser);
 
 #if PG_MAJORVERSION_NUM < 15
@@ -1104,7 +1153,7 @@ alter_role_super(const char* rolename, bool make_super)
 static void
 alter_event_trigger_owner(const char *obj_name, Oid role_oid)
 {
-	char* role_name = GetUserNameFromId(role_oid, false);
+	char* role_name = GetUserNameFromId(role_oid);
 
 	alter_role_super(role_name, true);
 
@@ -1126,9 +1175,9 @@ ProcessCreateEventTrigger(
 				   bool readOnlyTree,
 				   ProcessUtilityContext context,
 				   ParamListInfo params,
-				   QueryEnvironment *queryEnv,
-				   DestReceiver *dest,
-				   QueryCompletion *qc)
+				   //QueryEnvironment *queryEnv,
+				   DestReceiver *dest)
+				   //QueryCompletion *qc)
 {
 	Node	   *parseTree = pstmt->utilityStmt;
 	bool		sudo = false;
@@ -1147,8 +1196,8 @@ ProcessCreateEventTrigger(
 	if (nodeTag(parseTree) != T_CreateEventTrigStmt)
 	{
 		ereport(ERROR,
-				errcode(ERRCODE_INTERNAL_ERROR),
-				errmsg("ProcessCreateEventTrigger called for the wrong command"));
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("ProcessCreateEventTrigger called for the wrong command")));
 	}
 
 	/*
@@ -1158,7 +1207,8 @@ ProcessCreateEventTrigger(
 	 * For that we give superuser membership to the role for the execution of
 	 * the command.
 	 */
-	if (IsTransactionState() && is_privileged_role())
+	 // && is_privileged_role()
+	if (IsTransactionState())
 	{
 		/* Find the Event Trigger function Oid */
 		Oid func_oid = LookupFuncName(stmt->funcname, 0, NULL, false);
@@ -1181,7 +1231,7 @@ ProcessCreateEventTrigger(
 					 errdetail("current user \"%s\" is not a superuser "
 							   "and Event Trigger function \"%s\" "
 							   "is owned by a superuser",
-							   GetUserNameFromId(current_user_id, false),
+							   GetUserNameFromId(current_user_id),
 							   NameListToString(stmt->funcname))));
 		}
 
@@ -1194,7 +1244,7 @@ ProcessCreateEventTrigger(
 					 errdetail("current user \"%s\" is a superuser "
 							   "and function \"%s\" is "
 							   "owned by a non-superuser",
-							   GetUserNameFromId(current_user_id, false),
+							   GetUserNameFromId(current_user_id),
 							   NameListToString(stmt->funcname))));
 		}
 
@@ -1205,27 +1255,27 @@ ProcessCreateEventTrigger(
 	{
 		if (PreviousProcessUtilityHook)
 		{
-			PreviousProcessUtilityHook(
-				pstmt,
-				queryString,
-				readOnlyTree,
-				context,
-				params,
-				queryEnv,
-				dest,
-				qc);
+			// PreviousProcessUtilityHook(
+			// 	pstmt,
+			// 	queryString,
+			// 	readOnlyTree,
+			// 	context,
+			// 	params,
+			// 	queryEnv,
+			// 	dest,
+			// 	qc);
 		}
 		else
 		{
-			standard_ProcessUtility(
-				pstmt,
-				queryString,
-				readOnlyTree,
-				context,
-				params,
-				queryEnv,
-				dest,
-				qc);
+			// standard_ProcessUtility(
+			// 	pstmt,
+			// 	queryString,
+			// 	readOnlyTree,
+			// 	context,
+			// 	params,
+			// 	queryEnv,
+			// 	dest,
+			// 	qc);
 		}
 
 		/*
@@ -1235,7 +1285,8 @@ ProcessCreateEventTrigger(
 		 *
 		 * That way [ ALTER | DROP ] EVENT TRIGGER commands just work.
 		 */
-		if (IsTransactionState() && is_privileged_role())
+		// && is_privileged_role()
+		if (IsTransactionState())
 		{
 			if (!current_user_is_super)
 			{
@@ -1247,12 +1298,13 @@ ProcessCreateEventTrigger(
 			}
 		}
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		if (sudo)
 			switch_to_original_role();
 	}
 	PG_END_TRY();
+
 }
 
 
@@ -1266,9 +1318,9 @@ NeonProcessUtility(
 				   bool readOnlyTree,
 				   ProcessUtilityContext context,
 				   ParamListInfo params,
-				   QueryEnvironment *queryEnv,
-				   DestReceiver *dest,
-				   QueryCompletion *qc)
+				   //QueryEnvironment *queryEnv,
+				   DestReceiver *dest)
+				   // QueryCompletion *qc)
 {
 	Node	   *parseTree = pstmt->utilityStmt;
 
@@ -1278,15 +1330,15 @@ NeonProcessUtility(
 	 */
 	if (nodeTag(parseTree) == T_CreateEventTrigStmt)
 	{
-		ProcessCreateEventTrigger(
-				pstmt,
-				queryString,
-				readOnlyTree,
-				context,
-				params,
-				queryEnv,
-				dest,
-				qc);
+		// ProcessCreateEventTrigger(
+		// 		pstmt,
+		// 		queryString,
+		// 		readOnlyTree,
+		// 		context,
+		// 		params,
+		// 		queryEnv,
+		// 		dest,
+		// 		qc);
 		return;
 	}
 
@@ -1330,27 +1382,27 @@ NeonProcessUtility(
 
 	if (PreviousProcessUtilityHook)
 	{
-		PreviousProcessUtilityHook(
-			pstmt,
-			queryString,
-			readOnlyTree,
-			context,
-			params,
-			queryEnv,
-			dest,
-			qc);
+		// PreviousProcessUtilityHook(
+		// 	pstmt,
+		// 	queryString,
+		// 	readOnlyTree,
+		// 	context,
+		// 	params,
+		// 	queryEnv,
+		// 	dest,
+		// 	qc);
 	}
 	else
 	{
-		standard_ProcessUtility(
-			pstmt,
-			queryString,
-			readOnlyTree,
-			context,
-			params,
-			queryEnv,
-			dest,
-			qc);
+		// standard_ProcessUtility(
+		// 	pstmt,
+		// 	queryString,
+		// 	readOnlyTree,
+		// 	context,
+		// 	params,
+		// 	queryEnv,
+		// 	dest,
+		// 	qc);
 	}
 }
 
@@ -1360,13 +1412,13 @@ NeonProcessUtility(
 static void
 neon_event_triggers_assign_hook(bool newval, void *extra)
 {
-	if (IsTransactionState() && !is_privileged_role())
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to set neon.event_triggers"),
-				 errdetail("Only \"%s\" is allowed to set the GUC", privileged_role_name)));
-	}
+	// if (IsTransactionState() && !is_privileged_role())
+	// {
+	// 	ereport(ERROR,
+	// 			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+	// 			 errmsg("permission denied to set neon.event_triggers"),
+	// 			 errdetail("Only \"%s\" is allowed to set the GUC", privileged_role_name)));
+	// }
 }
 
 
@@ -1374,7 +1426,7 @@ void
 InitDDLHandler()
 {
 	PreviousProcessUtilityHook = ProcessUtility_hook;
-	ProcessUtility_hook = NeonProcessUtility;
+	// ProcessUtility_hook = NeonProcessUtility;
 
     next_needs_fmgr_hook = needs_fmgr_hook;
 	needs_fmgr_hook = neon_needs_fmgr_hook;

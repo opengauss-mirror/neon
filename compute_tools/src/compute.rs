@@ -414,6 +414,16 @@ struct StartVmMonitorResult {
 }
 
 impl ComputeNode {
+    fn supports_sync_safekeepers(&self) -> bool {
+        Path::new(&self.params.pgbin)
+            .file_name()
+            .map(|name| {
+                // Support both PostgreSQL ("postgres") and openGauss ("gaussdb")
+                name == std::ffi::OsStr::new("postgres") || name == std::ffi::OsStr::new("gaussdb")
+            })
+            .unwrap_or(false)
+    }
+
     pub fn new(params: ComputeNodeParams, config: ComputeConfig) -> Result<Self> {
         let connstr = params.connstr.as_str();
         let mut conn_conf = postgres::config::Config::from_str(connstr)
@@ -673,7 +683,7 @@ impl ComputeNode {
 
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         info!(
-            "starting compute for project {}, operation {}, tenant {}, timeline {}, project {}, branch {}, endpoint {}, features {:?}, spec.remote_extensions {:?}",
+            "testneon starting compute for project {}, operation {}, tenant {}, timeline {}, project {}, branch {}, endpoint {}, features {:?}, spec.remote_extensions {:?}",
             pspec.spec.cluster.cluster_id.as_deref().unwrap_or("None"),
             pspec.spec.operation_uuid.as_deref().unwrap_or("None"),
             pspec.tenant_id,
@@ -718,6 +728,7 @@ impl ComputeNode {
             pre_tasks.spawn_blocking_child(move || this.prepare_pgdata(&cs));
         }
 
+        info!("prepare_pgdata succeed..");
         // Resize swap to the desired size if the compute spec says so
         if let (Some(size_bytes), true) =
             (pspec.spec.swap_size_bytes, self.params.resize_swap_on_bind)
@@ -736,7 +747,7 @@ impl ComputeNode {
                 Ok::<(), anyhow::Error>(())
             });
         }
-
+        info!("Resize swap succeed..");
         // Set disk quota if the compute spec says so
         if let (Some(disk_quota_bytes), Some(disk_quota_fs_mountpoint)) = (
             pspec.spec.disk_quota_bytes,
@@ -752,6 +763,7 @@ impl ComputeNode {
                 Ok::<(), anyhow::Error>(())
             });
         }
+        info!("Set disk quota succeed..");
 
         // tune pgbouncer
         if let Some(pgbouncer_settings) = &pspec.spec.pgbouncer_settings {
@@ -770,6 +782,7 @@ impl ComputeNode {
                 }
             });
         }
+        info!("tune pgbouncer succeed..");
 
         // configure local_proxy
         if let Some(local_proxy) = &pspec.spec.local_proxy_config {
@@ -788,6 +801,8 @@ impl ComputeNode {
                 }
             });
         }
+        info!("configure local_proxy succeed..");
+
 
         // Configure and start rsyslog for compliance audit logging
         match pspec.spec.audit_log_level {
@@ -826,9 +841,13 @@ impl ComputeNode {
             _ => {}
         }
 
+        info!("Configure and start rsyslog succeed..");
+
         // Configure and start rsyslog for Postgres logs export
         let conf = PostgresLogsRsyslogConfig::new(pspec.spec.logs_export_host.as_deref());
         configure_postgres_logs_export(conf)?;
+
+        info!("Configure and start rsyslog2 succeed..");
 
         // Launch remaining service threads
         let _monitor_handle = launch_monitor(self);
@@ -839,7 +858,7 @@ impl ComputeNode {
         while let Some(res) = rt.block_on(pre_tasks.join_next()) {
             res??;
         }
-
+        info!("Wait for all the pre-tasks to finish succeed..");
         ////// START POSTGRES
         let start_time = Utc::now();
         let pg_process = self.start_postgres(pspec.storage_auth_token.clone())?;
@@ -973,11 +992,19 @@ impl ComputeNode {
         let compute_state = self.state.lock().unwrap().clone();
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         let lsn = if matches!(pspec.spec.mode, compute_api::spec::ComputeMode::Primary) {
-            info!("syncing safekeepers on shutdown");
-            let storage_auth_token = pspec.storage_auth_token.clone();
-            let lsn = self.sync_safekeepers(storage_auth_token)?;
-            info!(%lsn, "synced safekeepers");
-            Some(lsn)
+            if self.supports_sync_safekeepers() {
+                info!("syncing safekeepers on shutdown");
+                let storage_auth_token = pspec.storage_auth_token.clone();
+                let lsn = self.sync_safekeepers(storage_auth_token)?;
+                info!(%lsn, "synced safekeepers");
+                Some(lsn)
+            } else {
+                info!(
+                    "skipping safekeeper sync on shutdown because {} does not support --sync-safekeepers",
+                    self.params.pgbin
+                );
+                None
+            }
         } else {
             info!("not primary, not syncing safekeepers");
             None
@@ -1068,6 +1095,7 @@ impl ComputeNode {
         };
 
         self.fix_zenith_signal_neon_signal()?;
+        self.fix_pg_version_for_opengauss()?;
 
         let mut state = self.state.lock().unwrap();
         state.metrics.pageserver_connect_micros =
@@ -1095,6 +1123,62 @@ impl ComputeNode {
         if zenithsig.is_file() {
             fs::copy(zenithsig, neonsig)?;
         }
+
+        Ok(())
+    }
+
+    /// Fix PG_VERSION file format for openGauss compatibility.
+    /// openGauss expects PG_VERSION to be in "major.minor" format (e.g., "9.2")
+    /// instead of just the major version (e.g., "14").
+    fn fix_pg_version_for_opengauss(&self) -> Result<()> {
+        let pgbin_path = Path::new(&self.params.pgbin);
+        let pgbin_name = pgbin_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // Check if we're using openGauss (gaussdb binary)
+        let is_opengauss = pgbin_name.contains("gaussdb") || 
+                          pgbin_path.to_string_lossy().contains("gaussdb") ||
+                          pgbin_path.to_string_lossy().contains("openGauss");
+
+        if !is_opengauss {
+            return Ok(());
+        }
+
+        let pg_version_path = Path::new(&self.params.pgdata).join("PG_VERSION");
+        
+        if !pg_version_path.exists() {
+            // PG_VERSION should exist after basebackup extraction
+            // If it doesn't, something went wrong, but we'll let it fail later
+            return Ok(());
+        }
+
+        // Read current PG_VERSION content
+        let current_content = fs::read_to_string(&pg_version_path)
+            .with_context(|| format!("Failed to read PG_VERSION from {:?}", pg_version_path))?;
+        
+        let trimmed = current_content.trim();
+        
+        // If it's already in "major.minor" format, don't change it
+        if trimmed.contains('.') {
+            return Ok(());
+        }
+
+        // Convert PostgreSQL major version to openGauss format
+        // openGauss is based on PostgreSQL 9.2.4, so we use "9.2"
+        let opengauss_version = match trimmed {
+            "14" | "15" | "16" | "17" => "9.2",
+            _ => {
+                warn!("Unknown PostgreSQL version '{}' in PG_VERSION, using 9.2 for openGauss", trimmed);
+                "9.2"
+            }
+        };
+
+        // Write the openGauss-compatible version
+        fs::write(&pg_version_path, format!("{}\n", opengauss_version))
+            .with_context(|| format!("Failed to write PG_VERSION to {:?}", pg_version_path))?;
+
+        info!("Fixed PG_VERSION from '{}' to '{}' for openGauss compatibility", trimmed, opengauss_version);
 
         Ok(())
     }
@@ -1430,10 +1514,15 @@ impl ComputeNode {
                 info!("checking if safekeepers are synced");
                 let lsn = if let Ok(Some(lsn)) = self.check_safekeepers_synced(compute_state) {
                     lsn
-                } else {
+                } else if self.supports_sync_safekeepers() {
                     info!("starting safekeepers syncing");
                     self.sync_safekeepers(pspec.storage_auth_token.clone())
                         .with_context(|| "failed to sync safekeepers")?
+                } else {
+                    anyhow::bail!(
+                        "safekeepers are not yet synced and {} does not support --sync-safekeepers",
+                        self.params.pgbin
+                    );
                 };
                 info!("safekeepers synced at LSN {}", lsn);
                 lsn
@@ -1461,6 +1550,7 @@ impl ComputeNode {
 
         // Update pg_hba.conf received with basebackup.
         update_pg_hba(pgdata_path, None)?;
+        info!("update_pg_hba succeed..");
 
         // Place pg_dynshmem under /dev/shm. This allows us to use
         // 'dynamic_shared_memory_type = mmap' so that the files are placed in
@@ -1501,16 +1591,59 @@ impl ComputeNode {
         // symlink doesn't affect anything.
         //
         // See https://github.com/neondatabase/autoscaling/issues/800
-        std::fs::remove_dir(pgdata_path.join("pg_dynshmem"))?;
-        symlink("/dev/shm/", pgdata_path.join("pg_dynshmem"))?;
+
+        // openGauss没有这一步：ERROR: No such file or directory (os error 2)
+        // std::fs::remove_dir(pgdata_path.join("pg_dynshmem"))?;
+        // symlink("/dev/shm/", pgdata_path.join("pg_dynshmem"))?;
 
         match spec.mode {
             ComputeMode::Primary => {}
             ComputeMode::Replica | ComputeMode::Static(..) => {
-                add_standby_signal(pgdata_path)?;
+                // Check if we're using openGauss
+                let pgbin_path = Path::new(&self.params.pgbin);
+                let is_opengauss = pgbin_path.to_string_lossy().contains("gaussdb") ||
+                                  pgbin_path.to_string_lossy().contains("openGauss");
+                
+                // For openGauss Replica mode, we need primary_conninfo and primary_slotname from the spec
+                // These are set in postgresql.conf, but openGauss needs them in recovery.conf
+                let (primary_conninfo, primary_slotname) = if is_opengauss && matches!(spec.mode, ComputeMode::Replica) {
+                    // Extract primary_conninfo - use splitn(2, '=') to only split at the first '='
+                    // Format: primary_conninfo = 'host=xxx port=xxx ...'
+                    let conninfo = spec.cluster.postgresql_conf.as_ref().and_then(|conf| {
+                        conf.lines()
+                            .find(|line| line.trim().starts_with("primary_conninfo"))
+                            .and_then(|line| {
+                                line.splitn(2, '=')
+                                    .nth(1)
+                                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
+                            })
+                    });
+                    
+                    // openGauss uses 'primary_slotname' instead of 'primary_slot_name'
+                    let slotname = spec.cluster.postgresql_conf.as_ref().and_then(|conf| {
+                        conf.lines()
+                            .find(|line| line.trim().starts_with("primary_slot_name"))
+                            .and_then(|line| {
+                                line.splitn(2, '=')
+                                    .nth(1)
+                                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
+                            })
+                    });
+                    
+                    (conninfo, slotname)
+                } else {
+                    (None, None)
+                };
+                
+                add_standby_signal_ext(
+                    pgdata_path,
+                    is_opengauss,
+                    primary_conninfo.as_deref(),
+                    primary_slotname.as_deref(),
+                )?;
             }
         }
-
+        info!("prepare_pgdata succeed..");
         Ok(())
     }
 
@@ -1572,23 +1705,55 @@ impl ComputeNode {
     #[instrument(skip_all)]
     pub fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
         let pgdata_path = Path::new(&self.params.pgdata);
+        info!("testneon start_postgres...");
 
         // Run postgres as a child process.
-        let mut pg = maybe_cgexec(&self.params.pgbin)
-            .args(["-D", &self.params.pgdata])
-            .envs(if let Some(storage_auth_token) = &storage_auth_token {
-                vec![("NEON_AUTH_TOKEN", storage_auth_token)]
-            } else {
-                vec![]
-            })
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("cannot start postgres process");
+        let env_vars: Vec<(&str, &str)> = if let Some(storage_auth_token) = &storage_auth_token {
+            vec![("NEON_AUTH_TOKEN", storage_auth_token)]
+        } else {
+            vec![]
+        };
+        
+        // Log the full command for debugging
+        let is_cgexec = env::var_os("AUTOSCALING").is_some();
+        let cmd_str = if is_cgexec {
+            format!("cgexec -g memory:neon-postgres {} -D {}", self.params.pgbin, self.params.pgdata)
+        } else {
+            format!("{} -D {}", self.params.pgbin, self.params.pgdata)
+        };
+        
+        info!(
+            pgbin = %self.params.pgbin,
+            pgdata = %self.params.pgdata,
+            "Starting opengauss/postgres process"
+        );
+        info!("Startup command: {}", cmd_str);
+        if !env_vars.is_empty() {
+            let env_str = env_vars.iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!("Environment variables: {}", env_str);
+        }
+        
+        let mut cmd = maybe_cgexec(&self.params.pgbin);
+        cmd.args(["-D", &self.params.pgdata]);
+        cmd.envs(env_vars.iter().map(|(k, v)| (*k, *v)));
+        cmd.stderr(Stdio::piped());
+        
+        info!("About to spawn postgres process");
+        let mut pg = cmd.spawn()
+            .with_context(|| format!("Failed to spawn postgres process. Command: {}", cmd_str))?;
+        info!(pid = %pg.id(), "Successfully spawned postgres process");
         PG_PID.store(pg.id(), Ordering::SeqCst);
 
         // Start a task to collect logs from stderr.
         let stderr = pg.stderr.take().expect("stderr should be captured");
-        let logs_handle = handle_postgres_logs(stderr);
+        // Create log file path in the same directory as compute.log (parent of pgdata)
+        let log_file_path = pgdata_path
+            .parent()
+            .map(|p| p.join("postgres_startup.log"));
+        let logs_handle = handle_postgres_logs_with_file(stderr, log_file_path);
 
         wait_for_postgres(&mut pg, pgdata_path)?;
 
