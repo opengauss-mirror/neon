@@ -183,18 +183,6 @@ impl PostgresRedoManager {
             bail!("invalid WAL redo request with no records");
         }
 
-        // [LAYERDBG] Log the WAL redo request details
-        let (rel, blkno) = key.to_rel_block().unwrap_or_default();
-        let base_img_lsn_for_log = base_img.as_ref().map(|p| p.0).unwrap_or(Lsn::INVALID);
-        let base_img_size = base_img.as_ref().map(|p| p.1.len()).unwrap_or(0);
-        let first_record_will_init = records.first().map(|(_, r)| r.will_init()).unwrap_or(false);
-        info!(
-            "[LAYERDBG] request_redo: key={}, rel={}/{}/{}.{}, blkno={}, lsn={}, base_img_lsn={}, base_img_size={}, \
-             records_count={}, first_record_will_init={}, pg_version={:?}",
-            key, rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno,
-            lsn, base_img_lsn_for_log, base_img_size, records.len(), first_record_will_init, pg_version
-        );
-
         let max_retry_attempts = match redo_attempt_type {
             RedoAttemptType::ReadPage => 2,
             RedoAttemptType::LegacyCompaction => 1,
@@ -560,19 +548,12 @@ impl PostgresRedoManager {
     ) -> Result<Bytes, Error> {
         let start_time = Instant::now();
 
-        // [LAYERDBG] Log neon batch start
-        info!(
-            "[LAYERDBG] apply_batch_neon: key={}, lsn={}, base_img_size={}, records_count={}",
-            key, lsn, base_img.as_ref().map(|b| b.len()).unwrap_or(0), records.len()
-        );
-
         let mut page = BytesMut::new();
         if let Some(fpi) = base_img {
             // If full-page image is provided, then use it...
             page.extend_from_slice(&fpi[..]);
         } else {
             // All the current WAL record types that we can handle require a base image.
-            info!("[LAYERDBG] apply_batch_neon: no base image for key={}", key);
             bail!("invalid neon WAL redo request with no base image");
         }
 
@@ -586,9 +567,11 @@ impl PostgresRedoManager {
         // there could be multiple batch sizes this would be N+1 modal.
         WAL_REDO_TIME.observe(duration.as_secs_f64());
 
-        info!(
-            "[LAYERDBG] apply_batch_neon: success, key={}, {} WAL records in {} us, result_size={}",
-            key, records.len(), duration.as_micros(), page.len()
+        debug!(
+            "neon applied {} WAL records in {} us to reconstruct page image at LSN {}",
+            records.len(),
+            duration.as_micros(),
+            lsn
         );
 
         Ok(page.freeze())

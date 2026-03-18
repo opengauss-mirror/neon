@@ -75,7 +75,8 @@ int32		max_cluster_size;
 char	   *page_server_connstring;
 char	   *neon_auth_token;
 
-int			readahead_buffer_size = 128;
+/* Reduced from 128 to 64: limits walredo queue depth under high concurrency */
+int			readahead_buffer_size = 64;
 int			flush_every_n_requests = 8;
 
 int         neon_protocol_version = 3;
@@ -1734,8 +1735,8 @@ pg_init_libpagestore(void)
 							"tablespaces' effective_io_concurrency and "
 							"maintenance_io_concurrency, and your sessions' "
 							"values for these settings.",
-							&readahead_buffer_size,
-							128, 16, 1024,
+						&readahead_buffer_size,
+						64, 16, 1024,
 							PGC_USERSET,
 							0,	/* no flags required */
 							NULL, (GucIntAssignHook) &readahead_buffer_resize, NULL);
@@ -1784,8 +1785,8 @@ pg_init_libpagestore(void)
 							"pageserver response diconnect timeout",
 							"If the pageserver doesn't respond to a request within this timeout, "
 							"disconnect and reconnect.",
-							&pageserver_response_disconnect_timeout,
-							150000, 100, INT_MAX,
+						&pageserver_response_disconnect_timeout,
+						300000, 100, INT_MAX,
 							PGC_SUSET,
 							GUC_UNIT_MS,
 							NULL, NULL, NULL);

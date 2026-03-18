@@ -44,18 +44,18 @@
 #include "neon_utils.h"
 #include "wait_events.h"
 
-/* TESTDBG: Include for XLogRecord debugging */
+/* Include for XLogRecord debugging */
 #include "access/xlog_basic.h"
 
-/* TESTDBG: WAL structure constants for openGauss */
-#define TESTDBG_XLOG_BLCKSZ 8192
-#define TESTDBG_WAL_SEGMENT_SIZE (16 * 1024 * 1024)
-#define TESTDBG_XLOG_SIZE_OF_XLOG_SHORT_PHD 24
-#define TESTDBG_XLOG_SIZE_OF_XLOG_LONG_PHD 40
-#define TESTDBG_XLP_LONG_HEADER 0x0002
-#define TESTDBG_XLOG_PAGE_MAGIC 0xD074
+/* WAL structure constants for openGauss */
+#define WP_XLOG_BLCKSZ 8192
+#define WP_WAL_SEGMENT_SIZE (16 * 1024 * 1024)
+#define WP_XLOG_SIZE_OF_XLOG_SHORT_PHD 24
+#define WP_XLOG_SIZE_OF_XLOG_LONG_PHD 40
+#define WP_XLP_LONG_HEADER 0x0002
+#define WP_XLOG_PAGE_MAGIC 0xD074
 
-/* TESTDBG: Helper function to dump XLogRecord info from WAL data with page header handling */
+/* Helper function to dump XLogRecord info from WAL data with page header handling */
 static void
 DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int wal_len)
 {
@@ -63,7 +63,7 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
     int record_count = 0;
     XLogRecPtr current_lsn = lsn;
     
-    elog(LOG, "TESTDBG %s: LSN=%X/%X, wal_len=%d",
+    elog(DEBUG1, "%s: LSN=%X/%X, wal_len=%d",
          prefix, LSN_FORMAT_ARGS(lsn), wal_len);
     
     while (offset < wal_len)
@@ -72,13 +72,13 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
         int remaining = wal_len - offset;
         
         /* Check if we're at a page boundary */
-        uint64 page_offset = current_lsn % TESTDBG_XLOG_BLCKSZ;
-        uint64 segment_offset = current_lsn % TESTDBG_WAL_SEGMENT_SIZE;
+        uint64 page_offset = current_lsn % WP_XLOG_BLCKSZ;
+        uint64 segment_offset = current_lsn % WP_WAL_SEGMENT_SIZE;
         
         /* At the start of a page, we need to skip the page header */
         if (page_offset == 0)
         {
-            int hdr_size = (segment_offset == 0) ? TESTDBG_XLOG_SIZE_OF_XLOG_LONG_PHD : TESTDBG_XLOG_SIZE_OF_XLOG_SHORT_PHD;
+            int hdr_size = (segment_offset == 0) ? WP_XLOG_SIZE_OF_XLOG_LONG_PHD : WP_XLOG_SIZE_OF_XLOG_SHORT_PHD;
             
             if (remaining >= hdr_size)
             {
@@ -90,10 +90,10 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
                 uint32 xlp_rem_len = *(uint32 *)(ptr + 16);
                 uint32 xlp_total_len = *(uint32 *)(ptr + 20);
                 
-                bool is_long_header = (xlp_info & TESTDBG_XLP_LONG_HEADER) != 0;
-                int actual_hdr_size = is_long_header ? TESTDBG_XLOG_SIZE_OF_XLOG_LONG_PHD : TESTDBG_XLOG_SIZE_OF_XLOG_SHORT_PHD;
+                bool is_long_header = (xlp_info & WP_XLP_LONG_HEADER) != 0;
+                int actual_hdr_size = is_long_header ? WP_XLOG_SIZE_OF_XLOG_LONG_PHD : WP_XLOG_SIZE_OF_XLOG_SHORT_PHD;
                 
-                elog(LOG, "TESTDBG %s: PAGE_HEADER at LSN=%X/%X offset=%d: xlp_magic=0x%04X, xlp_info=0x%04X, xlp_tli=%u, xlp_pageaddr=%X/%X, xlp_rem_len=%u, xlp_total_len=%u, hdr_size=%d",
+                elog(DEBUG1, "%s: PAGE_HEADER at LSN=%X/%X offset=%d: xlp_magic=0x%04X, xlp_info=0x%04X, xlp_tli=%u, xlp_pageaddr=%X/%X, xlp_rem_len=%u, xlp_total_len=%u, hdr_size=%d",
                      prefix,
                      (uint32)(current_lsn >> 32), (uint32)current_lsn,
                      offset,
@@ -106,10 +106,10 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
                      actual_hdr_size);
                 
                 /* Validate page magic */
-                if (xlp_magic != TESTDBG_XLOG_PAGE_MAGIC)
+                if (xlp_magic != WP_XLOG_PAGE_MAGIC)
                 {
-                    elog(LOG, "TESTDBG %s: WARNING - unexpected page magic 0x%04X (expected 0x%04X)",
-                         prefix, xlp_magic, TESTDBG_XLOG_PAGE_MAGIC);
+                    elog(DEBUG1, "%s: WARNING - unexpected page magic 0x%04X (expected 0x%04X)",
+                         prefix, xlp_magic, WP_XLOG_PAGE_MAGIC);
                 }
                 
                 offset += actual_hdr_size;
@@ -118,7 +118,7 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
             }
             else
             {
-                elog(LOG, "TESTDBG %s: insufficient data for page header at offset=%d, remaining=%d",
+                elog(DEBUG1, "%s: insufficient data for page header at offset=%d, remaining=%d",
                      prefix, offset, remaining);
                 break;
             }
@@ -127,7 +127,7 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
         /* Not at page boundary, try to parse XLogRecord */
         if (remaining < (int)sizeof(XLogRecord))
         {
-            elog(LOG, "TESTDBG %s: insufficient data for XLogRecord at offset=%d, remaining=%d",
+            elog(DEBUG1, "%s: insufficient data for XLogRecord at offset=%d, remaining=%d",
                  prefix, offset, remaining);
             break;
         }
@@ -138,14 +138,14 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
         /* Sanity check for xl_tot_len */
         if (tot_len < sizeof(XLogRecord) || tot_len > 10 * 1024 * 1024)
         {
-            elog(LOG, "TESTDBG %s: record[%d] INVALID xl_tot_len=%u at LSN=%X/%X offset=%d, remaining=%d, sizeof(XLogRecord)=%lu",
+            elog(DEBUG1, "%s: record[%d] INVALID xl_tot_len=%u at LSN=%X/%X offset=%d, remaining=%d, sizeof(XLogRecord)=%lu",
                  prefix, record_count, tot_len,
                  (uint32)(current_lsn >> 32), (uint32)current_lsn,
                  offset, remaining, sizeof(XLogRecord));
             break;
         }
         
-        elog(LOG, "TESTDBG %s: record[%d] at LSN=%X/%X: xl_tot_len=%u, xl_term=%u, xl_xid=%lu, "
+        elog(DEBUG1, "%s: record[%d] at LSN=%X/%X: xl_tot_len=%u, xl_term=%u, xl_xid=%lu, "
              "xl_prev=%X/%X, xl_info=0x%02X, xl_rmid=%u, xl_bucket_id=%u, xl_crc=0x%08X",
              prefix, record_count,
              (uint32)(current_lsn >> 32), (uint32)current_lsn,
@@ -159,7 +159,7 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
              record->xl_crc);
         
         /* Calculate how much of this record is on the current page */
-        uint64 remaining_in_page = TESTDBG_XLOG_BLCKSZ - page_offset;
+        uint64 remaining_in_page = WP_XLOG_BLCKSZ - page_offset;
         
         if (tot_len <= remaining_in_page)
         {
@@ -171,7 +171,7 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
         else
         {
             /* Record spans multiple pages */
-            elog(LOG, "TESTDBG %s: record[%d] spans pages: record_len=%u, remaining_in_page=%lu",
+            elog(DEBUG1, "%s: record[%d] spans pages: record_len=%u, remaining_in_page=%lu",
                  prefix, record_count, tot_len, (unsigned long)remaining_in_page);
             
             int aligned_len = MAXALIGN(tot_len);
@@ -184,7 +184,7 @@ DumpXLogRecordInfo(const char *prefix, XLogRecPtr lsn, const char *wal_data, int
         /* Limit output to avoid log flooding */
         if (record_count >= 5)
         {
-            elog(LOG, "TESTDBG %s: ... (truncated, %d bytes remaining)", prefix, wal_len - offset);
+            elog(DEBUG1, "%s: ... (truncated, %d bytes remaining)", prefix, wal_len - offset);
             break;
         }
     }
@@ -1867,7 +1867,7 @@ SendAppendRequests(Safekeeper *sk)
 										 &errmsg))
 				{
 					case NEON_WALREAD_SUCCESS:
-						/* TESTDBG: Dump XLogRecord info after reading WAL */
+						/* Dump XLogRecord info after reading WAL */
 						DumpXLogRecordInfo("walproposer SEND",
 										   req->beginLsn,
 										   &sk->outbuf.data[sk->outbuf.len],

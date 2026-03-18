@@ -319,7 +319,7 @@ impl Timeline {
         debug_assert_current_span_has_tenant_and_timeline_id();
 
         // [LAYERDBG] Log batched page requests
-        info!("[LAYERDBG] get_rel_page_at_lsn_batched: starting batch request");
+        debug!("[LAYERDBG] get_rel_page_at_lsn_batched: starting batch request");
 
         let mut slots_filled = 0;
         let page_count = pages.len();
@@ -1950,7 +1950,7 @@ impl DatadirModification<'_> {
 
         // [LAYERDBG] Log batch info
         if !batch.metadata.is_empty() {
-            info!(
+            debug!(
                 "[LAYERDBG] ingest_batch: processing {} metadata entries at LSN {}",
                 batch.metadata.len(),
                 self.lsn
@@ -1965,7 +1965,7 @@ impl DatadirModification<'_> {
             let new_nblocks = blkno + 1;
 
             // [LAYERDBG] Log each metadata entry details
-            info!(
+            debug!(
                 "[LAYERDBG] ingest_batch entry: key={}, rel={}/{}/{}.{}, blkno={}, lsn={}",
                 key, rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno,
                 meta.lsn()
@@ -1973,7 +1973,7 @@ impl DatadirModification<'_> {
 
             let old_nblocks = self.create_relation_if_required(rel, ctx).await?;
             if new_nblocks > old_nblocks {
-                info!(
+                debug!(
                     "[LAYERDBG] ingest_batch: extending rel {}/{}/{}.{} from {} to {} blocks",
                     rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, old_nblocks, new_nblocks
                 );
@@ -1981,7 +1981,7 @@ impl DatadirModification<'_> {
             }
 
             if let Some(gaps) = Self::find_gaps(rel, blkno, old_nblocks, shard) {
-                info!(
+                debug!(
                     "[LAYERDBG] ingest_batch: found gap for rel {}/{}/{}.{}, blkno={}, old_nblocks={}",
                     rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno, old_nblocks
                 );
@@ -2318,7 +2318,7 @@ impl DatadirModification<'_> {
         dbdir: &DbDirectory,
     ) -> Result<(), WalIngestError> {
         // Copy everything from relv1 to relv2; TODO: check if there's any key in the v2 keyspace, if so, abort.
-        tracing::info!("initializing rel_size_v2 keyspace");
+        tracing::debug!("initializing rel_size_v2 keyspace");
         let mut rel_cnt = 0;
         // relmap_exists (the value of dbdirs hashmap) does not affect the migration: we need to copy things over anyways
         for &(spcnode, dbnode) in dbdir.dbdirs.keys() {
@@ -2330,7 +2330,7 @@ impl DatadirModification<'_> {
                     sparse_rel_dir_key,
                     Value::Image(RelDirExists::Exists.encode()),
                 );
-                tracing::info!(
+                tracing::debug!(
                     "migrated rel_size_v2: {}",
                     RelTag {
                         spcnode,
@@ -2342,7 +2342,7 @@ impl DatadirModification<'_> {
                 rel_cnt += 1;
             }
         }
-        tracing::info!(
+        tracing::debug!(
             "initialized rel_size_v2 keyspace at lsn {}: migrated {} relations",
             self.lsn,
             rel_cnt

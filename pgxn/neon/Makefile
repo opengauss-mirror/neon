@@ -123,6 +123,8 @@ override CXXFLAGS += -g3 -fno-omit-frame-pointer
 
 # Add Python include path for plpython.h
 # Python.h is located in OPENGAUSS_BINARYLIBS_DIR/kernel/platform/python3.7/include/python3.7m/
+# Default to the neon project's own binarylibs if OPENGAUSS_BINARYLIBS_DIR is not set.
+OPENGAUSS_BINARYLIBS_DIR ?= /usr1/neon/3rd/openGauss-third_party_binarylibs_openEuler_2203_arm
 PYTHON_INCLUDE_PATH := -I$(OPENGAUSS_BINARYLIBS_DIR)/kernel/platform/python3.7/include/python3.7m
 override CXXFLAGS += $(PYTHON_INCLUDE_PATH)
 

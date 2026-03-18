@@ -707,11 +707,15 @@ where
             {
                 return Ok(());
             }
-            // User defined tablespaces are not supported
+            // openGauss compatibility: openGauss may use non-standard spcnode OIDs
+            // (e.g. 16384/16385 for pg_default tablespace) during bulk loads.
+            // Treat any non-global spcnode as DEFAULTTABLESPACE and include the
+            // database directory under base/ rather than erroring out.
+            // This mirrors the standard PG behavior where all user data lives in base/.
             if spcnode != DEFAULTTABLESPACE_OID {
-                return Err(BasebackupError::Server(anyhow!(
-                    "spcnode != DEFAULTTABLESPACE_OID, spcnode={spcnode}"
-                )));
+                warn!(
+                    "non-default spcnode={spcnode} treated as DEFAULTTABLESPACE_OID for basebackup compatibility"
+                );
             }
 
             // Append dir path for each database

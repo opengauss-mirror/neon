@@ -26,7 +26,7 @@ ICU_PREFIX_DIR := /usr/local/icu
 # We differentiate between release / debug build types using the BUILD_TYPE
 # environment variable.
 #
-BUILD_TYPE ?= debug
+BUILD_TYPE ?= release
 WITH_SANITIZERS ?= no
 PG_CFLAGS = -fsigned-char
 ifeq ($(BUILD_TYPE),release)

@@ -392,18 +392,18 @@ pub mod waldecoder {
         }
 
         pub fn feed_bytes(&mut self, buf: &[u8]) {
-            // TESTDBG: Log input data to decoder
+            // Log input data to decoder (trace level, off by default)
             if !buf.is_empty() {
-                tracing::info!(
-                    "TESTDBG WalStreamDecoder::feed_bytes: lsn={}, buf_len={}, first_32_bytes={:02x?}",
+                tracing::trace!(
+                    "WalStreamDecoder::feed_bytes: lsn={}, buf_len={}, first_32_bytes={:02x?}",
                     self.lsn,
                     buf.len(),
                     &buf[..std::cmp::min(buf.len(), 32)]
                 );
                 // Also print end bytes if buffer is longer
                 if buf.len() > 64 {
-                    tracing::info!(
-                        "TESTDBG WalStreamDecoder::feed_bytes: last_32_bytes={:02x?}",
+                    tracing::trace!(
+                        "WalStreamDecoder::feed_bytes: last_32_bytes={:02x?}",
                         &buf[buf.len()-32..]
                     );
                 }
@@ -424,7 +424,7 @@ pub mod waldecoder {
                 })
             );
             
-            // TESTDBG: Log decoded record
+            // Log decoded record (trace level, off by default)
             match &result {
                 Ok(Some((next_lsn, recdata))) => {
                     // Parse the XLogRecord header for logging
@@ -438,8 +438,8 @@ pub mod waldecoder {
                         let xl_bucket_id = u16::from_le_bytes([recdata[26], recdata[27]]);
                         let xl_crc = u32::from_le_bytes([recdata[28], recdata[29], recdata[30], recdata[31]]);
                         
-                        tracing::info!(
-                            "TESTDBG WalStreamDecoder::poll_decode: SUCCESS next_lsn={}, record_len={}, xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
+                        tracing::trace!(
+                            "WalStreamDecoder::poll_decode: SUCCESS next_lsn={}, record_len={}, xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
                             next_lsn,
                             recdata.len(),
                             xl_tot_len,
@@ -454,17 +454,17 @@ pub mod waldecoder {
                         
                         // Print the full record in hex for complete comparison
                         if recdata.len() <= 256 {
-                            tracing::info!(
-                                "TESTDBG WalStreamDecoder::poll_decode: record_hex={:02x?}",
+                            tracing::trace!(
+                                "WalStreamDecoder::poll_decode: record_hex={:02x?}",
                                 &recdata[..]
                             );
                         } else {
-                            tracing::info!(
-                                "TESTDBG WalStreamDecoder::poll_decode: record_hex (first 128)={:02x?}",
+                            tracing::trace!(
+                                "WalStreamDecoder::poll_decode: record_hex (first 128)={:02x?}",
                                 &recdata[..128]
                             );
-                            tracing::info!(
-                                "TESTDBG WalStreamDecoder::poll_decode: record_hex (last 64)={:02x?}",
+                            tracing::trace!(
+                                "WalStreamDecoder::poll_decode: record_hex (last 64)={:02x?}",
                                 &recdata[recdata.len()-64..]
                             );
                         }
@@ -475,7 +475,7 @@ pub mod waldecoder {
                 }
                 Err(e) => {
                     tracing::error!(
-                        "TESTDBG WalStreamDecoder::poll_decode: ERROR at lsn={}: {}",
+                        "WalStreamDecoder::poll_decode: ERROR at lsn={}: {}",
                         self.lsn,
                         e.msg
                     );

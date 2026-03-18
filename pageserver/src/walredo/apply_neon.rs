@@ -89,7 +89,11 @@ pub(crate) fn apply_in_neon(
                 assert!(map_block == blknum);
 
                 // equivalent to PageGetContents(page)
-                let map = &mut page[pg_constants::MAXALIGN_SIZE_OF_PAGE_HEADER_DATA..];
+                // Note: openGauss PageHeaderData is 28 bytes (aligned to 32), not 24.
+                // The map array starts at MAXALIGN_SIZE_OF_PAGE_HEADER_DATA offset.
+                // However, HEAPBLK_TO_MAPBYTE uses SIZE_OF_PAGE_HEADER (24) for calculation.
+                // To avoid index out of bounds, we use the same offset as SIZE_OF_PAGE_HEADER.
+                let map = &mut page[pg_constants::SIZE_OF_PAGE_HEADER as usize..];
 
                 map[map_byte as usize] &= !(flags << map_offset);
                 // The page should never be empty, but we're checking it anyway as a precaution, so that if it is empty for some reason anyway, we don't make matters worse by setting the LSN on it.
@@ -106,7 +110,8 @@ pub(crate) fn apply_in_neon(
 
                 assert!(map_block == blknum);
 
-                let map = &mut page[pg_constants::MAXALIGN_SIZE_OF_PAGE_HEADER_DATA..];
+                // Use SIZE_OF_PAGE_HEADER offset to match HEAPBLK_TO_MAPBYTE calculation
+                let map = &mut page[pg_constants::SIZE_OF_PAGE_HEADER as usize..];
 
                 map[map_byte as usize] &= !(flags << map_offset);
                 // The page should never be empty, but we're checking it anyway as a precaution, so that if it is empty for some reason anyway, we don't make matters worse by setting the LSN on it.

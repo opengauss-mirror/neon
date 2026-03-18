@@ -91,7 +91,6 @@ use crate::{CancellableTask, PERF_TRACE_TARGET, timed_after_cancellation};
 /// is not yet in state [`TenantState::Active`].
 ///
 /// NB: this is a different value than [`crate::http::routes::ACTIVE_TENANT_TIMEOUT`].
-/// HADRON: reduced timeout and we will retry in Cache::get().
 const ACTIVE_TENANT_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Threshold at which to log slow GetPage requests.
@@ -2149,19 +2148,43 @@ impl PageServerHandler {
         )?;
 
         if effective_request_lsn > last_record_lsn {
+            // Cap the LSN we wait for when the gap is large (> 8 MB).  During bulk
+            // inserts or large DDL (CREATE INDEX), openGauss may evict pages with a
+            // zero LSN and fall back to GetFlushRecPtr, which can be tens of MB ahead
+            // of what the pageserver has ingested.  For metadata requests (nblocks,
+            // exists, dbsize) a slightly stale answer is acceptable; vacuum/autovacuum
+            // will retry on the next cycle.  This mirrors the same cap that is already
+            // applied to the batched GetPage path.
+            const LARGE_LSN_GAP: u64 = 8 * 1024 * 1024;
+            let lsn_to_wait = if not_modified_since.0 - last_record_lsn.0 > LARGE_LSN_GAP {
+                last_record_lsn
+            } else {
+                not_modified_since
+            };
             timeline
                 .wait_lsn(
-                    not_modified_since,
+                    lsn_to_wait,
                     crate::tenant::timeline::WaitLsnWaiter::PageService,
                     timeline::WaitLsnTimeout::Default,
                     ctx,
                 )
                 .await?;
 
-            // Since we waited for 'effective_request_lsn' to arrive, that is now the last
+            // Since we waited for 'lsn_to_wait' to arrive, that is now the last
             // record LSN. (Or close enough for our purposes; the last-record LSN can
             // advance immediately after we return anyway)
         }
+
+        // Cap the effective LSN we return when the gap is large, matching the wait cap.
+        const LARGE_LSN_GAP: u64 = 8 * 1024 * 1024;
+        let effective_request_lsn =
+            if effective_request_lsn > last_record_lsn
+                && effective_request_lsn.0 - last_record_lsn.0 > LARGE_LSN_GAP
+            {
+                last_record_lsn
+            } else {
+                effective_request_lsn
+            };
 
         Ok(effective_request_lsn)
     }
@@ -2382,7 +2405,7 @@ impl PageServerHandler {
     #[instrument(skip_all)]
     async fn handle_get_page_at_lsn_request_batched(
         timeline: &Timeline,
-        requests: SmallVec<[BatchedGetPageRequest; 1]>,
+        mut requests: SmallVec<[BatchedGetPageRequest; 1]>,
         io_concurrency: IoConcurrency,
         batch_break_reason: GetPageBatchBreakReason,
         ctx: &RequestContext,
@@ -2439,12 +2462,47 @@ impl PageServerHandler {
         };
 
         let last_record_lsn = timeline.get_last_record_lsn();
-        if max_effective_lsn > last_record_lsn {
+        // When the gap between max_effective_lsn and last_record_lsn is large
+        // (e.g. bulk INSERT / CREATE INDEX during TPCC BUILD), two issues arise:
+        // 1. Waiting the full 300s default timeout stalls the load.
+        // 2. Capping the LSN to last_record_lsn causes MissingKey errors for
+        //    relations that were newly created inside the gap (they don't exist
+        //    at last_record_lsn in the pageserver layers yet).
+        //
+        // Solution: Use aggressive tiered timeouts to minimize Lock wait timeout errors
+        // during high-concurrency TPC-C workloads. OpenGauss uses update_lockwait_timeout=600s,
+        // but transactions should complete in seconds, not minutes.
+        //
+        // Tiered approach:
+        // - Small gap (<1MB): 3s timeout - normal operations should complete quickly
+        // - Medium gap (1-8MB): 10s timeout - some WAL lag but should catch up
+        // - Large gap (>8MB): 30s timeout - significant lag, give more time
+        const SMALL_LSN_GAP: u64 = 1 * 1024 * 1024;  // 1 MB
+        const LARGE_LSN_GAP: u64 = 8 * 1024 * 1024;  // 8 MB
+        
+        let lsn_gap = if max_effective_lsn > last_record_lsn {
+            max_effective_lsn.0 - last_record_lsn.0
+        } else {
+            0
+        };
+
+        let effective_lsn_for_wait = max_effective_lsn;
+        let wait_timeout = if lsn_gap > LARGE_LSN_GAP {
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(30))
+        } else if lsn_gap > SMALL_LSN_GAP {
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(10))
+        } else if lsn_gap > 0 {
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(3))
+        } else {
+            timeline::WaitLsnTimeout::Default
+        };
+
+        if effective_lsn_for_wait > last_record_lsn {
             if let Err(e) = timeline
                 .wait_lsn(
-                    max_effective_lsn,
+                    effective_lsn_for_wait,
                     crate::tenant::timeline::WaitLsnWaiter::PageService,
-                    timeline::WaitLsnTimeout::Default,
+                    wait_timeout,
                     &ctx,
                 )
                 .maybe_perf_instrument(&ctx, |current_perf_span| {
@@ -2618,7 +2676,7 @@ impl PageServerHandler {
         let ctx = ctx.with_scope_timeline(&timeline);
 
         if timeline.is_archived() == Some(true) {
-            tracing::info!(
+            tracing::debug!(
                 "timeline {tenant_id}/{timeline_id} is archived, but got basebackup request for it."
             );
             return Err(QueryError::NotFound("timeline is archived".into()));

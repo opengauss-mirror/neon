@@ -80,6 +80,14 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         flavor,
     } = args;
     let mut initdb_command = tokio::process::Command::new(initdb_bin_path);
+    
+    // Get the bin directory from initdb_bin_path to set GAUSSHOME
+    let gausshome = initdb_bin_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string())
+        .unwrap_or_default();
+    
     initdb_command
         .args(["--pgdata", pgdata.as_ref()])
         .args(["--username", superuser])
@@ -88,6 +96,14 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         .env_clear()
         .env("LD_LIBRARY_PATH", library_search_path)
         .env("DYLD_LIBRARY_PATH", library_search_path)
+        // openGauss gs_initdb needs HOME and USER to identify current directory
+        .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+        .env("USER", std::env::var("USER").unwrap_or_else(|_| "neon".to_string()))
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // openGauss needs GAUSSHOME set
+        .env("GAUSSHOME", &gausshome)
+        // Set working directory to pgdata parent to avoid "could not identify current directory"
+        .current_dir(pgdata.parent().unwrap_or(pgdata.as_ref()))
         .env(
             "ASAN_OPTIONS",
             std::env::var("ASAN_OPTIONS").unwrap_or_default(),

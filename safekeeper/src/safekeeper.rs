@@ -1295,7 +1295,7 @@ where
         msg: &AppendRequest,
         require_flush: bool,
     ) -> Result<Option<AcceptorProposerMessage>> {
-        // TESTDBG: Log received WAL data with XLogRecord parsing
+        // Log received WAL data with XLogRecord parsing
         // openGauss WAL structure constants:
         // - XLOG_BLCKSZ = 8192 (page size)
         // - XLogPageHeaderData = 24 bytes (xlp_magic:2 + xlp_info:2 + xlp_tli:4 + xlp_pageaddr:8 + xlp_rem_len:4 + xlp_total_len:4)
@@ -1311,8 +1311,8 @@ where
         const XLOG_PAGE_MAGIC: u16 = 0xD074; // openGauss page magic (53364)
         
         if !msg.wal_data.is_empty() {
-            info!(
-                "TESTDBG safekeeper RECV: begin_lsn={}, end_lsn={}, wal_data_len={}",
+            trace!(
+                "safekeeper RECV: begin_lsn={}, end_lsn={}, wal_data_len={}",
                 msg.h.begin_lsn, msg.h.end_lsn, msg.wal_data.len()
             );
             
@@ -1349,8 +1349,8 @@ where
                         let is_long_header = (xlp_info & XLP_LONG_HEADER) != 0;
                         let actual_hdr_size = if is_long_header { XLOG_SIZE_OF_XLOG_LONG_PHD } else { XLOG_SIZE_OF_XLOG_SHORT_PHD };
                         
-                        info!(
-                            "TESTDBG safekeeper RECV: PAGE_HEADER at LSN={:X}/{:X} offset={}: xlp_magic=0x{:04X}, xlp_info=0x{:04X}, xlp_tli={}, xlp_pageaddr={:X}/{:X}, xlp_rem_len={}, xlp_total_len={}, hdr_size={}",
+                        trace!(
+                            "safekeeper RECV: PAGE_HEADER at LSN={:X}/{:X} offset={}: xlp_magic=0x{:04X}, xlp_info=0x{:04X}, xlp_tli={}, xlp_pageaddr={:X}/{:X}, xlp_rem_len={}, xlp_total_len={}, hdr_size={}",
                             (current_lsn >> 32) as u32, current_lsn as u32,
                             offset,
                             xlp_magic,
@@ -1364,8 +1364,8 @@ where
                         
                         // Validate page magic
                         if xlp_magic != XLOG_PAGE_MAGIC {
-                            info!(
-                                "TESTDBG safekeeper RECV: WARNING - unexpected page magic 0x{:04X} (expected 0x{:04X})",
+                            trace!(
+                                "safekeeper RECV: WARNING - unexpected page magic 0x{:04X} (expected 0x{:04X})",
                                 xlp_magic, XLOG_PAGE_MAGIC
                             );
                         }
@@ -1374,8 +1374,8 @@ where
                         current_lsn += actual_hdr_size as u64;
                         continue;
                     } else {
-                        info!(
-                            "TESTDBG safekeeper RECV: insufficient data for page header at offset={}, remaining={}",
+                        trace!(
+                            "safekeeper RECV: insufficient data for page header at offset={}, remaining={}",
                             offset, data.len()
                         );
                         break;
@@ -1384,8 +1384,8 @@ where
                 
                 // Not at page boundary, try to parse XLogRecord
                 if data.len() < XLOG_SIZE_OF_XLOG_RECORD {
-                    info!(
-                        "TESTDBG safekeeper RECV: insufficient data for XLogRecord at offset={}, remaining={}",
+                    trace!(
+                        "safekeeper RECV: insufficient data for XLogRecord at offset={}, remaining={}",
                         offset, data.len()
                     );
                     break;
@@ -1403,8 +1403,8 @@ where
                 
                 // Sanity check for xl_tot_len
                 if xl_tot_len < XLOG_SIZE_OF_XLOG_RECORD as u32 || xl_tot_len > 10 * 1024 * 1024 {
-                    info!(
-                        "TESTDBG safekeeper RECV: record[{}] INVALID xl_tot_len={} at LSN={:X}/{:X} offset={}, remaining={}, raw_bytes={:02X?}",
+                    trace!(
+                        "safekeeper RECV: record[{}] INVALID xl_tot_len={} at LSN={:X}/{:X} offset={}, remaining={}, raw_bytes={:02X?}",
                         record_count, xl_tot_len,
                         (current_lsn >> 32) as u32, current_lsn as u32,
                         offset, data.len(),
@@ -1413,8 +1413,8 @@ where
                     break;
                 }
                 
-                info!(
-                    "TESTDBG safekeeper RECV: record[{}] at LSN={:X}/{:X}: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
+                trace!(
+                    "safekeeper RECV: record[{}] at LSN={:X}/{:X}: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
                     record_count,
                     (current_lsn >> 32) as u32, current_lsn as u32,
                     xl_tot_len,
@@ -1439,8 +1439,8 @@ where
                     current_lsn += aligned_len as u64;
                 } else {
                     // Record spans multiple pages - need to account for page headers
-                    info!(
-                        "TESTDBG safekeeper RECV: record[{}] spans pages: record_len={}, remaining_in_page={}",
+                    trace!(
+                        "safekeeper RECV: record[{}] spans pages: record_len={}, remaining_in_page={}",
                         record_count, record_len, remaining_in_page
                     );
                     
@@ -1455,7 +1455,7 @@ where
                 
                 // Limit output
                 if record_count >= 5 {
-                    info!("TESTDBG safekeeper RECV: ... (truncated, {} bytes remaining)", msg.wal_data.len().saturating_sub(offset));
+                    trace!("safekeeper RECV: ... (truncated, {} bytes remaining)", msg.wal_data.len().saturating_sub(offset));
                     break;
                 }
             }

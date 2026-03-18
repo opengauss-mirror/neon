@@ -844,7 +844,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
             };
             let send_buf = &send_buf[..send_size];
 
-            // TESTDBG: Log WAL data being sent with XLogRecord parsing
+            // Log WAL data being sent with XLogRecord parsing (trace level, off by default)
             // openGauss WAL structure constants:
             // - XLOG_BLCKSZ = 8192 (page size)
             // - XLogPageHeaderData = 24 bytes
@@ -860,8 +860,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
             const XLOG_PAGE_MAGIC: u16 = 0xD074; // openGauss page magic (53364)
             
             if !send_buf.is_empty() {
-                info!(
-                    "TESTDBG safekeeper SEND: start_pos={}, end_pos={}, send_size={}",
+                trace!(
+                    "safekeeper SEND: start_pos={}, end_pos={}, send_size={}",
                     self.start_pos, self.end_pos, send_size
                 );
                 
@@ -898,8 +898,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                             let is_long_header = (xlp_info & XLP_LONG_HEADER) != 0;
                             let actual_hdr_size = if is_long_header { XLOG_SIZE_OF_XLOG_LONG_PHD } else { XLOG_SIZE_OF_XLOG_SHORT_PHD };
                             
-                            info!(
-                                "TESTDBG safekeeper SEND: PAGE_HEADER at LSN={:X}/{:X} offset={}: xlp_magic=0x{:04X}, xlp_info=0x{:04X}, xlp_tli={}, xlp_pageaddr={:X}/{:X}, xlp_rem_len={}, xlp_total_len={}, hdr_size={}",
+                            trace!(
+                                "safekeeper SEND: PAGE_HEADER at LSN={:X}/{:X} offset={}: xlp_magic=0x{:04X}, xlp_info=0x{:04X}, xlp_tli={}, xlp_pageaddr={:X}/{:X}, xlp_rem_len={}, xlp_total_len={}, hdr_size={}",
                                 (current_lsn >> 32) as u32, current_lsn as u32,
                                 offset,
                                 xlp_magic,
@@ -913,8 +913,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                             
                             // Validate page magic
                             if xlp_magic != XLOG_PAGE_MAGIC {
-                                info!(
-                                    "TESTDBG safekeeper SEND: WARNING - unexpected page magic 0x{:04X} (expected 0x{:04X})",
+                                trace!(
+                                    "safekeeper SEND: WARNING - unexpected page magic 0x{:04X} (expected 0x{:04X})",
                                     xlp_magic, XLOG_PAGE_MAGIC
                                 );
                             }
@@ -923,8 +923,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                             current_lsn += actual_hdr_size as u64;
                             continue;
                         } else {
-                            info!(
-                                "TESTDBG safekeeper SEND: insufficient data for page header at offset={}, remaining={}",
+                            trace!(
+                                "safekeeper SEND: insufficient data for page header at offset={}, remaining={}",
                                 offset, data.len()
                             );
                             break;
@@ -933,8 +933,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                     
                     // Not at page boundary, try to parse XLogRecord
                     if data.len() < XLOG_SIZE_OF_XLOG_RECORD {
-                        info!(
-                            "TESTDBG safekeeper SEND: insufficient data for XLogRecord at offset={}, remaining={}",
+                        trace!(
+                            "safekeeper SEND: insufficient data for XLogRecord at offset={}, remaining={}",
                             offset, data.len()
                         );
                         break;
@@ -952,8 +952,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                     
                     // Sanity check for xl_tot_len
                     if xl_tot_len < XLOG_SIZE_OF_XLOG_RECORD as u32 || xl_tot_len > 10 * 1024 * 1024 {
-                        info!(
-                            "TESTDBG safekeeper SEND: record[{}] INVALID xl_tot_len={} at LSN={:X}/{:X} offset={}, remaining={}, raw_bytes={:02X?}",
+                        trace!(
+                            "safekeeper SEND: record[{}] INVALID xl_tot_len={} at LSN={:X}/{:X} offset={}, remaining={}, raw_bytes={:02X?}",
                             record_count, xl_tot_len,
                             (current_lsn >> 32) as u32, current_lsn as u32,
                             offset, data.len(),
@@ -962,8 +962,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                         break;
                     }
                     
-                    info!(
-                        "TESTDBG safekeeper SEND: record[{}] at LSN={:X}/{:X}: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
+                    trace!(
+                        "safekeeper SEND: record[{}] at LSN={:X}/{:X}: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={:X}/{:X}, xl_info=0x{:02X}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08X}",
                         record_count,
                         (current_lsn >> 32) as u32, current_lsn as u32,
                         xl_tot_len,
@@ -988,8 +988,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                         current_lsn += aligned_len as u64;
                     } else {
                         // Record spans multiple pages
-                        info!(
-                            "TESTDBG safekeeper SEND: record[{}] spans pages: record_len={}, remaining_in_page={}",
+                        trace!(
+                            "safekeeper SEND: record[{}] spans pages: record_len={}, remaining_in_page={}",
                             record_count, record_len, remaining_in_page
                         );
                         
@@ -1002,7 +1002,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                     
                     // Limit output
                     if record_count >= 5 {
-                        info!("TESTDBG safekeeper SEND: ... (truncated, {} bytes remaining)", send_buf.len() - offset);
+                        trace!("safekeeper SEND: ... (truncated, {} bytes remaining)", send_buf.len() - offset);
                         break;
                     }
                 }
