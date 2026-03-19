@@ -435,21 +435,21 @@ impl Storage for PhysicalStorage {
 
     /// Write WAL to disk.
     async fn write_wal(&mut self, startpos: Lsn, buf: &[u8]) -> Result<()> {
-        // TESTDBG: Log WAL data being written to disk
+        // Log WAL data being written to disk (trace level, off by default)
         if !buf.is_empty() {
-            info!(
-                "TESTDBG wal_storage::write_wal: startpos={}, buf_len={}, write_lsn={}",
+            trace!(
+                "wal_storage::write_wal: startpos={}, buf_len={}, write_lsn={}",
                 startpos, buf.len(), self.write_lsn
             );
             // Print first 64 bytes
-            info!(
-                "TESTDBG wal_storage::write_wal: first_64_bytes={:02x?}",
+            trace!(
+                "wal_storage::write_wal: first_64_bytes={:02x?}",
                 &buf[..std::cmp::min(buf.len(), 64)]
             );
             // Print last 64 bytes if buffer is longer
             if buf.len() > 128 {
-                info!(
-                    "TESTDBG wal_storage::write_wal: last_64_bytes={:02x?}",
+                trace!(
+                    "wal_storage::write_wal: last_64_bytes={:02x?}",
                     &buf[buf.len()-64..]
                 );
             }

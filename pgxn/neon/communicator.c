@@ -1417,7 +1417,13 @@ Retry:
 				{
 					/* Wait for the old request to finish and discard it */
 					if (!prefetch_wait_for(last_ring_index))
+					{
+						/* Connection failed - clean up the request before retry */
+						prefetch_set_unused(last_ring_index);
+						pgBufferUsage.prefetch.expired += 1;
+						MyNeonCounters->getpage_prefetch_discards_total += 1;
 						goto Retry;
+					}
 					prefetch_set_unused(last_ring_index);
 					entry = NULL;
 					slot = NULL;
@@ -1508,7 +1514,13 @@ Retry:
 					case PRFS_REQUESTED:
 						Assert(MyPState->ring_receive == cleanup_index);
 						if (!prefetch_wait_for(cleanup_index))
+						{
+							/* Connection failed - clean up before retry */
+							prefetch_set_unused(cleanup_index);
+							pgBufferUsage.prefetch.expired += 1;
+							MyNeonCounters->getpage_prefetch_discards_total += 1;
 							goto Retry;
+						}
 						prefetch_set_unused(cleanup_index);
 						pgBufferUsage.prefetch.expired += 1;
 						MyNeonCounters->getpage_prefetch_discards_total += 1;
@@ -2326,6 +2338,7 @@ communicator_read_at_lsnv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber ba
 	PrfHashEntry *entry;
 	PrefetchRequest *slot;
 	PrefetchRequest hashkey;
+	bool		wait_success = false;
 
 	Assert(PointerIsValid(request_lsns));
 	Assert(nblocks >= 1);
@@ -2363,6 +2376,7 @@ communicator_read_at_lsnv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber ba
 		BlockNumber blockno = base_blockno + i;
 		neon_request_lsns *reqlsns = &request_lsns[i];
 		TimestampTz		start_ts, end_ts;
+		int			read_error_retries = 0;
 
 		if (PointerIsValid(mask) && BITMAP_ISSET(mask, i))
 			continue;
@@ -2399,7 +2413,13 @@ Retry:
 				if (slot->status == PRFS_REQUESTED)
 				{
 					if (!prefetch_wait_for(slot->my_ring_index))
+					{
+						/* Connection failed - clean up before retry */
+						prefetch_set_unused(slot->my_ring_index);
+						pgBufferUsage.prefetch.expired += 1;
+						MyNeonCounters->getpage_prefetch_discards_total++;
 						goto Retry;
+					}
 				}
 				/* drop caches */
 				prefetch_set_unused(slot->my_ring_index);
@@ -2436,7 +2456,43 @@ Retry:
 			Assert(slot->status != PRFS_UNUSED);
 			Assert(GetPrfSlot(ring_index) == slot);
 
-		} while (!prefetch_wait_for(ring_index));
+			wait_success = prefetch_wait_for(ring_index);
+			if (!wait_success)
+			{
+				/*
+				 * Connection failed - clean up the prefetch request so that
+				 * the next iteration creates a new request and triggers reconnection.
+				 * Follow the same cleanup logic as prefetch_on_ps_disconnect().
+				 */
+				/* 
+				 * Clean up all pending REQUESTED slots from ring_receive up to ring_unused
+				 * This is exactly what prefetch_on_ps_disconnect does.
+				 */
+				while (MyPState->ring_receive < MyPState->ring_unused)
+				{
+					uint64 cleanup_ring_index = MyPState->ring_receive;
+					PrefetchRequest *cleanup_slot = GetPrfSlotNoCheck(cleanup_ring_index);
+					if (cleanup_slot->status == PRFS_REQUESTED)
+					{
+						/* Disconnect shard to ensure proper reconnection */
+						if (page_server->disconnect != NULL)
+							page_server->disconnect(cleanup_slot->shard_no);
+
+						cleanup_slot->status = PRFS_TAG_REMAINS;
+						MyPState->n_requests_inflight -= 1;
+						MyPState->ring_receive += 1;
+						prefetch_set_unused(cleanup_ring_index);
+						pgBufferUsage.prefetch.expired += 1;
+						MyNeonCounters->getpage_prefetch_discards_total++;
+					}
+					else
+					{
+						break;
+					}
+				}
+				entry = NULL;
+			}
+		} while (!wait_success);
 
 		Assert(slot->status == PRFS_RECEIVED);
 		Assert(memcmp(&hashkey.buftag, &slot->buftag, sizeof(BufferTag)) == 0);
@@ -2462,14 +2518,39 @@ Retry:
 				break;
 			}
 			case T_NeonErrorResponse:
+			{
+				NeonErrorResponse *err_resp = (NeonErrorResponse *) resp;
+				/*
+				 * Pageserver may return "Read error: could not find data for
+				 * key" when the key's data is in an open (not-yet-flushed)
+				 * layer.  This is transient: the layer flushes shortly.
+				 * Retry up to 120 times (500 ms each, 60 s total).
+				 *
+				 * Also retry any "Read error" to handle the same class of
+				 * timing issues.
+				 */
+				if (read_error_retries < 240 &&
+					(strstr(err_resp->message, "could not find data for key") != NULL ||
+					 strncmp(err_resp->message, "Read error", 10) == 0))
+				{
+					neon_log(LOG,
+							 NEON_TAG "transient Read error for block %u (retry %d/240): %s",
+							 blockno, read_error_retries + 1, err_resp->message);
+					prefetch_set_unused(ring_index);
+					prefetch_cleanup_trailing_unused();
+					read_error_retries++;
+					pg_usleep(500000L); /* 500 ms */
+					goto Retry;
+				}
 				ereport(ERROR,
 						(errcode(ERRCODE_IO_ERROR),
 						 errmsg(NEON_TAG "[shard %d, reqid " UINT64_HEX_FORMAT "] could not read block %u in rel %u/%u/%u.%u from page server at lsn %X/%08X",
 								slot->shard_no, resp->reqid, blockno, RelFileInfoFmt(rinfo),
 								forkNum, LSN_FORMAT_ARGS(reqlsns->effective_request_lsn)),
 						 errdetail("page server returned error: %s",
-								   ((NeonErrorResponse *) resp)->message)));
+								   err_resp->message)));
 				break;
+			}
 			default:
 				NEON_PANIC_CONNECTION_STATE(slot->shard_no, PANIC,
 											"Expected GetPage (0x%02x) or Error (0x%02x) response to GetPageRequest, but got 0x%02x",

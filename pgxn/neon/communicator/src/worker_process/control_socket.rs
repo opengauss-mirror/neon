@@ -57,7 +57,7 @@ impl CommunicatorWorkerProcessStruct {
         let listener = UnixListener::bind(NEON_COMMUNICATOR_SOCKET_NAME)?;
 
         tokio::spawn(async {
-            tracing::info!("control socket listener spawned");
+            tracing::debug!("control socket listener spawned");
             axum::serve(listener, app)
                 .await
                 .expect("axum::serve never returns")

@@ -157,6 +157,9 @@ fn main() -> anyhow::Result<()> {
                 opengauss_binarylibs_dir
             );
             builder = builder.clang_arg(python_include);
+        } else {
+            // Fallback: try to find Python.h in common locations
+            builder = builder.clang_arg("-I/usr/include/python3.9");
         }
 
         //

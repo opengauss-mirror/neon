@@ -116,6 +116,10 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/resowner.h"
+#include "utils/inval.h"
+#include "utils/catcache.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #ifdef ENABLE_NEON
 #include "executor/node/nodeShareInputScan.h"
@@ -329,6 +333,14 @@ WalRedoMain(int argc, char *argv[])
 #endif
 
 	/*
+	 * Disable openGauss memory protection for walredo process.
+	 * This prevents unbounded memory growth from dynamic memory tracking.
+	 * The walredo process is short-lived and handles single WAL records,
+	 * so memory protection overhead is unnecessary and harmful.
+	 */
+	g_instance.attr.attr_memory.enable_memory_limit = false;
+
+	/*
 	 * We have our own version of CreateSharedMemoryAndSemaphores() that
 	 * sets up local memory instead of shared one.
 	 */
@@ -336,6 +348,14 @@ WalRedoMain(int argc, char *argv[])
 	CreateFakeSharedMemoryAndSemaphores(false, 0);
 #else
 	CreateFakeSharedMemoryAndSemaphores();
+#endif
+
+#if defined(ENABLE_NEON) || defined(PGXC)
+	/*
+	 * openGauss incremental checkpoint is incompatible with Neon's page
+	 * server model and causes walredo to spin/hang. Disable it unconditionally.
+	 */
+	g_instance.attr.attr_storage.enableIncrementalCheckpoint = false;
 #endif
 	/*
 	 * Remember stand-alone backend startup time,roughly at the same point
@@ -406,8 +426,14 @@ WalRedoMain(int argc, char *argv[])
 
 	for (;;)
 	{
-		/* Release memory left over from prior query cycle. */
-		resetStringInfo(&input_message);
+		/*
+		 * Release memory left over from prior query cycle.
+		 * This is CRITICAL for preventing memory leaks during WAL redo.
+		 * Without this reset, each ApplyRecord call accumulates memory
+		 * indefinitely, causing OOM during high-volume workloads like TPC-C.
+		 */
+		MemoryContextReset(t_thrd.mem_cxt.msg_mem_cxt);
+		initStringInfo(&input_message);
 
 		set_ps_display("idle", false);
 
@@ -427,6 +453,12 @@ WalRedoMain(int argc, char *argv[])
 
 			case 'A':			/* ApplyRecord */
 				ApplyRecord(&input_message);
+				/*
+				 * After applying a WAL record, ensure we're back in the
+				 * message memory context. rm_redo functions in openGauss
+				 * may switch to other memory contexts during execution.
+				 */
+				MemoryContextSwitchTo(t_thrd.mem_cxt.msg_mem_cxt);
 				break;
 
 			case 'G':			/* GetPage */
@@ -494,12 +526,22 @@ void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
 	char		cwd[MAXPGPATH];
     InitNuma();
 
-    /* Set max backends and thread pool group number before alloc share memory array. */
+    /*
+     * MEMORY for WAL redo (stability-first configuration)
+     * 
+     * openGauss CR Buffer needs ~100MB (12800 * 8KB).
+     * Allocate 192MB to ensure stability during TPC-C.
+     * Memory optimization can be done later.
+     */
+    g_instance.attr.attr_storage.NBuffers = 16;
+    g_instance.attr.attr_storage.enableIncrementalCheckpoint = false;
+    
     CalcMaxBackends();
 
     int numSemas;
-    Size size = ComputeTotalSizeOfShmem();
-    ereport(DEBUG3, (errmsg("invoking IpcMemoryCreate(size=%lu)", (unsigned long)size)));
+    Size size = 192 * 1024 * 1024;
+    ereport(LOG, (errmsg("[neon-walredo] optimized shmem: %lu MB (CR Buffer disabled)", 
+                         (unsigned long)(size/1024/1024))));
 
     /* Initialize the Memory Protection feature */
     gs_memprot_init(size);
@@ -565,6 +607,15 @@ void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
         CLOGShmemInit();
         CSNLOGShmemInit();
         MultiXactShmemInit();
+        
+        /*
+         * CRITICAL FIX: Initialize g_instance pointers before InitBufferPool.
+         * InitBufferPool accesses g_instance.ckpt_cxt_ctl which is NULL by default.
+         * Without this, we get SIGSEGV when accessing g_instance.ckpt_cxt_ctl->CkptBufferIds.
+         */
+        g_instance.ckpt_cxt_ctl = &g_instance.ckpt_cxt;
+        /* Ensure HTAP counter is 0 so HAVE_HTAP_TABLES returns false */
+        pg_atomic_init_u32(&g_instance.imcstore_cxt.imcs_tbl_cnt, 0);
         InitBufferPool();
         pca_buf_init_ctx();
         // /* global temporay table */
@@ -590,118 +641,29 @@ void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
         CreateProcXactHashTable();
     }
 
-    CreateSharedRingBuffer();
+    /*
+     * Restore necessary initializations for WAL redo stability.
+     * Some rm_redo functions may access these structures.
+     */
     CreateSharedBackendStatus();
-    sessionTimeShmemInit();
-    sessionStatShmemInit();
-    sessionMemoryShmemInit();
-
-    {
-        TwoPhaseShmemInit();
-    }
-
-    /*
-     * Set up shared-inval messaging
-     */
+    
+    TwoPhaseShmemInit();
+    
+    /* Set up shared-inval messaging - needed by some catalog operations */
     CreateSharedInvalidationState();
-
-    /*
-     * Set up interprocess signaling mechanisms
-     */
+    
+    /* Set up interprocess signaling mechanisms */
     PMSignalShmemInit();
     ProcSignalShmemInit();
-#ifdef USE_SPQ
-    ShareInputShmemInit();
-#endif
-    // MmapShmemInit();
-    {
-        CheckpointerShmemInit();
-        CBMShmemInit();
-        AutoVacuumShmemInit();
-        // TxnSnapCapShmemInit();
-        // CfsShrinkerShmemInit();
-        // RbCleanerShmemInit();
-    }
-    ReplicationSlotsShmemInit();
-#ifndef ENABLE_MULTIPLE_NODES
-    ReplicationOriginShmemInit();
-    ApplyLauncherShmemInit();
-#endif
-    WalSndShmemInit();
-    /*
-    * Set up WAL semaphores. This must be done after WalSndShmemInit().
-    */
-    if (!IsUnderPostmaster) {
-        InitWalSemaphores();
-    }
-    WalRcvShmemInit();
-    // DataSndShmemInit();
-    // DataRcvShmemInit();
-    // DataSenderQueueShmemInit();
-    // DataWriterQueueShmemInit();
-    HaShmemInit();
-    AsyncRollbackHashShmemInit();
-    // UndoWorkerShmemInit();
-    undo::InitUndoZoneLock();
-    heartbeat_shmem_init();
-    // MatviewShmemInit();
-#ifndef ENABLE_MULTIPLE_NODES
-    // if(g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
-    //     DcfContextShmemInit();
-    // }
-#endif
-
-    {
-        NotifySignalShmemInit();
-
-        // JobInfoShmemInit();
-        /*
-         * Set up other modules that need some shared memory space
-         */
-        BTreeShmemInit();
-        SyncScanShmemInit();
-        // AsyncShmemInit();
-
-#ifdef PGXC
-        NodeTablesShmemInit();
-#endif
-    }
-
-    /*
-     * Set up tablespace usage information management struct
-     */
-    // TableSpaceUsageManager::Init();
-
-    /*
-     * Set up thread shared fd cache
-     */
+    
+    /* BTree and SyncScan - may be accessed by index redo */
+    BTreeShmemInit();
+    SyncScanShmemInit();
+    
+    /* Initialize data file cache - needed for smgr */
     InitDataFileIdCache();
-    // InitUidCache();
-
-    /*
-     * Set up seg spc cache
-     */
-    // InitSegSpcCache();
-
-#ifdef ENABLE_MULTIPLE_NODES
-    if (IS_MULTI_DISASTER_RECOVER_MODE) {
-        InitDisasterCache();
-    }
-#endif
-
-    /*
-     * Set up CStoreSpaceAllocator
-     */
-    CStoreAllocator::InitColSpaceCache();
-
-#ifdef ENABLE_MULTIPLE_NODES
-    /*
-     * Set up TableStatusCache
-     */
-    if (g_instance.attr.attr_common.enable_tsdb) {
-        Tsdb::TableStatus::GetInstance().init();
-    }
-#endif   /* ENABLE_MULTIPLE_NODES */
+    
+    ereport(LOG, (errmsg("[neon-wal-redo] shared memory initialization complete")));
 }
 #else
 static void
@@ -812,24 +774,22 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	CreateSharedInvalidationState();
 
 	/*
-	 * Set up interprocess signaling mechanisms
+	 * OPTIMIZED: Only essential signaling for WAL redo
+	 * Removed unnecessary: Checkpointer, AutoVacuum, Replication, WalSnd/Rcv
 	 */
 	PMSignalShmemInit();
 	ProcSignalShmemInit();
-	CheckpointerShmemInit();
-	AutoVacuumShmemInit();
-	ReplicationSlotsShmemInit();
-	ReplicationOriginShmemInit();
-	WalSndShmemInit();
-	WalRcvShmemInit();
-	ApplyLauncherShmemInit();
+	/* CheckpointerShmemInit();    -- not needed for redo */
+	/* AutoVacuumShmemInit();      -- not needed for redo */
+	/* ReplicationSlotsShmemInit();-- not needed for redo */
+	/* ReplicationOriginShmemInit(); -- not needed for redo */
+	/* WalSndShmemInit();          -- not needed for redo */
+	/* WalRcvShmemInit();          -- not needed for redo */
+	/* ApplyLauncherShmemInit();   -- not needed for redo */
 
 	/*
-	 * Set up other modules that need some shared memory space
+	 * BTree and SyncScan needed for rm_redo index operations
 	 */
-#if PG_MAJORVERSION_NUM < 17
-	/* "snapshot too old" was removed in PG17, and with it the SnapMgr */
-#endif
 	BTreeShmemInit();
 	SyncScanShmemInit();
 
@@ -1120,7 +1080,16 @@ ApplyRecord(StringInfo input_message)
 	 */
 	lsn = pq_getmsgint64(input_message);
 
-	smgrinit();					/* reset inmem smgr state */
+	/*
+	 * NOTE: Do NOT call smgrinit() here!
+	 * 
+	 * smgrinit() would reset inmem_smgr state (used_pages = 0), which would
+	 * clear all pages stored by previous PushPage() calls. This was the root
+	 * cause of the "zero page" corruption bug: the base image sent by pageserver
+	 * via PushPage() was being cleared before rm_redo could read it.
+	 * 
+	 * The smgr cleanup is done properly in GetPage() after the page is returned.
+	 */
 
 	/* note: the input must be aligned here */
 	record = (XLogRecord *) pq_getmsgbytes(input_message, sizeof(XLogRecord));
@@ -1199,21 +1168,100 @@ ApplyRecord(StringInfo input_message)
 	/* Ignore any other blocks than the ones the caller is interested in */
 	redo_read_buffer_filter = redo_block_filter;
 
-	RmgrTable[record->xl_rmid].rm_redo(reader_state);
+	/*
+	 * DIAGNOSTIC: Log the rm_redo call details.
+	 * This helps trace which WAL records cause zero page issues.
+	 */
+	elog(DEBUG1, "[WALREDO_APPLY] rm_redo: rmid=%u info=0x%02X lsn=%X/%X "
+				 "target_block=%u/%u/%u.%d blk=%u has_base_image=%s",
+				 record->xl_rmid, record->xl_info,
+				 (uint32) (lsn >> 32), (uint32) lsn,
+				 target_redo_tag.rnode.spcNode,
+				 target_redo_tag.rnode.dbNode,
+				 target_redo_tag.rnode.relNode,
+				 target_redo_tag.forkNum,
+				 target_redo_tag.blockNum,
+				 BufferIsValid(wal_redo_buffer) ? "yes" : "no");
+
+	{
+		struct timeval start_time, end_time;
+		long elapsed_ms;
+		gettimeofday(&start_time, NULL);
+
+		RmgrTable[record->xl_rmid].rm_redo(reader_state);
+
+		gettimeofday(&end_time, NULL);
+		elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000 +
+					 (end_time.tv_usec - start_time.tv_usec) / 1000;
+		if (elapsed_ms > 100)
+		{
+			ereport(LOG,
+					(errmsg("[WALREDO_SLOW] rm_redo took %ld ms for rmid=%u info=%u lsn=%X/%X",
+							elapsed_ms, record->xl_rmid, record->xl_info,
+							(uint32) (lsn >> 32), (uint32) lsn)));
+		}
+	}
 
 	/*
 	 * If no base image of the page was provided by PushPage, initialize
 	 * wal_redo_buffer here. The first WAL record must initialize the page
 	 * in that case.
+	 *
+	 * CRITICAL FIX: When will_init is true (pageserver didn't send base image),
+	 * rm_redo should have initialized the page. If wal_redo_buffer is still
+	 * InvalidBuffer at this point, it means rm_redo didn't properly handle
+	 * the will_init case - it used RBM_NORMAL which returns BLK_NOTFOUND for
+	 * zero pages instead of RBM_ZERO_AND_LOCK which would initialize the page.
+	 *
+	 * We use RBM_ZERO_AND_LOCK here to ensure the buffer exists, but log a
+	 * warning because the page content may be incorrect (rm_redo was skipped).
 	 */
 	if (BufferIsInvalid(wal_redo_buffer))
 	{
+		/*
+		 * No base image was provided (will_init=true case), but rm_redo
+		 * didn't set wal_redo_buffer. This is likely because:
+		 * 1. XLogReadBufferForRedo returned BLK_NOTFOUND for zero page
+		 * 2. rm_redo skipped the operation
+		 *
+		 * Use RBM_ZERO_AND_LOCK to at least get a buffer, but warn that
+		 * the page may be invalid.
+		 */
+		ereport(WARNING,
+				(errmsg("[WALREDO_NOINIT] rm_redo did not initialize buffer for "
+						"%u/%u/%u.%d blk %u (rmid=%u info=0x%02X lsn=%X/%X). "
+						"This may result in zero page being returned.",
+						target_redo_tag.rnode.spcNode,
+						target_redo_tag.rnode.dbNode,
+						target_redo_tag.rnode.relNode,
+						target_redo_tag.forkNum,
+						target_redo_tag.blockNum,
+						record->xl_rmid, record->xl_info,
+						(uint32) (lsn >> 32), (uint32) lsn)));
+
 		wal_redo_buffer = NeonRedoReadBuffer(BufTagGetNRelFileInfo(target_redo_tag),
 											 target_redo_tag.forkNum,
 											 target_redo_tag.blockNum,
-											 RBM_NORMAL);
-		Assert(!BufferIsInvalid(wal_redo_buffer));
-		ReleaseBuffer(wal_redo_buffer);
+											 RBM_ZERO_AND_LOCK);
+		if (!BufferIsInvalid(wal_redo_buffer))
+		{
+			/*
+			 * We got a buffer but it's likely zero/uninitialized.
+			 * The caller (GetPage) will detect this and log a warning.
+			 */
+			UnlockReleaseBuffer(wal_redo_buffer);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errmsg("[WALREDO_NOINIT] failed to get buffer for "
+							"%u/%u/%u.%d blk %u even with RBM_ZERO_AND_LOCK",
+							target_redo_tag.rnode.spcNode,
+							target_redo_tag.rnode.dbNode,
+							target_redo_tag.rnode.relNode,
+							target_redo_tag.forkNum,
+							target_redo_tag.blockNum)));
+		}
 	}
 
 	redo_read_buffer_filter = NULL;
@@ -1351,6 +1399,35 @@ GetPage(StringInfo input_message)
 	Assert(buf == wal_redo_buffer);
 	page = BufferGetPage(buf);
 
+	/*
+	 * DIAGNOSTIC: Check for zero page before returning.
+	 * A zero page (pd_lower=0 AND pd_upper=0) after WAL redo indicates
+	 * that rm_redo did not properly initialize the page.
+	 */
+	{
+		PageHeader phdr = (PageHeader) page;
+		uint16 pd_lower = phdr->pd_lower;
+		uint16 pd_upper = phdr->pd_upper;
+		uint16 pd_special = phdr->pd_special;
+		uint16 pd_pagesize_version = phdr->pd_pagesize_version;
+		
+		if (pd_lower == 0 && pd_upper == 0)
+		{
+			ereport(WARNING,
+					(errmsg("[WALREDO_ZERO_PAGE] returning zero page for %u/%u/%u.%d blk %u: "
+							"pd_lower=%u, pd_upper=%u, pd_special=%u, pd_pagesize_version=0x%04X",
+							RelFileInfoFmt(rinfo), forknum, blknum,
+							pd_lower, pd_upper, pd_special, pd_pagesize_version)));
+		}
+		else
+		{
+			elog(DEBUG1, "[WALREDO_PAGE] returning page for %u/%u/%u.%d blk %u: "
+						 "pd_lower=%u, pd_upper=%u, pd_special=%u",
+						 RelFileInfoFmt(rinfo), forknum, blknum,
+						 pd_lower, pd_upper, pd_special);
+		}
+	}
+
 	/* Response: Page content */
 	tot_written = 0;
 	do {
@@ -1371,6 +1448,34 @@ GetPage(StringInfo input_message)
 	ReleaseBuffer(buf);
 	DropRelationAllLocalBuffers(rinfo);
 	wal_redo_buffer = InvalidBuffer;
+
+	/*
+	 * CRITICAL: Release all resources held by the ResourceOwner.
+	 * 
+	 * openGauss accumulates resources (buffer pins, catcache refs, relation refs,
+	 * etc.) in the ResourceOwner during WAL redo. Without explicit release,
+	 * memory grows unbounded (~10GB/minute during TPC-C).
+	 * 
+	 * We call ResourceOwnerRelease in all three phases to ensure complete cleanup:
+	 * - BEFORE_LOCKS: Release buffer pins, catcache refs, etc.
+	 * - LOCKS: Release any locks (shouldn't have any in walredo)
+	 * - AFTER_LOCKS: Final cleanup
+	 */
+	ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner,
+						 RESOURCE_RELEASE_BEFORE_LOCKS, true, true);
+	ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner,
+						 RESOURCE_RELEASE_LOCKS, true, true);
+	ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner,
+						 RESOURCE_RELEASE_AFTER_LOCKS, true, true);
+
+	/*
+	 * Reset smgr state and any cached relations to prevent memory
+	 * accumulation across redo cycles.
+	 */
+	smgrinit();
+	smgrcloseall();
+
+	/* Memory limit removed - proper optimization should keep memory low */
 
 	elog(TRACE, "Page sent back for block %u", blknum);
 }

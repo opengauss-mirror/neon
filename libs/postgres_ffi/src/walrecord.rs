@@ -296,22 +296,11 @@ pub fn decode_wal_record(
     // FIXME: assume little-endian here
     let xlogrec = XLogRecord::from_bytes(&mut buf)?;
 
-    tracing::info!(
-        "TESTDBG decode_wal_record: record_len={}, xl_tot_len={}, xl_rmid={}, xl_info={}, xl_xid={}, xl_prev={}, XLOG_SIZE_OF_XLOG_RECORD={}",
-        record.len(),
-        xlogrec.xl_tot_len,
-        xlogrec.xl_rmid,
-        xlogrec.xl_info,
-        xlogrec.xl_xid,
-        xlogrec.xl_prev,
-        XLOG_SIZE_OF_XLOG_RECORD
-    );
-
     let remaining: usize = xlogrec.xl_tot_len as usize - XLOG_SIZE_OF_XLOG_RECORD;
 
     if buf.remaining() != remaining {
         tracing::error!(
-            "TESTDBG decode_wal_record: buf.remaining()={} != remaining={}, xl_tot_len={}",
+            "decode_wal_record: buf.remaining()={} != remaining={}, xl_tot_len={}",
             buf.remaining(),
             remaining,
             xlogrec.xl_tot_len
@@ -380,14 +369,6 @@ pub fn decode_wal_record(
                 let has_bucket_or_segpage = (block_id & BKID_HAS_BUCKET_OR_SEGPAGE) != 0;
                 let has_tde_page = (block_id & BKID_HAS_TDE_PAGE) != 0;
                 
-                tracing::info!(
-                    "TESTDBG decode_wal_record: block_id=0x{:02x}, actual_block_id={}, has_bucket_or_segpage={}, has_tde_page={}, buf.remaining()={}",
-                    block_id,
-                    actual_block_id,
-                    has_bucket_or_segpage,
-                    has_tde_page,
-                    buf.remaining()
-                );
                 
                 // Check if this is a valid block reference
                 if actual_block_id > pg_constants::XLR_MAX_BLOCK_ID {
@@ -417,14 +398,6 @@ pub fn decode_wal_record(
                 blk.will_init = (fork_flags & pg_constants::BKPBLOCK_WILL_INIT) != 0;
                 blk.data_len = buf.get_u16_le();
                 
-                tracing::info!(
-                    "TESTDBG decode_wal_record: fork_flags=0x{:02x}, has_image={}, has_data={}, data_len={}, buf.remaining()={}",
-                    fork_flags,
-                    blk.has_image,
-                    blk.has_data,
-                    blk.data_len,
-                    buf.remaining()
-                );
 
                 /* TODO cross-check that the HAS_DATA flag is set iff data_length > 0 */
 
@@ -444,13 +417,6 @@ pub fn decode_wal_record(
                     blk.bimg_len = BLCKSZ - blk.hole_length;
                     blk.bimg_info = 0; // openGauss has no bimg_info field
                     blk.apply_image = true; // Always apply in openGauss
-
-                    tracing::info!(
-                        "TESTDBG decode_wal_record: block image header: hole_offset={}, hole_length={}, bimg_len={}",
-                        blk.hole_offset,
-                        blk.hole_length,
-                        blk.bimg_len
-                    );
 
                     datatotal += blk.bimg_len as u32;
                     blocks_total_len += blk.bimg_len as u32;
@@ -477,10 +443,6 @@ pub fn decode_wal_record(
                     rnode_dbnode = buf.get_u32_le();
                     rnode_relnode = buf.get_u32_le();
                     
-                    tracing::info!(
-                        "TESTDBG decode_wal_record: RelFileNode: spc={}, db={}, rel={}, buf.remaining()={}",
-                        rnode_spcnode, rnode_dbnode, rnode_relnode, buf.remaining()
-                    );
                     
                     // openGauss RelFileNode has additional fields when BKID_HAS_BUCKET_OR_SEGPAGE is set:
                     // - bucketNode (int2, 2 bytes)
@@ -488,27 +450,15 @@ pub fn decode_wal_record(
                     if has_bucket_or_segpage {
                         let bucket_node = buf.get_i16_le();
                         let opt = buf.get_u16_le();
-                        tracing::info!(
-                            "TESTDBG decode_wal_record: bucket_or_segpage: bucket_node={}, opt={}, buf.remaining()={}",
-                            bucket_node, opt, buf.remaining()
-                        );
                     }
                     
                     // If TDE page, skip TdeInfo structure (396 bytes)
                     if has_tde_page {
-                        tracing::info!(
-                            "TESTDBG decode_wal_record: skipping TdeInfo ({} bytes), buf.remaining()={}",
-                            SIZEOF_TDE_INFO, buf.remaining()
-                        );
                         buf.advance(SIZEOF_TDE_INFO);
                     }
                     
                     // openGauss has extra_flag (uint16) after RelFileNode/TdeInfo
                     let extra_flag = buf.get_u16_le();
-                    tracing::info!(
-                        "TESTDBG decode_wal_record: extra_flag=0x{:04x}, buf.remaining()={}",
-                        extra_flag, buf.remaining()
-                    );
                     
                     got_rnode = true;
                 } else if !got_rnode {
@@ -518,10 +468,6 @@ pub fn decode_wal_record(
                         "BKPBLOCK_SAME_REL set but no previous rel in WAL record"
                     );
                 } else {
-                    tracing::info!(
-                        "TESTDBG decode_wal_record: BKPBLOCK_SAME_REL set, using previous rnode: {}/{}/{}",
-                        rnode_spcnode, rnode_dbnode, rnode_relnode
-                    );
                 }
                 // When BKPBLOCK_SAME_REL is set, rnode and extra_flag are inherited from lastBlock
                 // No additional data to read for RelFileNode
@@ -533,10 +479,6 @@ pub fn decode_wal_record(
                 // Read block number
                 blk.blkno = buf.get_u32_le();
                 
-                tracing::info!(
-                    "TESTDBG decode_wal_record: blkno={}, buf.remaining()={}",
-                    blk.blkno, buf.remaining()
-                );
                 
                 // openGauss: if segment-page storage, read physical location
                 // For now, we assume we're not using segment storage (XLOG_NEED_PHYSICAL_LOCATION returns false)
@@ -550,15 +492,6 @@ pub fn decode_wal_record(
                 // openGauss has last_lsn (XLogRecPtr, 8 bytes) at the end of each block header
                 let last_lsn = buf.get_u64_le();
                 
-                tracing::info!(
-                    "TESTDBG decode_wal_record: last_lsn={:X}/{:X}, affects {}/{}/{} blk {}, buf.remaining()={}",
-                    (last_lsn >> 32) as u32, last_lsn as u32,
-                    rnode_spcnode,
-                    rnode_dbnode,
-                    rnode_relnode,
-                    blk.blkno,
-                    buf.remaining()
-                );
 
                 decoded.blocks.push(blk);
             }
@@ -582,24 +515,10 @@ pub fn decode_wal_record(
 
     let main_data_offset = (xlogrec.xl_tot_len - main_data_len) as usize;
 
-    tracing::info!(
-        "TESTDBG decode_wal_record: main_data_offset={}, main_data_len={}, xl_tot_len={}, record.len()={}, blocks_total_len={}",
-        main_data_offset,
-        main_data_len,
-        xlogrec.xl_tot_len,
-        record.len(),
-        blocks_total_len
-    );
-
     // 4. Decode main_data
     if main_data_len > 0 {
         assert_eq!(buf.remaining(), main_data_len as usize);
-        // TESTDBG: Print the complete main_data in hex before it's used by heap decoders
-        tracing::info!(
-            "TESTDBG decode_wal_record: main_data_hex (complete, {} bytes)={:02x?}",
-            buf.remaining(),
-            &buf[..buf.remaining()]
-        );
+        // Print the complete main_data in hex before it's used by heap decoders
     }
 
     decoded.xl_xid = xlogrec.xl_xid;
@@ -631,17 +550,8 @@ pub mod V702 {
     /// } xl_heap_insert;
     impl XlHeapInsert {
         pub fn decode(buf: &mut Bytes) -> XlHeapInsert {
-            tracing::info!(
-                "TESTDBG XlHeapInsert::decode: buf.remaining()={}, buf_hex={:02x?}",
-                buf.remaining(),
-                &buf[..std::cmp::min(buf.remaining(), 32)]
-            );
             let offnum = buf.get_u16_le();
             let flags = buf.get_u8();
-            tracing::info!(
-                "TESTDBG XlHeapInsert::decode: offnum={}, flags=0x{:02x}, remaining={}",
-                offnum, flags, buf.remaining()
-            );
             XlHeapInsert { offnum, flags }
         }
     }
@@ -663,18 +573,9 @@ pub mod V702 {
     /// } xl_heap_multi_insert;
     impl XlHeapMultiInsert {
         pub fn decode(buf: &mut Bytes) -> XlHeapMultiInsert {
-            tracing::info!(
-                "TESTDBG XlHeapMultiInsert::decode: buf.remaining()={}, buf_hex={:02x?}",
-                buf.remaining(),
-                &buf[..std::cmp::min(buf.remaining(), 32)]
-            );
             let flags = buf.get_u8();
             let _padding = buf.get_u8();
             let ntuples = buf.get_u16_le();
-            tracing::info!(
-                "TESTDBG XlHeapMultiInsert::decode: flags=0x{:02x}, ntuples={}, remaining={}",
-                flags, ntuples, buf.remaining()
-            );
             XlHeapMultiInsert { flags, _padding, ntuples }
         }
     }
@@ -701,11 +602,6 @@ pub mod V702 {
     impl XlHeapDelete {
         pub fn decode(buf: &mut Bytes) -> XlHeapDelete {
             let buf_len = buf.remaining();
-            tracing::info!(
-                "TESTDBG XlHeapDelete::decode: buf.remaining()={}, buf_hex={:02x?}",
-                buf_len,
-                &buf[..std::cmp::min(buf_len, 32)]
-            );
             
             let offnum = buf.get_u16_le();
             let flags = buf.get_u8();
@@ -716,33 +612,25 @@ pub mod V702 {
             // - 9 bytes: Full format (3 + 8 + 1 = 12 bytes total, SizeOfHeapDelete)
             let remaining = buf.remaining();
             let (xmax, infobits_set) = if remaining == 0 {
-                tracing::info!("TESTDBG XlHeapDelete::decode: using SizeOfOldHeapDelete format (3 bytes)");
                 (0u64, 0u8)
             } else if remaining >= 9 {
-                tracing::info!("TESTDBG XlHeapDelete::decode: using SizeOfHeapDelete format (12 bytes)");
                 let xmax = buf.get_u64_le();
                 let infobits_set = buf.get_u8();
                 (xmax, infobits_set)
             } else if remaining >= 5 {
                 // Possible ShortTransactionId format (4 bytes xmax + 1 byte infobits)
-                tracing::info!("TESTDBG XlHeapDelete::decode: using ShortTransactionId format ({} bytes)", 3 + remaining);
                 let xmax = buf.get_u32_le() as u64;
                 let infobits_set = buf.get_u8();
                 (xmax, infobits_set)
             } else if remaining >= 4 {
                 // ShortTransactionId without infobits_set
-                tracing::info!("TESTDBG XlHeapDelete::decode: using ShortTransactionId format without infobits");
                 let xmax = buf.get_u32_le() as u64;
                 (xmax, 0u8)
             } else {
-                tracing::warn!("TESTDBG XlHeapDelete::decode: UNEXPECTED remaining={}", remaining);
+                tracing::warn!("XlHeapDelete::decode: UNEXPECTED remaining={}", remaining);
                 (0u64, 0u8)
             };
             
-            tracing::info!(
-                "TESTDBG XlHeapDelete::decode: offnum={}, flags=0x{:02x}, xmax={}, infobits_set=0x{:02x}, final_remaining={}",
-                offnum, flags, xmax, infobits_set, buf.remaining()
-            );
             XlHeapDelete { offnum, flags, xmax, infobits_set }
         }
     }
@@ -778,20 +666,11 @@ pub mod V702 {
     impl XlHeapUpdate {
         pub fn decode(buf: &mut Bytes) -> XlHeapUpdate {
             let buf_len = buf.remaining();
-            tracing::info!(
-                "TESTDBG XlHeapUpdate::decode: buf.remaining()={}, buf_hex={:02x?}",
-                buf_len,
-                &buf[..std::cmp::min(buf_len, 32)]
-            );
             
             let old_offnum = buf.get_u16_le();
             let new_offnum = buf.get_u16_le();
             let flags = buf.get_u8();
             
-            tracing::info!(
-                "TESTDBG XlHeapUpdate::decode: old_offnum={}, new_offnum={}, flags=0x{:02x}, remaining_after_flags={}",
-                old_offnum, new_offnum, flags, buf.remaining()
-            );
             
             // Determine format based on remaining buffer size:
             // - 0 bytes remaining after flags: SizeOfOldHeapUpdate format (5 bytes total)
@@ -800,31 +679,33 @@ pub mod V702 {
             let remaining = buf.remaining();
             let (old_xmax, new_xmax, old_infobits_set) = if remaining == 0 {
                 // SizeOfOldHeapUpdate format - only offnums and flags
-                tracing::info!("TESTDBG XlHeapUpdate::decode: using SizeOfOldHeapUpdate format (5 bytes)");
                 (0u64, 0u64, 0u8)
             } else if remaining == 8 {
                 // ShortTransactionId format (4 bytes each, no infobits_set)
-                tracing::info!("TESTDBG XlHeapUpdate::decode: using ShortTransactionId format (13 bytes)");
                 let old_xmax = buf.get_u32_le() as u64;
                 let new_xmax = buf.get_u32_le() as u64;
                 (old_xmax, new_xmax, 0u8)
             } else if remaining == 9 {
                 // ShortTransactionId format with infobits_set (4 bytes each + 1 byte)
-                tracing::info!("TESTDBG XlHeapUpdate::decode: using ShortTransactionId format with infobits (14 bytes)");
                 let old_xmax = buf.get_u32_le() as u64;
                 let new_xmax = buf.get_u32_le() as u64;
                 let old_infobits_set = buf.get_u8();
                 (old_xmax, new_xmax, old_infobits_set)
+            } else if remaining == 16 {
+                // Full TransactionId format without infobits_set (8 bytes each, no infobits)
+                // This is used by openGauss when old_infobits_set is not needed
+                let old_xmax = buf.get_u64_le();
+                let new_xmax = buf.get_u64_le();
+                (old_xmax, new_xmax, 0u8)
             } else if remaining >= 17 {
                 // Full TransactionId format (8 bytes each + 1 byte infobits_set)
-                tracing::info!("TESTDBG XlHeapUpdate::decode: using full TransactionId format (22 bytes)");
                 let old_xmax = buf.get_u64_le();
                 let new_xmax = buf.get_u64_le();
                 let old_infobits_set = buf.get_u8();
                 (old_xmax, new_xmax, old_infobits_set)
             } else {
                 tracing::error!(
-                    "TESTDBG XlHeapUpdate::decode: UNEXPECTED remaining={}, cannot determine format!",
+                    "XlHeapUpdate::decode: UNEXPECTED remaining={}, cannot determine format!",
                     remaining
                 );
                 // Try to read what we can - assume short format without infobits
@@ -837,10 +718,6 @@ pub mod V702 {
                 }
             };
             
-            tracing::info!(
-                "TESTDBG XlHeapUpdate::decode: old_xmax={}, new_xmax={}, old_infobits_set=0x{:02x}, final_remaining={}",
-                old_xmax, new_xmax, old_infobits_set, buf.remaining()
-            );
             
             XlHeapUpdate {
                 old_offnum,
@@ -879,11 +756,6 @@ pub mod V702 {
     impl XlHeapLock {
         pub fn decode(buf: &mut Bytes) -> XlHeapLock {
             let buf_len = buf.remaining();
-            tracing::info!(
-                "TESTDBG XlHeapLock::decode: buf.remaining()={}, buf_hex={:02x?}",
-                buf_len,
-                &buf[..std::cmp::min(buf_len, 32)]
-            );
             
             let locking_xid = buf.get_u64_le();
             let offnum = buf.get_u16_le();
@@ -901,10 +773,6 @@ pub mod V702 {
                 (0u8, false)
             };
             
-            tracing::info!(
-                "TESTDBG XlHeapLock::decode: locking_xid={}, offnum={}, xid_is_mxact={}, shared_lock={}, infobits_set=0x{:02x}, lock_updated={}, remaining={}",
-                locking_xid, offnum, xid_is_mxact, shared_lock, infobits_set, lock_updated, buf.remaining()
-            );
             
             XlHeapLock {
                 locking_xid,
@@ -931,21 +799,12 @@ pub mod V702 {
     impl XlHeapLockUpdated {
         pub fn decode(buf: &mut Bytes) -> XlHeapLockUpdated {
             let buf_len = buf.remaining();
-            tracing::info!(
-                "TESTDBG XlHeapLockUpdated::decode: buf.remaining()={}, buf_hex={:02x?}",
-                buf_len,
-                &buf[..std::cmp::min(buf_len, 32)]
-            );
             
             let xmax = buf.get_u64_le();
             let offnum = buf.get_u16_le();
             let infobits_set = buf.get_u8();
             let flags = buf.get_u8();
             
-            tracing::info!(
-                "TESTDBG XlHeapLockUpdated::decode: xmax={}, offnum={}, infobits_set=0x{:02x}, flags=0x{:02x}, remaining={}",
-                xmax, offnum, infobits_set, flags, buf.remaining()
-            );
             
             XlHeapLockUpdated {
                 xmax,
@@ -1335,7 +1194,6 @@ impl XlXactParsedRecord {
         if xinfo & pg_constants::XACT_XINFO_HAS_TWOPHASE != 0 {
             // openGauss: TransactionId is uint64
             xid = buf.get_u64_le();
-            tracing::debug!("XLOG_XACT_COMMIT-XACT_XINFO_HAS_TWOPHASE xid {}", xid);
         }
 
         let origin_lsn = if xinfo & pg_constants::XACT_XINFO_HAS_ORIGIN != 0 {

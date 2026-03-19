@@ -86,6 +86,8 @@ pub struct PageServerConf {
     pub wait_lsn_timeout: Duration,
     // How long to wait for WAL redo to complete.
     pub wal_redo_timeout: Duration,
+    // Number of concurrent walredo processes per tenant (process pool size).
+    pub wal_redo_concurrency: std::num::NonZeroUsize,
 
     pub superuser: String,
     pub locale: String,
@@ -353,6 +355,13 @@ impl PageServerConf {
     //
     pub fn pg_distrib_dir(&self, pg_version: PgMajorVersion) -> anyhow::Result<Utf8PathBuf> {
         let base = self.pg_distrib_dir.clone();
+        
+        // First check if base already points to a versioned directory (e.g., og_install/V702)
+        if base.join("bin").exists() {
+            return Ok(base);
+        }
+        
+        // Otherwise, try appending version subdirectories
         let og_dir = base.join("V702");
         if og_dir.exists() {
             return Ok(og_dir);
@@ -469,6 +478,7 @@ impl PageServerConf {
             availability_zone,
             wait_lsn_timeout,
             wal_redo_timeout,
+            wal_redo_concurrency: std::num::NonZeroUsize::new(4).unwrap(),
             superuser,
             locale,
             page_cache_size,

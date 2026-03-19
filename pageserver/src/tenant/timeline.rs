@@ -1588,7 +1588,7 @@ impl Timeline {
                 LOG_PACER.lock().unwrap().call(|| {
                     let num_keys = total_keyspace.total_raw_size();
                     let num_pages = results.len();
-                    tracing::info!(
+                    tracing::debug!(
                       shard_id = %self.tenant_shard_id.shard_slug(),
                       lsn = %max_request_lsn,
                       "Vectored read for {total_keyspace} visited {layers_visited} layers. Returned {num_pages}/{num_keys} pages.",
@@ -2131,7 +2131,7 @@ impl Timeline {
                 // This is not harmful, but it only happens in relatively rare cases where
                 // time-based checkpoints are not happening fast enough to keep the amount of
                 // ephemeral data within configured limits.  It's a sign of stress on the system.
-                tracing::info!(
+                tracing::debug!(
                     "Early-rolling open layer at size {current_size} (limit {size_override}) due to dirty data pressure"
                 );
             }
@@ -2164,7 +2164,7 @@ impl Timeline {
                         .await;
 
                     if let Err(e) = res {
-                        tracing::info!(
+                        tracing::debug!(
                             "failed to flush frozen layer after background freeze: {e:#}"
                         );
                     }
@@ -2393,7 +2393,7 @@ impl Timeline {
                     // race with trying to offload it (which also stops the flush loop)
                     false
                 } else {
-                    tracing::info!(?open, frozen, "flushing and freezing on shutdown");
+                    tracing::debug!(?open, frozen, "flushing and freezing on shutdown");
                     true
                 }
             } else {
@@ -4241,7 +4241,7 @@ impl Timeline {
             Some(non_resident) => {
                 let mut non_resident = non_resident.peekable();
                 if non_resident.peek().is_none() {
-                    tracing::info!(timeline_id=%self.timeline_id, "Previous heatmap now obsolete");
+                    tracing::debug!(timeline_id=%self.timeline_id, "Previous heatmap now obsolete");
                     self.previous_heatmap
                         .store(Some(PreviousHeatmap::Obsolete.into()));
                 }
@@ -4299,7 +4299,7 @@ impl Timeline {
             heatmap_layers.push(hl);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Generating unarchival heatmap with {} layers",
             heatmap_layers.len()
         );
@@ -5137,7 +5137,7 @@ impl Timeline {
                 // Cancellation safety: we are not leaving an I/O in-flight for the flush, we're just ignoring
                 // the notification from [`flush_loop`] that it completed.
                 _ = self.cancel.cancelled() => {
-                    tracing::info!("Cancelled layer flush due on timeline shutdown");
+                    tracing::debug!("Cancelled layer flush due on timeline shutdown");
                     return Ok(())
                 }
             };
@@ -5828,7 +5828,7 @@ impl Timeline {
         // WAL since the last check or a checkpoint timeout interval has elapsed since the last
         // check.
         let decision = distance_based_decision || time_based_decision;
-        tracing::info!(
+        tracing::debug!(
             "Decided to check image layers: {}. Distance-based decision: {}, time-based decision: {}",
             decision,
             distance_based_decision,
@@ -5975,7 +5975,7 @@ impl Timeline {
                 }) {
                     // TODO: this can be processed with the BatchLayerWriter::finish_with_discard
                     // in the future.
-                    tracing::info!(
+                    tracing::debug!(
                         "Skipping image layer at {lsn} {}..{}, already exists",
                         img_range.start,
                         img_range.end
@@ -6078,7 +6078,7 @@ impl Timeline {
                             .now_or_never()
                             .is_some();
                         if should_yield {
-                            tracing::info!(
+                            tracing::debug!(
                                 "preempt image layer generation at {lsn} when processing partition {}..{}: too many L0 layers",
                                 partition.start().unwrap(),
                                 partition.end().unwrap()
@@ -6653,7 +6653,7 @@ impl Timeline {
                 .await
             {
                 Ok((index_part, index_generation, _index_mtime)) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "GC loaded shard zero metadata (gen {index_generation:?}): latest_gc_cutoff_lsn: {}",
                         index_part.metadata.latest_gc_cutoff_lsn()
                     );
@@ -7080,30 +7080,11 @@ impl Timeline {
             RedoAttemptType::GcCompaction => false,
         };
 
-        // [LAYERDBG] Log page reconstruction details
-        let (rel, blkno) = key.to_rel_block().unwrap_or_default();
-        info!(
-            "[LAYERDBG] reconstruct_value: key={}, rel={}/{}/{}.{}, blkno={}, request_lsn={}, \
-             has_img={}, img_lsn={}, num_records={}",
-            key, rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno,
-            request_lsn, data.img.is_some(),
-            data.img.as_ref().map(|i| i.0.to_string()).unwrap_or_else(|| "none".to_string()),
-            data.records.len()
-        );
-
         // If we have a page image, and no WAL, we're all set
         if data.records.is_empty() {
-            if let Some((img_lsn, img)) = &data.img {
-                info!(
-                    "[LAYERDBG] found page image for key {} at {}, no WAL redo required, req LSN {}, img_size={}",
-                    key, img_lsn, request_lsn, img.len()
-                );
+            if let Some((_img_lsn, img)) = &data.img {
                 Ok(img.clone())
             } else {
-                info!(
-                    "[LAYERDBG] base image for {} at {} not found",
-                    key, request_lsn
-                );
                 Err(PageReconstructError::from(anyhow!(
                     "base image for {key} at {request_lsn} not found"
                 )))
@@ -7114,10 +7095,6 @@ impl Timeline {
             // If we don't have a base image, then the oldest WAL record better initialize
             // the page
             if data.img.is_none() && !data.records.first().unwrap().1.will_init() {
-                info!(
-                    "[LAYERDBG] Base image for {} at {} not found, got {} WAL records, first will_init=false",
-                    key, request_lsn, data.records.len()
-                );
                 Err(PageReconstructError::from(anyhow!(
                     "Base image for {} at {} not found, but got {} WAL records",
                     key,
@@ -7125,28 +7102,9 @@ impl Timeline {
                     data.records.len()
                 )))
             } else {
-                if data.img.is_some() {
-                    info!(
-                        "[LAYERDBG] found {} WAL records and a base image for {} at {}, performing WAL redo",
-                        data.records.len(),
-                        key,
-                        request_lsn
-                    );
-                } else {
-                    info!(
-                        "[LAYERDBG] found {} WAL records that will init the page for {} at {}, performing WAL redo",
-                        data.records.len(),
-                        key,
-                        request_lsn
-                    );
-                };
-                // [LAYERDBG] Log each WAL record's details
-                for (idx, (rec_lsn, rec)) in data.records.iter().enumerate() {
-                    info!(
-                        "[LAYERDBG] WAL record {} for key {}: lsn={}, will_init={}, record_type={:?}",
-                        idx, key, rec_lsn, rec.will_init(), std::mem::discriminant(rec)
-                    );
-                }
+                // [DIAG] Time WAL redo
+                let redo_start = std::time::Instant::now();
+                let num_records = data.records.len();
                 let res = self
                     .walredo_mgr
                     .as_ref()
@@ -7161,20 +7119,18 @@ impl Timeline {
                         redo_attempt_type,
                     )
                     .await;
+                let redo_elapsed = redo_start.elapsed();
+                // Log if WAL redo takes more than 10ms
+                if redo_elapsed.as_millis() > 10 {
+                    info!(
+                        "slow walredo: key={} records={} took {:.3}s",
+                        key, num_records, redo_elapsed.as_secs_f64()
+                    );
+                }
                 let img = match res {
-                    Ok(img) => {
-                        info!(
-                            "[LAYERDBG] walredo success for {}, result_size={}",
-                            key, img.len()
-                        );
-                        img
-                    }
+                    Ok(img) => img,
                     Err(walredo::Error::Cancelled) => return Err(PageReconstructError::Cancelled),
                     Err(walredo::Error::Other(err)) => {
-                        info!(
-                            "[LAYERDBG] walredo failure for {}: {:?}",
-                            key, err
-                        );
                         if fire_critical_error {
                             critical_timeline!(
                                 self.tenant_shard_id,
@@ -7274,7 +7230,7 @@ impl Timeline {
             let Ok(lm) = guard.layer_map() else {
                 // technically here we could look into iterating accessible layers, but downloading
                 // all layers of a shutdown timeline makes no sense regardless.
-                tracing::info!("attempted to download all layers of shutdown timeline");
+                tracing::debug!("attempted to download all layers of shutdown timeline");
                 return;
             };
             lm.iter_historic_layers()
@@ -7917,25 +7873,6 @@ impl TimelineWriter<'_> {
 
         let batch_max_lsn = batch.max_lsn;
         let buf_size: u64 = batch.buffer_size() as u64;
-
-        // [LAYERDBG] Log put_batch call
-        tracing::info!(
-            "[LAYERDBG] put_batch: max_lsn={}, buf_size={}, metadata_count={}",
-            batch_max_lsn, buf_size, batch.metadata.len()
-        );
-        for meta in &batch.metadata {
-            if let wal_decoder::serialized_batch::ValueMeta::Serialized(s) = meta {
-                let key = pageserver_api::key::Key::from_compact(s.key);
-                // Extract rel info from key fields: field2=spc, field3=db, field4=rel, field5=fork, field6=blk
-                if key.field1 == 0x00 && key.field4 != 0 {
-                    tracing::info!(
-                        "[LAYERDBG] put_batch entry: key={}, rel={}/{}/{}.{}, blkno={}, lsn={}, will_init={}, len={}",
-                        s.key, key.field2, key.field3, key.field4, key.field5,
-                        key.field6, s.lsn, s.will_init, s.len
-                    );
-                }
-            }
-        }
 
         let action = self.get_open_layer_action(batch_max_lsn, buf_size);
         let layer = self

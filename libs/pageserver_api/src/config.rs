@@ -685,7 +685,8 @@ pub mod defaults {
     pub const DEFAULT_HEATMAP_UPLOAD_CONCURRENCY: usize = 8;
     pub const DEFAULT_SECONDARY_DOWNLOAD_CONCURRENCY: usize = 1;
 
-    pub const DEFAULT_INGEST_BATCH_SIZE: u64 = 100;
+    // 优化：减小批量大小以加快 last_record_lsn 更新，避免 Lock wait timeout
+    pub const DEFAULT_INGEST_BATCH_SIZE: u64 = 1;
 
     /// Soft limit for the maximum size of a vectored read.
     ///
@@ -843,7 +844,8 @@ pub mod tenant_conf_defaults {
     // would be more appropriate. But a low value forces the code to be exercised more,
     // which is good for now to trigger bugs.
     // This parameter actually determines L0 layer file size.
-    pub const DEFAULT_CHECKPOINT_DISTANCE: u64 = 256 * 1024 * 1024;
+    // 优化：减小到 64MB 以加快 disk_consistent_lsn 更新，减少 wait_lsn 延迟
+    pub const DEFAULT_CHECKPOINT_DISTANCE: u64 = 64 * 1024 * 1024;
     pub const DEFAULT_CHECKPOINT_TIMEOUT: &str = "10 m";
 
     // FIXME the below configs are only used by legacy algorithm. The new algorithm

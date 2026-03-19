@@ -78,20 +78,19 @@ pub fn write_postgres_conf(
     // For OpenGauss: Disable audit and double write functionality as they're not needed in Neon
     writeln!(file, "# OpenGauss settings for Neon")?;
     writeln!(file, "audit_enabled = off")?;
+    if is_opengauss {
+        // Reduce prefetch pressure to avoid cascading disconnects under bulk load.
+        // Walredo is serial; fewer in-flight requests = less queue depth = fewer timeouts.
+        writeln!(file, "neon.readahead_buffer_size=32")?;
+    }
     writeln!(file, "enable_double_write = off")?;
     writeln!(file, "enable_incremental_checkpoint = off")?;
     writeln!(file, "enable_ustore = off")?;
-    writeln!(file, "log_statement = 'all'")?;
-    writeln!(file, "log_min_messages = 'DEBUG1'")?;
-    
-    // [LAYERDBG] Disable index scans to force SeqScan for debugging table loss issue
-    // This is a temporary setting for debugging purposes
-    writeln!(file, "# [LAYERDBG] Disable index scans for debugging")?;
-    writeln!(file, "enable_indexscan = off")?;
-    writeln!(file, "enable_indexonlyscan = off")?;
-    writeln!(file, "enable_bitmapscan = off")?;
+    writeln!(file, "enable_indexscan = on")?;
+    writeln!(file, "enable_indexonlyscan = on")?;
+    writeln!(file, "enable_bitmapscan = on")?;
 
-    // Logging configuration
+    // Logging configuration - use WARNING level to avoid excessive I/O
     writeln!(file, "# Logging configuration")?;
     writeln!(file, "logging_collector = on")?;
     writeln!(file, "log_directory = 'pg_log'")?;
@@ -99,9 +98,10 @@ pub fn write_postgres_conf(
     writeln!(file, "log_rotation_size = 100MB")?;
     writeln!(file, "log_rotation_age = 1d")?;
     writeln!(file, "log_destination = 'stderr'")?;
-    writeln!(file, "log_min_messages = debug1")?;
+    writeln!(file, "log_min_messages = WARNING")?;
     writeln!(file, "log_min_error_statement = error")?;
-    writeln!(file, "log_min_duration_statement = 0")?;
+    writeln!(file, "log_min_duration_statement = -1")?;
+    writeln!(file, "log_statement = 'none'")?;
     writeln!(file, "log_line_prefix = '%m [%p] [%c] [%l] [%d] [%u] [%r] '")?;
 
     // Stripe size GUC should be defined prior to connection string
@@ -115,7 +115,7 @@ pub fn write_postgres_conf(
     }
     if !spec.safekeeper_connstrings.is_empty() {
         let mut neon_safekeepers_value = String::new();
-        tracing::info!(
+        tracing::debug!(
             "safekeepers_connstrings is not zero, gen: {:?}",
             spec.safekeepers_generation
         );

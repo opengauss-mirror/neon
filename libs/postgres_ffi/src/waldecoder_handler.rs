@@ -48,17 +48,6 @@ pub trait WalStreamDecoderHandler {
 impl WalStreamDecoderHandler for WalStreamDecoder {
     fn validate_page_header(&self, hdr: &XLogPageHeaderData) -> Result<(), WalDecodeError> {
         let validate_impl = || {
-            tracing::info!(
-                "TESTDBG validate_page_header: xlp_magic={} (expected {}), xlp_pageaddr={} (expected {}), xlp_info={}, xlp_tli={}, xlp_rem_len={}, xlp_total_len={}",
-                hdr.xlp_magic,
-                XLOG_PAGE_MAGIC,
-                hdr.xlp_pageaddr,
-                self.lsn.0,
-                hdr.xlp_info,
-                hdr.xlp_tli,
-                hdr.xlp_rem_len,
-                hdr.xlp_total_len
-            );
             if hdr.xlp_magic != XLOG_PAGE_MAGIC as u16 {
                 return Err(format!(
                     "invalid xlog page header: xlp_magic={}, expected {}",
@@ -173,13 +162,6 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
                     // peek xl_tot_len at the beginning of the record.
                     // FIXME: assumes little-endian
                     let xl_tot_len = (&self.inputbuf[0..4]).get_u32_le();
-                    tracing::info!(
-                        "TESTDBG poll_decode_internal WaitingForRecord: lsn={}, xl_tot_len={}, inputbuf.remaining()={}, XLOG_SIZE_OF_XLOG_RECORD={}",
-                        self.lsn,
-                        xl_tot_len,
-                        self.inputbuf.remaining(),
-                        XLOG_SIZE_OF_XLOG_RECORD
-                    );
                     if (xl_tot_len as usize) < XLOG_SIZE_OF_XLOG_RECORD {
                         return Err(WalDecodeError {
                             msg: format!("invalid xl_tot_len {xl_tot_len}"),
@@ -193,11 +175,6 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
                         let recordbuf = self.inputbuf.copy_to_bytes(xl_tot_len as usize);
                         return Ok(Some(self.complete_record(recordbuf)?));
                     } else {
-                        tracing::info!(
-                            "TESTDBG poll_decode_internal: need to reassemble record, xl_tot_len={}, pageleft={}",
-                            xl_tot_len,
-                            pageleft
-                        );
                         // Need to assemble the record from pieces. Remember the size of the
                         // record, and loop back. On next iterations, we will reach the branch
                         // below, and copy the part of the record that was on this or next page(s)
@@ -258,14 +235,6 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
         //   xl_crc:        4 bytes (offset 28)
         // Total: 32 bytes
         
-        // TESTDBG: Print raw record header bytes
-        tracing::info!(
-            "TESTDBG complete_record: lsn={}, recordbuf.len()={}, header_hex={:02x?}",
-            self.lsn,
-            recordbuf.len(),
-            &recordbuf[0..std::cmp::min(recordbuf.len(), 64)]
-        );
-        
         let xlogrec =
             XLogRecord::from_slice(&recordbuf[0..XLOG_SIZE_OF_XLOG_RECORD]).map_err(|e| {
                 WalDecodeError {
@@ -273,19 +242,6 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
                     lsn: self.lsn,
                 }
             })?;
-
-        // TESTDBG: Print parsed XLogRecord fields
-        tracing::info!(
-            "TESTDBG complete_record: xl_tot_len={}, xl_term={}, xl_xid={}, xl_prev={}, xl_info=0x{:02x}, xl_rmid={}, xl_bucket_id={}, xl_crc=0x{:08x}",
-            xlogrec.xl_tot_len,
-            xlogrec.xl_term,
-            xlogrec.xl_xid,
-            xlogrec.xl_prev,
-            xlogrec.xl_info,
-            xlogrec.xl_rmid,
-            xlogrec.xl_bucket_id,
-            xlogrec.xl_crc
-        );
 
         // openGauss CRC calculation:
         // CRC is calculated over the record data (after xl_crc) first, then over the header (before xl_crc)
@@ -295,22 +251,9 @@ impl WalStreamDecoderHandler for WalStreamDecoder {
         let hdr_start = 0;
         let hdr_end = XLOG_RECORD_CRC_OFFS; // 28
         
-        tracing::info!(
-            "TESTDBG complete_record: CRC calc: data_range=[{}..{}] ({} bytes), hdr_range=[{}..{}] ({} bytes), XLOG_RECORD_CRC_OFFS={}",
-            data_start, data_end, data_end - data_start,
-            hdr_start, hdr_end, hdr_end - hdr_start,
-            XLOG_RECORD_CRC_OFFS
-        );
-        
         let mut crc = 0;
         crc = crc32c_append(crc, &recordbuf[data_start..data_end]);
-        let crc_after_data = crc;
         crc = crc32c_append(crc, &recordbuf[hdr_start..hdr_end]);
-        
-        tracing::info!(
-            "TESTDBG complete_record: CRC calc: crc_after_data=0x{:08x}, final_crc=0x{:08x}, stored_crc=0x{:08x}, match={}",
-            crc_after_data, crc, xlogrec.xl_crc, crc == xlogrec.xl_crc
-        );
         
         if crc != xlogrec.xl_crc {
             tracing::warn!(

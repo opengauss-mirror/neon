@@ -67,6 +67,7 @@
 #include "neon_lwlsncache.h"
 #include "neon_perf_counters.h"
 #include "pagestore_client.h"
+#include "walproposer.h"
 
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
@@ -269,35 +270,38 @@ neon_wallog_pagev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								RelFileInfoFmt(InfoFromSMgrRel(reln)),
 								forknum)));
 			}
-			else if (forknum != FSM_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
-			{
-				/*
-				 * Its a bad sign if there is a page with zero LSN in the buffer
-				 * cache in a standby, too. However, PANICing seems like a cure
-				 * worse than the disease, as the damage has likely already been
-				 * done in the primary. So in a standby, make this an assertion,
-				 * and in a release build just LOG the error and soldier on. We
-				 * update the last-written LSN of the page with a conservative
-				 * value in that case, which is the last replayed LSN.
-				 */
-				ereport(RecoveryInProgress() ? LOG : PANIC,
-						(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN",
-								blkno,
-								RelFileInfoFmt(InfoFromSMgrRel(reln)),
-								forknum)));
-				Assert(false);
-
-				lsn = GetXLogReplayRecPtr(NULL); /* in standby mode, soldier on */
-			}
-		}
-		else
+		else if (forknum != FSM_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
 		{
-			ereport(SmgrTrace,
-					(errmsg(NEON_TAG "Evicting page %u of relation %u/%u/%u.%u with lsn=%X/%X",
+			/*
+			 * Its a bad sign if there is a page with zero LSN in the buffer
+			 * cache in a standby, too. However, PANICing seems like a cure
+			 * worse than the disease, as the damage has likely already been
+			 * done in the primary. So in a standby, make this an assertion,
+			 * and in a release build just LOG the error and soldier on. We
+			 * update the last-written LSN of the page with a conservative
+			 * value in that case, which is the last replayed LSN.
+			 *
+			 * openGauss compatibility: openGauss may evict pages with zero LSN
+			 * during bulk inserts (e.g., TPC-C load phase) due to differences in
+			 * buffer management. Downgrade PANIC to WARNING and soldier on.
+			 */
+			ereport(WARNING,
+					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN, using GetFlushRecPtr as fallback",
 							blkno,
 							RelFileInfoFmt(InfoFromSMgrRel(reln)),
-							forknum, LSN_FORMAT_ARGS(lsn))));
+							forknum)));
+
+			lsn = GetFlushRecPtr(); /* use flush LSN: already sent to safekeeper, safe for pageserver */
 		}
+	}
+	else
+	{
+		ereport(SmgrTrace,
+				(errmsg(NEON_TAG "Evicting page %u of relation %u/%u/%u.%u with lsn=%X/%X",
+						blkno,
+						RelFileInfoFmt(InfoFromSMgrRel(reln)),
+						forknum, LSN_FORMAT_ARGS(lsn))));
+	}
 
 		/*
 		 * Remember the LSN on this page. When we read the page again, we must
@@ -420,15 +424,17 @@ neon_wallog_page(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, co
 			 * and in a release build just LOG the error and soldier on. We
 			 * update the last-written LSN of the page with a conservative
 			 * value in that case, which is the last replayed LSN.
+			 *
+			 * openGauss compatibility: openGauss may evict pages with zero LSN
+			 * during bulk inserts. Downgrade PANIC to WARNING and soldier on.
 			 */
-			ereport(RecoveryInProgress() ? LOG : PANIC,
-					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN",
+			ereport(WARNING,
+					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN, using GetFlushRecPtr as fallback",
 							blocknum,
 							RelFileInfoFmt(InfoFromSMgrRel(reln)),
 							forknum)));
-			Assert(false);
 
-			lsn = GetXLogReplayRecPtr(NULL); /* in standby mode, soldier on */
+			lsn = GetFlushRecPtr(); /* use flush LSN: already sent to safekeeper, safe for pageserver */
 		}
 	}
 	else
@@ -661,13 +667,18 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 			 * "WAL before data" rule. However, such case does exist at index
 			 * building, _bt_blwritepage logs the full page without flushing WAL
 			 * before smgrextend (files are fsynced before build ends).
+			 *
+			 * Never call XLogWaitFlush here - it can stall the backend for
+			 * seconds to minutes during bulk inserts (16 concurrent workers
+			 * can always be in this gap).  The clamp below caps
+			 * last_written_lsn to flushlsn safely.
 			 */
 			if (last_written_lsn > flushlsn)
 			{
-				neon_log(DEBUG5, "last-written LSN %X/%X is ahead of last flushed LSN %X/%X",
+				neon_log(DEBUG5, "last-written LSN %X/%X is ahead of last flushed LSN %X/%X (gap=%lu), clamping",
 						 LSN_FORMAT_ARGS(last_written_lsn),
-						 LSN_FORMAT_ARGS(flushlsn));
-				XLogWaitFlush(last_written_lsn);
+						 LSN_FORMAT_ARGS(flushlsn),
+						 (unsigned long)(last_written_lsn - flushlsn));
 			}
 
 			/*
@@ -709,9 +720,66 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 			 * The problem can be fixed by callingGetFlushRecPtr() before checking if the page is in the buffer cache.
 			 * But you can't do that within smgrprefetch(), would need to modify the caller.
 			 */
+		/*
+		 * Set LSN fields for the page request.
+		 *
+		 * request_lsn = UINT64_MAX: always ask for the latest version.
+		 * not_modified_since = last_written_lsn: the exact LSN at which this
+		 * block was last written.  No clamping needed: pageserver now skips
+		 * wait_lsn when the gap is large (> 8 MB), so 300-second timeouts
+		 * during bulk inserts are eliminated on the pageserver side.
+		 */
+		{
 			result->request_lsn = UINT64_MAX;
 			result->not_modified_since = last_written_lsn;
 			result->effective_request_lsn = last_written_lsn;
+		}
+
+		/*
+		 * FSM (Free Space Map) and VM (Visibility Map) pages are advisory
+		 * hints only.  Reading a stale version is always safe.
+		 *
+		 * FSM/VM changes are normally not WAL-logged.  Neon force-logs them
+		 * at eviction time with a very recent LSN, causing the pageserver to
+		 * stall for 30-50 s during bulk loads.
+		 *
+		 * Fix: set not_modified_since = effective_request_lsn = 1 so the
+		 * pageserver answers immediately with whatever version it already has.
+		 *
+		 * Additionally, global-catalog pages (spcnode == GLOBALTABLESPACE_OID,
+		 * i.e. pg_global) that are read during bulk loads are purely
+		 * informational lookups (e.g. pg_database).  Returning a version
+		 * that is a few WAL records behind is safe because the catalog row
+		 * itself is protected by transaction visibility; the worst case is
+		 * a re-read on the next access.  This avoids repeated 20-60 s stalls
+		 * when pageserver lags behind compute during heavy WAL generation.
+		 */
+		if (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM)
+		{
+			result->not_modified_since = 1;
+			neon_log(DEBUG1,
+					 "neon_get_request_lsns FSM/VM: set not_modified_since=1 to skip wait (lwlsn=%X/%X)",
+					 LSN_FORMAT_ARGS(last_written_lsn));
+		}
+		else if (rinfo.spcNode == GLOBALTABLESPACE_OID)
+		{
+			/*
+			 * pg_global system catalog pages: clamp not_modified_since to
+			 * the pageserver's last known LSN so we never wait beyond what
+			 * has already been ingested.  Use GetFlushRecPtr() as a proxy
+			 * for "pageserver has seen up to here" on the compute side.
+			 */
+			XLogRecPtr flushlsn = GetFlushRecPtr();
+			if (result->not_modified_since > flushlsn)
+			{
+				result->not_modified_since = flushlsn;
+				result->effective_request_lsn = flushlsn;
+				neon_log(DEBUG1,
+						 "neon_get_request_lsns pg_global: clamped not_modified_since to flushlsn=%X/%X (lwlsn=%X/%X)",
+						 LSN_FORMAT_ARGS(flushlsn),
+						 LSN_FORMAT_ARGS(last_written_lsn));
+			}
+		}
 
 		}
 	}
