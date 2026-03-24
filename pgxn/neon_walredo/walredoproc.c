@@ -138,6 +138,7 @@ static void PushPage(StringInfo input_message);
 static void ApplyRecord(StringInfo input_message);
 static void apply_error_callback(void *arg);
 static bool redo_block_filter(XLogReaderState *record, uint8 block_id);
+static void redo_buffer_allocated(Buffer buf);
 static void GetPage(StringInfo input_message);
 static void Ping(StringInfo input_message);
 static ssize_t buffered_read(void *buf, size_t count);
@@ -1168,6 +1169,9 @@ ApplyRecord(StringInfo input_message)
 	/* Ignore any other blocks than the ones the caller is interested in */
 	redo_read_buffer_filter = redo_block_filter;
 
+	/* Register buffer allocation hook for will_init cases */
+	redo_buffer_allocated_hook = redo_buffer_allocated;
+
 	/*
 	 * DIAGNOSTIC: Log the rm_redo call details.
 	 * This helps trace which WAL records cause zero page issues.
@@ -1265,6 +1269,7 @@ ApplyRecord(StringInfo input_message)
 	}
 
 	redo_read_buffer_filter = NULL;
+	redo_buffer_allocated_hook = NULL;
 
 	/* Pop the error context stack */
 #ifdef ENABLE_NEON
@@ -1310,6 +1315,23 @@ apply_error_callback(void *arg)
 }
 
 
+
+/*
+ * Hook called when a buffer is allocated for the target block during WAL redo.
+ * This is critical for will_init cases where no base image is provided by pageserver.
+ * The buffer must be tracked so that GetPage can return it after rm_redo completes.
+ */
+static void
+redo_buffer_allocated(Buffer buf)
+{
+	ereport(LOG, (errmsg("[WALREDO_BUFFER_HOOK] called: buf=%d, wal_redo_buffer=%d, buf_valid=%d, wrb_valid=%d",
+		buf, wal_redo_buffer, BufferIsValid(buf), BufferIsValid(wal_redo_buffer))));
+	if (BufferIsValid(buf) && !BufferIsValid(wal_redo_buffer))
+	{
+		wal_redo_buffer = buf;
+		ereport(LOG, (errmsg("[WALREDO_BUFFER_HOOK] buffer %d set as wal_redo_buffer", buf)));
+	}
+}
 
 static bool
 redo_block_filter(XLogReaderState *record, uint8 block_id)

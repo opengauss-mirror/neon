@@ -492,6 +492,26 @@ pub fn decode_wal_record(
                 // openGauss has last_lsn (XLogRecPtr, 8 bytes) at the end of each block header
                 let last_lsn = buf.get_u64_le();
                 
+                // Debug: Log ALL blocks being decoded to understand the flow
+                tracing::debug!(
+                    "[WAL_DECODE_BLOCK] relnode={} dbnode={} spcnode={} blkno={} forknum={} has_image={} has_data={}",
+                    blk.rnode_relnode, blk.rnode_dbnode, blk.rnode_spcnode, blk.blkno, blk.forknum, blk.has_image, blk.has_data
+                );
+                
+                // Track system catalog tables specifically
+                // pg_database and other global catalogs have relnode=15353, 15354, 15355, etc.
+                // Database-specific catalogs: pg_class=14828, pg_attribute=14802, pg_type=14709
+                let is_global_catalog = blk.rnode_dbnode == 0 && blk.rnode_spcnode == 1664;  // Global tablespace
+                let is_db_catalog = blk.rnode_relnode == 14802 || blk.rnode_relnode == 14828 ||
+                   blk.rnode_relnode == 14709 || (blk.rnode_relnode >= 14700 && blk.rnode_relnode <= 14900);
+                let is_pg_database = blk.rnode_relnode == 15353;  // pg_database relfilenode
+                
+                if is_global_catalog || is_db_catalog || is_pg_database {
+                    tracing::info!(
+                        "[SYSCAT_WAL_DEBUG] decode_wal_record: relnode={} dbnode={} spcnode={} blkno={} forknum={} has_image={} has_data={} data_len={}",
+                        blk.rnode_relnode, blk.rnode_dbnode, blk.rnode_spcnode, blk.blkno, blk.forknum, blk.has_image, blk.has_data, blk.data_len
+                    );
+                }
 
                 decoded.blocks.push(blk);
             }
@@ -1079,19 +1099,36 @@ pub struct XlDropDatabase {
 }
 
 impl XlDropDatabase {
-    pub fn decode(buf: &mut Bytes) -> XlDropDatabase {
-        let mut rec = XlDropDatabase {
-            db_id: buf.get_u32_le(),
-            n_tablespaces: buf.get_u32_le(),
-            tablespace_ids: Vec::<Oid>::new(),
-        };
+    /// Decode an XlDropDatabase WAL record.
+    /// 
+    /// openGauss (PG14) has a different format than PostgreSQL:
+    /// - openGauss: only db_id and a single tablespace_id (8 bytes total)
+    /// - PostgreSQL: db_id, n_tablespaces count, followed by tablespace_ids array
+    pub fn decode(buf: &mut Bytes, pg_version: crate::PgMajorVersion) -> XlDropDatabase {
+        if pg_version == crate::PgMajorVersion::PG14 {
+            // openGauss format: only db_id and tablespace_id, no array
+            let db_id = buf.get_u32_le();
+            let tablespace_id = buf.get_u32_le();
+            XlDropDatabase {
+                db_id,
+                n_tablespaces: 1,
+                tablespace_ids: vec![tablespace_id],
+            }
+        } else {
+            // PostgreSQL format: db_id, n_tablespaces, then tablespace_ids array
+            let mut rec = XlDropDatabase {
+                db_id: buf.get_u32_le(),
+                n_tablespaces: buf.get_u32_le(),
+                tablespace_ids: Vec::<Oid>::new(),
+            };
 
-        for _i in 0..rec.n_tablespaces {
-            let id = buf.get_u32_le();
-            rec.tablespace_ids.push(id);
+            for _i in 0..rec.n_tablespaces {
+                let id = buf.get_u32_le();
+                rec.tablespace_ids.push(id);
+            }
+
+            rec
         }
-
-        rec
     }
 }
 

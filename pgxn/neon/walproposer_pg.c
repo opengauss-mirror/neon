@@ -11,6 +11,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifndef WIN32
+#include <sys/syscall.h>
+#endif
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
@@ -855,6 +858,47 @@ walprop_pg_init_walsender(void)
 	t_thrd.walsender_cxt.am_walsender = true;
 	InitWalSnd();
 	InitProcessPhase2();
+
+	/*
+	 * NEON FIX: Configure walproposer as a synchronous standby.
+	 * This is critical for SyncRepReleaseWaiters() to work correctly.
+	 *
+	 * SyncRepReleaseWaiters() checks these conditions and returns early if any is true:
+	 * 1. sync_standby_priority == 0 -> returns immediately
+	 * 2. state < WALSNDSTATE_STREAMING -> returns immediately
+	 * 3. flush == InvalidXLogRecPtr -> returns immediately
+	 *
+	 * Without these settings, transactions will wait indefinitely for sync rep
+	 * confirmation, causing lock wait timeouts during TPC-C benchmarks.
+	 */
+	if (t_thrd.walsender_cxt.MyWalSnd != NULL)
+	{
+		volatile WalSnd *walsnd = t_thrd.walsender_cxt.MyWalSnd;
+
+		/* Set state to STREAMING so SyncRepReleaseWaiters doesn't skip us */
+		WalSndSetState(WALSNDSTATE_STREAMING);
+
+		/* Set lwpId so walproposer appears in pg_stat_replication */
+		SpinLockAcquire(&walsnd->mutex);
+#ifndef WIN32
+		walsnd->lwpId = syscall(SYS_gettid);
+#else
+		walsnd->lwpId = (int)t_thrd.proc_cxt.MyProcPid;
+#endif
+		SpinLockRelease(&walsnd->mutex);
+
+		/* Set sync_standby_priority so we're recognized as a sync standby */
+		LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
+		if (walsnd->sync_standby_priority == 0)
+		{
+			walsnd->sync_standby_priority = 1;
+			walsnd->sync_standby_group = 0;
+		}
+		LWLockRelease(SyncRepLock);
+
+		ereport(LOG, (errmsg("[NEON_WALPROPOSER] initialized as sync standby: lwpId=%d, state=STREAMING, priority=%d",
+							 walsnd->lwpId, walsnd->sync_standby_priority)));
+	}
 
 	/* Create replication slot for WAL proposer if not exists */
 	// if (SearchNamedReplicationSlot(WAL_PROPOSER_SLOT_NAME, false) == NULL)

@@ -2424,6 +2424,10 @@ impl DatadirModification<'_> {
         nblocks: BlockNumber,
         ctx: &RequestContext,
     ) -> Result<(), WalIngestError> {
+        tracing::info!(
+            "[RELCREATION_DEBUG] put_rel_creation: spcnode={}, dbnode={}, relnode={}, forknum={}, nblocks={}, lsn={}",
+            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum, nblocks, self.lsn
+        );
         if rel.relnode == 0 {
             Err(WalIngestErrorKind::LogicalError(anyhow::anyhow!(
                 "invalid relnode"
@@ -2432,6 +2436,11 @@ impl DatadirModification<'_> {
         // It's possible that this is the first rel for this db in this
         // tablespace.  Create the reldir entry for it if so.
         let mut dbdir = DbDirectory::des(&self.get(DBDIR_KEY, ctx).await?)?;
+        tracing::info!(
+            "[RELCREATION_DEBUG] current dbdir has {} entries: {:?}",
+            dbdir.dbdirs.len(),
+            dbdir.dbdirs.keys().collect::<Vec<_>>()
+        );
 
         let dbdir_exists =
             if let hash_map::Entry::Vacant(e) = dbdir.dbdirs.entry((rel.spcnode, rel.dbnode)) {
@@ -2443,8 +2452,16 @@ impl DatadirModification<'_> {
                     MetricsUpdate::Set(dbdir.dbdirs.len() as u64),
                 ));
                 self.put(DBDIR_KEY, Value::Image(buf.into()));
+                tracing::info!(
+                    "[RELCREATION_DEBUG] created new dbdir entry: spcnode={}, dbnode={}",
+                    rel.spcnode, rel.dbnode
+                );
                 false
             } else {
+                tracing::info!(
+                    "[RELCREATION_DEBUG] dbdir entry already exists: spcnode={}, dbnode={}",
+                    rel.spcnode, rel.dbnode
+                );
                 true
             };
 

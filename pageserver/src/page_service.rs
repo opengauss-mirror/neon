@@ -2473,12 +2473,16 @@ impl PageServerHandler {
         // during high-concurrency TPC-C workloads. OpenGauss uses update_lockwait_timeout=600s,
         // but transactions should complete in seconds, not minutes.
         //
-        // Tiered approach:
-        // - Small gap (<1MB): 3s timeout - normal operations should complete quickly
-        // - Medium gap (1-8MB): 10s timeout - some WAL lag but should catch up
-        // - Large gap (>8MB): 30s timeout - significant lag, give more time
-        const SMALL_LSN_GAP: u64 = 1 * 1024 * 1024;  // 1 MB
-        const LARGE_LSN_GAP: u64 = 8 * 1024 * 1024;  // 8 MB
+        // Tiered approach based on LSN gap:
+        // - Tiny gap (<1MB): 5s timeout - normal operations
+        // - Small gap (1-8MB): 15s timeout - some WAL lag
+        // - Medium gap (8-64MB): 60s timeout - moderate lag during bulk loads
+        // - Large gap (64-256MB): 120s timeout - significant lag during TPC-C benchmark
+        // - Huge gap (>256MB): 300s timeout - extreme lag, give maximum time
+        const TINY_LSN_GAP: u64 = 1 * 1024 * 1024;    // 1 MB
+        const SMALL_LSN_GAP: u64 = 8 * 1024 * 1024;   // 8 MB
+        const MEDIUM_LSN_GAP: u64 = 64 * 1024 * 1024; // 64 MB
+        const LARGE_LSN_GAP: u64 = 256 * 1024 * 1024; // 256 MB
         
         let lsn_gap = if max_effective_lsn > last_record_lsn {
             max_effective_lsn.0 - last_record_lsn.0
@@ -2488,16 +2492,39 @@ impl PageServerHandler {
 
         let effective_lsn_for_wait = max_effective_lsn;
         let wait_timeout = if lsn_gap > LARGE_LSN_GAP {
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(30))
+            // Huge gap (>256MB): maximum timeout
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(300))
+        } else if lsn_gap > MEDIUM_LSN_GAP {
+            // Large gap (64-256MB): 120s for heavy TPC-C workloads
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(120))
         } else if lsn_gap > SMALL_LSN_GAP {
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(10))
+            // Medium gap (8-64MB): 60s for bulk operations
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(60))
+        } else if lsn_gap > TINY_LSN_GAP {
+            // Small gap (1-8MB): 15s
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(15))
         } else if lsn_gap > 0 {
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(3))
+            // Tiny gap (<1MB): 5s
+            timeline::WaitLsnTimeout::Custom(Duration::from_secs(5))
         } else {
             timeline::WaitLsnTimeout::Default
         };
 
         if effective_lsn_for_wait > last_record_lsn {
+            // Log LSN gap for debugging WAL lag issues
+            if lsn_gap > SMALL_LSN_GAP {
+                let timeout_secs = match &wait_timeout {
+                    timeline::WaitLsnTimeout::Default => 60,
+                    timeline::WaitLsnTimeout::Custom(d) => d.as_secs(),
+                };
+                info!(
+                    "[LSN_GAP] waiting for LSN {}, last_record={}, gap={}MB, timeout={}s",
+                    effective_lsn_for_wait,
+                    last_record_lsn,
+                    lsn_gap / (1024 * 1024),
+                    timeout_secs
+                );
+            }
             if let Err(e) = timeline
                 .wait_lsn(
                     effective_lsn_for_wait,
@@ -2514,6 +2541,13 @@ impl PageServerHandler {
                 })
                 .await
             {
+                warn!(
+                    "[LSN_TIMEOUT] failed to wait for LSN {}, last_record={}, gap={}MB: {}",
+                    effective_lsn_for_wait,
+                    last_record_lsn,
+                    lsn_gap / (1024 * 1024),
+                    e
+                );
                 return Vec::from_iter(requests.into_iter().map(|req| {
                     Err(BatchedPageStreamError {
                         err: PageStreamError::from(e.clone()),
