@@ -753,7 +753,24 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 		 * itself is protected by transaction visibility; the worst case is
 		 * a re-read on the next access.  This avoids repeated 20-60 s stalls
 		 * when pageserver lags behind compute during heavy WAL generation.
+		 *
+		 * ENABLE_NEON (openGauss): Disable VM optimization for openGauss.
+		 * In high-concurrency DELETE scenarios, stale VM pages cause
+		 * index-heap inconsistency: SELECT via index sees rows that
+		 * DELETE cannot find in heap, causing infinite retry loops.
+		 * FSM optimization is still safe as it only affects space allocation.
 		 */
+#ifdef ENABLE_NEON
+		/* openGauss: Only use stale optimization for FSM, not VM */
+		if (forknum == FSM_FORKNUM)
+		{
+			result->not_modified_since = 1;
+			neon_log(DEBUG1,
+					 "neon_get_request_lsns FSM: set not_modified_since=1 to skip wait (lwlsn=%X/%X)",
+					 LSN_FORMAT_ARGS(last_written_lsn));
+		}
+#else
+		/* PostgreSQL: Original behavior - both FSM and VM use stale optimization */
 		if (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM)
 		{
 			result->not_modified_since = 1;
@@ -761,6 +778,7 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 					 "neon_get_request_lsns FSM/VM: set not_modified_since=1 to skip wait (lwlsn=%X/%X)",
 					 LSN_FORMAT_ARGS(last_written_lsn));
 		}
+#endif
 		else if (rinfo.spcNode == GLOBALTABLESPACE_OID)
 		{
 			/*

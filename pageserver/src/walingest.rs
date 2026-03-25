@@ -994,6 +994,17 @@ impl WalIngest {
     ) -> Result<(), WalIngestError> {
         let ClogZeroPage { segno, rpageno } = zero_page;
 
+        // Write a zero page (all transactions IN_PROGRESS).
+        // This is the correct behavior for CLOG_ZERO_PAGE WAL records.
+        // 
+        // NOTE: We previously had a fix here that wrote 0x55 (COMMITTED) instead
+        // of 0x00 (IN_PROGRESS), but this caused PANIC errors because new 
+        // in-progress transactions were incorrectly marked as committed before
+        // they actually committed.
+        //
+        // The bootstrap CLOG fix in import_datadir.rs is separate and only
+        // applies to the initial import of bootstrap data, not to runtime
+        // CLOG page creation.
         self.put_slru_page_image(
             modification,
             SlruKind::Clog,
@@ -1388,6 +1399,10 @@ impl WalIngest {
         rel: RelTag,
         ctx: &RequestContext,
     ) -> Result<(), WalIngestError> {
+        tracing::info!(
+            "[SMGR_DEBUG] walingest::put_rel_creation called: spcnode={}, dbnode={}, relnode={}, forknum={}",
+            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum
+        );
         modification.put_rel_creation(rel, 0, ctx).await?;
         Ok(())
     }

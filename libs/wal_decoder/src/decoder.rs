@@ -33,6 +33,35 @@ impl InterpretedWalRecord {
     ) -> anyhow::Result<HashMap<ShardIdentity, InterpretedWalRecord>> {
         let mut decoded = DecodedWALRecord::default();
         decode_wal_record(buf, &mut decoded, pg_version)?;
+        
+        // Debug: Log decoded WAL record info with block details
+        if !decoded.blocks.is_empty() {
+            let block_info: Vec<String> = decoded.blocks.iter()
+                .map(|b| format!("{}:{}", b.rnode_relnode, b.blkno))
+                .collect();
+            tracing::info!(
+                "[WAL_DECODE_ENTRY] lsn={}, xl_rmid={}, xl_info=0x{:02X}, blocks=[{}]",
+                next_record_lsn, decoded.xl_rmid, decoded.xl_info, block_info.join(",")
+            );
+        }
+        
+        // Log system catalog blocks specifically
+        // Global catalogs: pg_database (relnode=15353), pg_authid, etc. in spcnode=1664, dbnode=0
+        // Database catalogs: pg_class=14828, pg_attribute=14802, pg_type=14709
+        for blk in decoded.blocks.iter() {
+            let is_global_catalog = blk.rnode_dbnode == 0 && blk.rnode_spcnode == 1664;
+            let is_db_catalog = blk.rnode_relnode == 14802 || blk.rnode_relnode == 14828 || blk.rnode_relnode == 14709 ||
+               (blk.rnode_relnode >= 14700 && blk.rnode_relnode <= 14900);
+            let is_pg_database = blk.rnode_relnode == 15353;
+            
+            if is_global_catalog || is_db_catalog || is_pg_database {
+                tracing::info!(
+                    "[WAL_DECODE_SYSCAT] lsn={}, relnode={}, dbnode={}, spcnode={}, blkno={}, forknum={} (global={})",
+                    next_record_lsn, blk.rnode_relnode, blk.rnode_dbnode, blk.rnode_spcnode, blk.blkno, blk.forknum, is_global_catalog
+                );
+            }
+        }
+        
         let xid = decoded.xl_xid;
 
         let flush_uncommitted = if decoded.is_dbase_create_copy(pg_version) {
@@ -629,6 +658,10 @@ impl MetadataRecord {
         decoded: &DecodedWALRecord,
     ) -> anyhow::Result<Option<MetadataRecord>> {
         let info = decoded.xl_info & pg_constants::XLR_RMGR_INFO_MASK;
+        tracing::info!(
+            "[SMGR_DEBUG] decode_smgr_record: xl_info={:#x}, masked_info={:#x}, XLOG_SMGR_CREATE={:#x}",
+            decoded.xl_info, info, pg_constants::XLOG_SMGR_CREATE
+        );
         if info == pg_constants::XLOG_SMGR_CREATE {
             let create = XlSmgrCreate::decode(buf);
             let rel = RelTag {
@@ -637,6 +670,10 @@ impl MetadataRecord {
                 relnode: create.rnode.relnode,
                 forknum: create.forknum,
             };
+            tracing::info!(
+                "[SMGR_DEBUG] XLOG_SMGR_CREATE decoded: spcnode={}, dbnode={}, relnode={}, forknum={}",
+                rel.spcnode, rel.dbnode, rel.relnode, rel.forknum
+            );
 
             return Ok(Some(MetadataRecord::Smgr(SmgrRecord::Create(SmgrCreate {
                 rel,
@@ -669,7 +706,7 @@ impl MetadataRecord {
 
                 return Ok(Some(record));
             } else if info == postgres_ffi::V702::bindings::XLOG_DBASE_DROP {
-                let dropdb = XlDropDatabase::decode(buf);
+                let dropdb = XlDropDatabase::decode(buf, pg_version);
 
                 let record = MetadataRecord::Dbase(DbaseRecord::Drop(DbaseDrop {
                     db_id: dropdb.db_id,
