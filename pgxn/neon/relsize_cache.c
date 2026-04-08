@@ -232,10 +232,10 @@ forget_cached_relsize(NRelFileInfo rinfo, ForkNumber forknum)
 void
 relsize_hash_init(void)
 {
-	static bool initialized = false;
+	static THR_LOCAL bool relsize_gucs_initialized = false;
 	
 	// Prevent re-initialization in OpenGauss which may call _PG_init() multiple times
-	if (initialized)
+	if (relsize_gucs_initialized)
 		return;
 	
 	DefineCustomIntVariable("neon.relsize_hash_size",
@@ -249,7 +249,7 @@ relsize_hash_init(void)
 							0,
 							NULL, NULL, NULL);
 	
-	initialized = true;
+	relsize_gucs_initialized = true;
 }
 
 /*

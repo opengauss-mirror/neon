@@ -178,10 +178,10 @@ extern "C" {
 void
 pg_init_walproposer(void)
 {
-	static bool initialized = false;
+	static THR_LOCAL bool walproposer_gucs_initialized = false;
 	
 	// Prevent re-initialization in OpenGauss which may call _PG_init() multiple times
-	if (initialized)
+	if (walproposer_gucs_initialized)
 	{
 		wpg_log(LOG, "walproposer already initialized, skipping re-initialization");
 		return;
@@ -199,7 +199,7 @@ pg_init_walproposer(void)
 	// Don't register bgworker here - moved to WalproposerShmemInit()
 	// walprop_register_bgworker();
 	
-	initialized = true;
+	walproposer_gucs_initialized = true;
 }
 
 #ifdef __cplusplus
@@ -904,15 +904,23 @@ walprop_pg_init_walsender(void)
 	// if (SearchNamedReplicationSlot(WAL_PROPOSER_SLOT_NAME, false) == NULL)
 	if (!IsLogicalReplicationSlot(WAL_PROPOSER_SLOT_NAME))
 	{
+		XLogRecPtr restart_lsn;
+
 #if PG_MAJORVERSION_NUM >= 17
 		ReplicationSlotCreate(WAL_PROPOSER_SLOT_NAME, false, RS_PERSISTENT,
 							  false, false, false);
+		ReplicationSlotReserveWal();
 #else
-		// ReplicationSlotCreate(WAL_PROPOSER_SLOT_NAME, false, RS_PERSISTENT, false);
-		ReplicationSlotCreate(WAL_PROPOSER_SLOT_NAME, RS_PERSISTENT, false, InvalidOid, InvalidXLogRecPtr, InvalidXLogRecPtr);
+		/*
+		 * openGauss: ReplicationSlotCreate accepts restart_lsn parameter directly.
+		 * Set restart_lsn to current RedoRecPtr to prevent WAL removal before
+		 * walproposer receives first feedback from safekeeper quorum.
+		 * This is equivalent to PostgreSQL's ReplicationSlotReserveWal().
+		 */
+		restart_lsn = GetRedoRecPtr();
+		ReplicationSlotCreate(WAL_PROPOSER_SLOT_NAME, RS_PERSISTENT, false, InvalidOid, restart_lsn, InvalidXLogRecPtr);
+		ReplicationSlotsComputeRequiredLSN(NULL);
 #endif
-	    // @see logical.cpp CreateInitDecodingContext
-		// ReplicationSlotReserveWal(); FIXME: 创建一个logical slot， og没有对应的，也许可以 create_logical_replication_slot？
 		/* Write this slot to disk */
 		ReplicationSlotMarkDirty();
 		ReplicationSlotSave();

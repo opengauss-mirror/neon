@@ -11,20 +11,25 @@
 #include "postgres.h"
 
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
+#include <string.h>
+#include <time.h>
 
 #include "neon_pgversioncompat.h"
 
-//#include "access/parallel.h"
+// #include "access/parallel.h"
 #include "access/xlog.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/hashfn.h"
 #include "pgstat.h"
-//#include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
-//#include "postmaster/interrupt.h"
+// #include "postmaster/interrupt.h"
 #include RELFILEINFO_HDR
 #include "storage/buf/buf_internals.h"
 #include "storage/smgr/fd.h"
@@ -37,6 +42,221 @@
 #include "utils/builtins.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
+
+#if defined(__has_include)
+#if __has_include("storage/condition_variable.h")
+#include "storage/condition_variable.h"
+#define NEON_HAVE_CONDITION_VARIABLE 1
+#endif
+#endif
+
+#ifndef NEON_HAVE_CONDITION_VARIABLE
+/*
+ * openGauss does not provide PostgreSQL's ConditionVariable API. Implement a
+ * small compatibility layer with process-shared pthread condition variables.
+ */
+typedef struct ConditionVariable
+{
+	pthread_mutex_t	mutex;
+	pthread_cond_t	cond;
+	uint64			signal_count;
+} ConditionVariable;
+
+static __thread ConditionVariable *neon_cv_sleep_target;
+static __thread uint64 neon_cv_sleep_seq;
+
+static inline void ConditionVariableCancelSleep(void);
+
+static inline void
+neon_cv_compute_abstime(struct timespec *ts, long timeout_ms)
+{
+	int	rc;
+	long	sec;
+	long	nsec;
+
+	rc = clock_gettime(CLOCK_REALTIME, ts);
+	if (rc != 0)
+		elog(ERROR, "LFC: clock_gettime failed: %m");
+
+	sec = timeout_ms / 1000;
+	nsec = (timeout_ms % 1000) * 1000000L;
+	ts->tv_sec += sec;
+	ts->tv_nsec += nsec;
+	if (ts->tv_nsec >= 1000000000L)
+	{
+		ts->tv_sec += 1;
+		ts->tv_nsec -= 1000000000L;
+	}
+}
+
+static inline void
+ConditionVariableInit(ConditionVariable *cv)
+{
+	pthread_mutexattr_t mutex_attr;
+	pthread_condattr_t cond_attr;
+	int rc;
+
+	rc = pthread_mutexattr_init(&mutex_attr);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutexattr_init failed: %s", strerror(rc));
+	rc = pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutexattr_setpshared failed: %s", strerror(rc));
+	rc = pthread_mutex_init(&cv->mutex, &mutex_attr);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_init failed: %s", strerror(rc));
+	rc = pthread_mutexattr_destroy(&mutex_attr);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutexattr_destroy failed: %s", strerror(rc));
+
+	rc = pthread_condattr_init(&cond_attr);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_condattr_init failed: %s", strerror(rc));
+	rc = pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_condattr_setpshared failed: %s", strerror(rc));
+	rc = pthread_cond_init(&cv->cond, &cond_attr);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_cond_init failed: %s", strerror(rc));
+	rc = pthread_condattr_destroy(&cond_attr);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_condattr_destroy failed: %s", strerror(rc));
+
+	cv->signal_count = 0;
+}
+
+static inline void
+ConditionVariablePrepareToSleep(ConditionVariable *cv)
+{
+	int rc;
+
+	if (neon_cv_sleep_target != NULL && neon_cv_sleep_target != cv)
+		ConditionVariableCancelSleep();
+
+	rc = pthread_mutex_lock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_lock failed: %s", strerror(rc));
+	neon_cv_sleep_seq = cv->signal_count;
+	rc = pthread_mutex_unlock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_unlock failed: %s", strerror(rc));
+
+	neon_cv_sleep_target = cv;
+}
+
+static inline bool
+ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 wait_event_info)
+{
+	(void) wait_event_info;
+	struct timespec abstime;
+	int rc;
+	int wait_rc;
+
+	if (neon_cv_sleep_target != cv)
+		ConditionVariablePrepareToSleep(cv);
+
+	rc = pthread_mutex_lock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_lock failed: %s", strerror(rc));
+
+	if (cv->signal_count != neon_cv_sleep_seq)
+	{
+		neon_cv_sleep_seq = cv->signal_count;
+		rc = pthread_mutex_unlock(&cv->mutex);
+		if (rc != 0)
+			elog(ERROR, "LFC: pthread_mutex_unlock failed: %s", strerror(rc));
+		CHECK_FOR_INTERRUPTS();
+		return false;
+	}
+
+	if (timeout >= 0)
+	{
+		neon_cv_compute_abstime(&abstime, timeout);
+		wait_rc = pthread_cond_timedwait(&cv->cond, &cv->mutex, &abstime);
+	}
+	else
+	{
+		/*
+		 * We can't block forever with pthread_cond_wait(), because process
+		 * interrupts wouldn't wake us up. Poll with a 1s timeout instead.
+		 */
+		neon_cv_compute_abstime(&abstime, 1000);
+		wait_rc = pthread_cond_timedwait(&cv->cond, &cv->mutex, &abstime);
+	}
+
+	if (wait_rc == 0 && cv->signal_count != neon_cv_sleep_seq)
+		neon_cv_sleep_seq = cv->signal_count;
+
+	rc = pthread_mutex_unlock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_unlock failed: %s", strerror(rc));
+
+	CHECK_FOR_INTERRUPTS();
+
+	if (timeout >= 0 && wait_rc == ETIMEDOUT)
+		return true;
+	if (wait_rc != 0 && wait_rc != ETIMEDOUT)
+		elog(WARNING, "LFC: pthread_cond_timedwait failed: %s", strerror(wait_rc));
+	return false;
+}
+
+static inline void
+ConditionVariableSleep(ConditionVariable *cv, uint32 wait_event_info)
+{
+	(void) ConditionVariableTimedSleep(cv, -1 /* no timeout */, wait_event_info);
+}
+
+static inline void
+ConditionVariableCancelSleep(void)
+{
+	neon_cv_sleep_target = NULL;
+}
+
+static inline void
+ConditionVariableSignal(ConditionVariable *cv)
+{
+	int rc;
+
+	rc = pthread_mutex_lock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_lock failed: %s", strerror(rc));
+	cv->signal_count++;
+	rc = pthread_cond_signal(&cv->cond);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_cond_signal failed: %s", strerror(rc));
+	rc = pthread_mutex_unlock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_unlock failed: %s", strerror(rc));
+}
+
+static inline void
+ConditionVariableBroadcast(ConditionVariable *cv)
+{
+	int rc;
+
+	rc = pthread_mutex_lock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_lock failed: %s", strerror(rc));
+	cv->signal_count++;
+	rc = pthread_cond_broadcast(&cv->cond);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_cond_broadcast failed: %s", strerror(rc));
+	rc = pthread_mutex_unlock(&cv->mutex);
+	if (rc != 0)
+		elog(ERROR, "LFC: pthread_mutex_unlock failed: %s", strerror(rc));
+}
+#endif
+
+#ifdef WAIT_EVENT_END
+#define pgstat_report_wait_start(wait_event_info) pgstat_report_waitevent(wait_event_info)
+#define pgstat_report_wait_end() pgstat_report_waitevent(WAIT_EVENT_END)
+#endif
+
+#ifdef PGXC
+#define LFC_OPEN_FILE(path, flags) BasicOpenFile((path), (flags), S_IRUSR | S_IWUSR)
+#else
+#define LFC_OPEN_FILE(path, flags) BasicOpenFile((path), (flags))
+#endif
 
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
@@ -96,9 +316,10 @@
 #define MAX_BLOCKS_PER_CHUNK_LOG  7 /* 1Mb chunk */
 #define MAX_BLOCKS_PER_CHUNK	  (1 << MAX_BLOCKS_PER_CHUNK_LOG)
 
-#define MB					((uint64)1024*1024)
+#define KB					((uint64)1024)
+#define LFC_MIN_SIZE_KB		1024
 
-#define SIZE_MB_TO_CHUNKS(size) ((uint32)((size) * MB / BLCKSZ >> lfc_chunk_size_log))
+#define SIZE_KB_TO_CHUNKS(size_kb) ((uint32)(((uint64)(size_kb) * KB / BLCKSZ) >> lfc_chunk_size_log))
 #define BLOCK_TO_CHUNK_OFF(blkno) ((blkno) & (lfc_blocks_per_chunk-1))
 
 /*
@@ -164,7 +385,7 @@ typedef struct FileCacheControl
 								 * algorithm */
 	dlist_head  holes;          /* double linked list of punched holes */
 
-	//ConditionVariable cv[N_COND_VARS]; /* turnstile of condition variables */
+	ConditionVariable cv[N_COND_VARS]; /* turnstile of condition variables */
 
 	/*
 	 * Estimation of working set size.
@@ -209,7 +430,7 @@ typedef struct FileCacheControl
 
 static HTAB *lfc_hash;
 static int	lfc_desc = -1;
-//static LWLockId lfc_lock;
+static LWLock *lfc_lock;
 static int	lfc_max_size;
 static int	lfc_size_limit;
 static int	lfc_prewarm_limit;
@@ -217,6 +438,11 @@ static int	lfc_prewarm_batch;
 static int	lfc_chunk_size_log = MAX_BLOCKS_PER_CHUNK_LOG;
 static int	lfc_blocks_per_chunk = MAX_BLOCKS_PER_CHUNK;
 static char *lfc_path;
+/*
+ * openGauss keeps custom GUC definitions in session context, so each backend
+ * thread must register them once. Keep the guard thread-local.
+ */
+static THR_LOCAL bool lfc_gucs_initialized = false;
 static uint64 lfc_generation;
 static FileCacheControl *lfc_ctl;
 static bool lfc_do_prewarm;
@@ -227,6 +453,14 @@ bool lfc_prewarm_update_ws_estimation;
 bool AmPrewarmWorker;
 
 #define LFC_ENABLED() (lfc_ctl->limit != 0)
+
+#ifdef PGXC
+#define LFC_PGBUFFER_HITS_INC(n) ((void) 0)
+#define LFC_PGBUFFER_MISSES_INC(n) ((void) 0)
+#else
+#define LFC_PGBUFFER_HITS_INC(n) (pgBufferUsage.file_cache.hits += (n))
+#define LFC_PGBUFFER_MISSES_INC(n) (pgBufferUsage.file_cache.misses += (n))
+#endif
 
 PGDLLEXPORT void lfc_prewarm_main(Datum main_arg);
 
@@ -281,15 +515,15 @@ lfc_switch_off(void)
 		 */
 		unlink(lfc_path);
 
-		// fd = BasicOpenFile(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
-		// if (fd < 0)
-		// 	elog(WARNING, "LFC: failed to recreate local file cache %s: %m", lfc_path);
-		// else
-		// 	close(fd);
+		fd = LFC_OPEN_FILE(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
+		if (fd < 0)
+			elog(WARNING, "LFC: failed to recreate local file cache %s: %m", lfc_path);
+		else
+			close(fd);
 
 		/* Wakeup waiting backends */
-		// for (int i = 0; i < N_COND_VARS; i++)
-		// 	ConditionVariableBroadcast(&lfc_ctl->cv[i]);
+		for (int i = 0; i < N_COND_VARS; i++)
+			ConditionVariableBroadcast(&lfc_ctl->cv[i]);
 	}
 	lfc_close_file();
 }
@@ -299,9 +533,9 @@ lfc_disable(char const *op)
 {
 	elog(WARNING, "LFC: failed to %s local file cache at %s: %m, disabling local file cache", op, lfc_path);
 
-	//LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+	LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 	lfc_switch_off();
-	////LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 }
 
 /*
@@ -328,13 +562,13 @@ lfc_ensure_opened(void)
 	/* Open cache file if not done yet */
 	if (lfc_desc < 0)
 	{
-		// lfc_desc = BasicOpenFile(lfc_path, O_RDWR);
+		lfc_desc = LFC_OPEN_FILE(lfc_path, O_RDWR);
 
-		// if (lfc_desc < 0)
-		// {
-		// 	lfc_disable("open");
-		// 	return false;
-		// }
+		if (lfc_desc < 0)
+		{
+			lfc_disable("open");
+			return false;
+		}
 	}
 	return true;
 }
@@ -352,9 +586,13 @@ LfcShmemInit(void)
 	if (!found)
 	{
 		int			fd;
-		uint32		n_chunks = SIZE_MB_TO_CHUNKS(lfc_max_size);
+		uint32		n_chunks = SIZE_KB_TO_CHUNKS(lfc_max_size);
 
-		//lfc_lock = (LWLockId) GetNamedLWLockTranche("lfc_lock");
+#ifdef PGXC
+		lfc_lock = (LWLock *) LWLockAssign(LWTRANCHE_NEON_LWLSN);
+#else
+		lfc_lock = &GetNamedLWLockTranche("lfc_lock")[0].lock;
+#endif
 		info.keysize = sizeof(BufferTag);
 		info.entrysize = FILE_CACHE_ENRTY_SIZE;
 
@@ -374,22 +612,21 @@ LfcShmemInit(void)
 		initSHLL(&lfc_ctl->wss_estimation);
 
 		/* Recreate file cache on restart */
-		// fd = BasicOpenFile(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
-		// if (fd < 0)
-		// {
-		// 	elog(WARNING, "LFC: failed to create local file cache %s: %m", lfc_path);
-		// 	lfc_ctl->limit = 0;
-		// }
-		// else
-		// {
-		// 	close(fd);
-		// 	lfc_ctl->limit = SIZE_MB_TO_CHUNKS(lfc_size_limit);
-		// }
+		fd = LFC_OPEN_FILE(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
+		if (fd < 0)
+		{
+			elog(WARNING, "LFC: failed to create local file cache %s: %m", lfc_path);
+			lfc_ctl->limit = 0;
+		}
+		else
+		{
+			close(fd);
+			lfc_ctl->limit = SIZE_KB_TO_CHUNKS(lfc_size_limit);
+		}
 
 		/* Initialize turnstile of condition variables */
-		// for (int i = 0; i < N_COND_VARS; i++)
-		// 	ConditionVariableInit(&lfc_ctl->cv[i]);
-
+		for (int i = 0; i < N_COND_VARS; i++)
+			ConditionVariableInit(&lfc_ctl->cv[i]);
 	}
 }
 
@@ -398,8 +635,12 @@ LfcShmemRequest(void)
 {
 	if (lfc_max_size > 0)
 	{
-		RequestAddinShmemSpace(sizeof(FileCacheControl) + hash_estimate_size(SIZE_MB_TO_CHUNKS(lfc_max_size) + 1, FILE_CACHE_ENRTY_SIZE));
-		//RequestNamedLWLockTranche("lfc_lock", 1);
+		RequestAddinShmemSpace(sizeof(FileCacheControl) + hash_estimate_size(SIZE_KB_TO_CHUNKS(lfc_max_size) + 1, FILE_CACHE_ENRTY_SIZE));
+#ifdef PGXC
+		RequestAddinLWLocks(1);
+#else
+		RequestNamedLWLockTranche("lfc_lock", 1);
+#endif
 	}
 }
 
@@ -413,8 +654,7 @@ is_normal_backend(void)
 	 * SIGHUP and it has access to shared memory (UsedShmemSegAddr != NULL),
 	 * but has no PGPROC.
 	 */
-	//return lfc_ctl && MyProc && UsedShmemSegAddr && !IsParallelWorker();
-	return true; /* TODO:暂时屏蔽PG代码 */
+	return lfc_ctl && t_thrd.proc && UsedShmemSegAddr;
 }
 
 static bool
@@ -431,13 +671,50 @@ lfc_check_chunk_size(int *newval, void **extra, GucSource source)
 static void
 lfc_change_chunk_size(int newval, void* extra)
 {
-	//lfc_chunk_size_log = pg_ceil_log2_32(newval);
+	int			log2 = 0;
+	uint32		val = (uint32) newval;
+
+	while (val > 1)
+	{
+		val >>= 1;
+		log2++;
+	}
+	lfc_chunk_size_log = log2;
 }
 
 
 static bool
+lfc_check_size_floor_kb(int value_kb, const char *guc_name)
+{
+	if (value_kb != 0 && value_kb < LFC_MIN_SIZE_KB)
+	{
+		elog(ERROR, "LFC: %s must be 0 (disabled) or at least 1MB", guc_name);
+		return false;
+	}
+	return true;
+}
+
+static bool
+lfc_check_max_size_hook(int *newval, void **extra, GucSource source)
+{
+	if (!lfc_check_size_floor_kb(*newval, "neon.max_file_cache_size"))
+		return false;
+
+	if (*newval != 0 && lfc_size_limit != 0 && *newval < lfc_size_limit)
+	{
+		elog(ERROR, "LFC: neon.max_file_cache_size can not be smaller than neon.file_cache_size_limit");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
 lfc_check_limit_hook(int *newval, void **extra, GucSource source)
 {
+	if (!lfc_check_size_floor_kb(*newval, "neon.file_cache_size_limit"))
+		return false;
+
 	if (*newval > lfc_max_size)
 	{
 		elog(ERROR, "LFC: neon.file_cache_size_limit can not be larger than neon.max_file_cache_size");
@@ -446,20 +723,62 @@ lfc_check_limit_hook(int *newval, void **extra, GucSource source)
 	return true;
 }
 
+static const char *
+lfc_format_size_kb(int size_kb, char *buf, size_t buf_size)
+{
+	int64		result = size_kb;
+	const char *unit = "";
+
+	if (result > 0)
+	{
+		if (result % (1024 * 1024) == 0)
+		{
+			result /= (1024 * 1024);
+			unit = "GB";
+		}
+		else if (result % 1024 == 0)
+		{
+			result /= 1024;
+			unit = "MB";
+		}
+		else
+			unit = "kB";
+	}
+
+	snprintf(buf, buf_size, INT64_FORMAT "%s", result, unit);
+	return buf;
+}
+
+static const char *
+lfc_show_max_size(void)
+{
+	static THR_LOCAL char buf[32];
+
+	return lfc_format_size_kb(lfc_max_size, buf, sizeof(buf));
+}
+
+static const char *
+lfc_show_size_limit(void)
+{
+	static THR_LOCAL char buf[32];
+
+	return lfc_format_size_kb(lfc_size_limit, buf, sizeof(buf));
+}
+
 static void
 lfc_change_limit_hook(int newval, void *extra)
 {
-	uint32		new_size = SIZE_MB_TO_CHUNKS(newval);
+	uint32		new_size = SIZE_KB_TO_CHUNKS(newval);
 
 	if (!lfc_ctl || !is_normal_backend())
 		return;
 
-	//LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+	LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 	/* Open LFC file only if LFC was enabled or we are going to reenable it */
 	if (newval == 0 && !LFC_ENABLED())
 	{
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 		/* File should be reopened if LFC is reenabled */
 		lfc_close_file();
 		return;
@@ -467,7 +786,7 @@ lfc_change_limit_hook(int newval, void *extra)
 
 	if (!lfc_ensure_opened())
 	{
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 		return;
 	}
 
@@ -506,7 +825,7 @@ lfc_change_limit_hook(int newval, void *extra)
 		memset(&holetag, 0, sizeof(holetag));
 		holetag.blockNum = offset;
 		hash = get_hash_value(lfc_hash, &holetag);
-		//hole = hash_search_with_hash_value(lfc_hash, &holetag, hash, HASH_ENTER, &found);
+		hole = (FileCacheEntry *) hash_search_with_hash_value(lfc_hash, &holetag, hash, HASH_ENTER, &found);
 		hole->hash = hash;
 		hole->offset = offset;
 		hole->access_count = 0;
@@ -522,16 +841,14 @@ lfc_change_limit_hook(int newval, void *extra)
 
 	neon_log(DEBUG1, "set local file cache limit to %d", new_size);
 
-	//LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 }
 
 void
 lfc_init(void)
 {
-	static bool initialized = false;
-	
-	// Prevent re-initialization in OpenGauss which may call _PG_init() multiple times
-	if (initialized)
+	/* Prevent re-initialization in the same backend thread/session. */
+	if (lfc_gucs_initialized)
 		return;
 	
 	/*
@@ -572,10 +889,10 @@ lfc_init(void)
 							0,
 							INT_MAX,
 							PGC_POSTMASTER,
-							0x4000,
+							GUC_UNIT_KB,
+							lfc_check_max_size_hook,
 							NULL,
-							NULL,
-							NULL);
+							lfc_show_max_size);
 
 	DefineCustomIntVariable("neon.file_cache_size_limit",
 							"Current limit for size of Neon local file cache",
@@ -585,10 +902,10 @@ lfc_init(void)
 							0,
 							INT_MAX,
 							PGC_SIGHUP,
-							0x4000,
+							GUC_UNIT_KB,
 							lfc_check_limit_hook,
 							lfc_change_limit_hook,
-							NULL);
+							lfc_show_size_limit);
 
 	DefineCustomStringVariable("neon.file_cache_path",
 							   "Path to local file cache (can be raw device)",
@@ -640,7 +957,7 @@ lfc_init(void)
 							NULL,
 							NULL);
 	
-	initialized = true;
+	lfc_gucs_initialized = true;
 }
 
 FileCacheState*
@@ -1017,13 +1334,13 @@ lfc_cache_contains(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno)
 	CriticalAssert(BufTagGetRelNumber(&tag) != InvalidRelFileNumber);
 	hash = get_hash_value(lfc_hash, &tag);
 
-	//LWLockAcquire(lfc_lock, LW_SHARED);
+	LWLockAcquire(lfc_lock, LW_SHARED);
 	if (LFC_ENABLED())
 	{
-		//entry = hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
+		entry = (FileCacheEntry *) hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
 		found = entry != NULL && GET_STATE(entry, chunk_offs) != UNAVAILABLE;
 	}
-	//LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 	return found;
 }
 
@@ -1175,7 +1492,7 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 	 */
 	while (nblocks > 0)
 	{
-		//struct iovec iov[PG_IOV_MAX];
+		struct iovec iov[PG_IOV_MAX];
 		uint8	chunk_mask[MAX_BLOCKS_PER_CHUNK / 8] = {0};
 		int		chunk_offs = BLOCK_TO_CHUNK_OFF(blkno);
 		int		blocks_in_chunk = Min(nblocks, lfc_blocks_per_chunk - chunk_offs);
@@ -1185,17 +1502,17 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		int		n_blocks_to_read = 0;
 		int		iov_last_used = 0;
 		int		first_block_in_chunk_read = -1;
-		//ConditionVariable* cv;
+		ConditionVariable* cv;
 
 		Assert(blocks_in_chunk > 0);
 
 		for (int i = 0; i < blocks_in_chunk; i++)
 		{
-			//iov[i].iov_len = BLCKSZ;
+			iov[i].iov_len = BLCKSZ;
 			/* mask not set = we must do work */
 			if (!BITMAP_ISSET(mask, buf_offset + i))
 			{
-				// iov[i].iov_base = buffers[buf_offset + i];
+				iov[i].iov_base = buffers[buf_offset + i];
 				n_blocks_to_read++;
 				iov_last_used = i + 1;
 
@@ -1208,7 +1525,7 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 			else
 			{
 				/* don't scribble on pages we weren't requested to write to */
-				// iov[i].iov_base = SCRIBBLEPAGE;
+				iov[i].iov_base = SCRIBBLEPAGE;
 			}
 		}
 
@@ -1229,25 +1546,25 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 
 		tag.blockNum = blkno - chunk_offs;
 		hash = get_hash_value(lfc_hash, &tag);
-		//cv = &lfc_ctl->cv[hash % N_COND_VARS];
+		cv = &lfc_ctl->cv[hash % N_COND_VARS];
 
-		//LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+		LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 		/* We can return the blocks we've read before LFC got disabled;
 		 * assuming we read any. */
 		if (!LFC_ENABLED() || !lfc_ensure_opened())
 		{
-			//LWLockRelease(lfc_lock);
+			LWLockRelease(lfc_lock);
 			return blocks_read;
 		}
 
-		//entry = hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
+		entry = (FileCacheEntry *) hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
 		if (entry == NULL)
 		{
 			/* Pages are not cached */
 			lfc_ctl->misses += blocks_in_chunk;
-			//pgBufferUsage.file_cache.misses += blocks_in_chunk;
-			//LWLockRelease(lfc_lock);
+			LFC_PGBUFFER_MISSES_INC(blocks_in_chunk);
+			LWLockRelease(lfc_lock);
 
 			buf_offset += blocks_in_chunk;
 			nblocks -= blocks_in_chunk;
@@ -1276,7 +1593,7 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 
 			while (lfc_ctl->generation == generation)
 			{
-				//state = GET_STATE(entry, chunk_offs + i);
+				state = GET_STATE(entry, chunk_offs + i);
 				if (state == PENDING) {
 					SET_STATE(entry, chunk_offs + i, REQUESTED);
 				} else if (state != REQUESTED) {
@@ -1284,16 +1601,16 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 				}
 				if (!sleeping)
 				{
-					// ConditionVariablePrepareToSleep(cv);
+					ConditionVariablePrepareToSleep(cv);
 					sleeping = true;
 				}
-				//LWLockRelease(lfc_lock);
-				//ConditionVariableTimedSleep(cv, CV_WAIT_TIMEOUT, WAIT_EVENT_NEON_LFC_CV_WAIT);
-				// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+				LWLockRelease(lfc_lock);
+				ConditionVariableTimedSleep(cv, CV_WAIT_TIMEOUT, WAIT_EVENT_NEON_LFC_CV_WAIT);
+				LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 			}
 			if (sleeping)
 			{
-				//ConditionVariableCancelSleep();
+				ConditionVariableCancelSleep();
 			}
 			if (state == AVAILABLE)
 			{
@@ -1303,7 +1620,7 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 			else
 				iteration_misses++;
 		}
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 
 		Assert(iteration_hits + iteration_misses > 0);
 
@@ -1316,12 +1633,12 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 			/* offset of first IOV */
 			first_read_offset += chunk_offs + first_block_in_chunk_read;
 
-			//pgstat_report_wait_start(WAIT_EVENT_NEON_LFC_READ);
+			pgstat_report_wait_start(WAIT_EVENT_NEON_LFC_READ);
 
 			/* Read only the blocks we're interested in, limiting */
-			// rc = preadv(lfc_desc, &iov[first_block_in_chunk_read],
-			// 			nwrite, first_read_offset * BLCKSZ);
-			// pgstat_report_wait_end();
+			rc = preadv(lfc_desc, &iov[first_block_in_chunk_read],
+						nwrite, first_read_offset * BLCKSZ);
+			pgstat_report_wait_end();
 
 			if (rc != (BLCKSZ * nwrite))
 			{
@@ -1331,15 +1648,15 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		}
 
 		/* Place entry to the head of LRU list */
-		// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+		LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 		if (lfc_ctl->generation == generation)
 		{
 			CriticalAssert(LFC_ENABLED());
 			lfc_ctl->hits += iteration_hits;
 			lfc_ctl->misses += iteration_misses;
-			// pgBufferUsage.file_cache.hits += iteration_hits;
-			// pgBufferUsage.file_cache.misses += iteration_misses;
+			LFC_PGBUFFER_HITS_INC(iteration_hits);
+			LFC_PGBUFFER_MISSES_INC(iteration_misses);
 
 			if (iteration_hits)
 			{
@@ -1367,11 +1684,11 @@ lfc_readv_select(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		{
 			/* generation mismatch, assume error condition */
 			lfc_close_file();
-			//LWLockRelease(lfc_lock);
+			LWLockRelease(lfc_lock);
 			return -1;
 		}
 
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 
 		buf_offset += blocks_in_chunk;
 		nblocks -= blocks_in_chunk;
@@ -1673,11 +1990,11 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		addSHLL(&lfc_ctl->wss_estimation, hash_bytes((uint8_t const*)&tag, sizeof(tag)));
 	}
 
-	// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+	LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 	if (!LFC_ENABLED() || !lfc_ensure_opened())
 	{
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 		return;
 	}
 	generation = lfc_ctl->generation;
@@ -1693,25 +2010,25 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 	 */
 	while (nblocks > 0)
 	{
-		// struct iovec iov[PG_IOV_MAX];
+		struct iovec iov[PG_IOV_MAX];
 		int		chunk_offs = BLOCK_TO_CHUNK_OFF(blkno);
 		int		blocks_in_chunk = Min(nblocks, lfc_blocks_per_chunk - chunk_offs);
 		instr_time io_start, io_end;
-		// ConditionVariable* cv;
+		ConditionVariable* cv;
 
 		Assert(blocks_in_chunk > 0);
 
 		for (int i = 0; i < blocks_in_chunk; i++)
 		{
-			// iov[i].iov_base = unconstify(void *, buffers[buf_offset + i]);
-			// iov[i].iov_len = BLCKSZ;
+			iov[i].iov_base = (void *) buffers[buf_offset + i];
+			iov[i].iov_len = BLCKSZ;
 		}
 
 		tag.blockNum = blkno - chunk_offs;
 		hash = get_hash_value(lfc_hash, &tag);
-		// cv = &lfc_ctl->cv[hash % N_COND_VARS];
+		cv = &lfc_ctl->cv[hash % N_COND_VARS];
 
-		// entry = hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_ENTER, &found);
+		entry = (FileCacheEntry *) hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_ENTER, &found);
 		if (found)
 		{
 			/*
@@ -1758,26 +2075,26 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 				}
 				if (!sleeping)
 				{
-					// ConditionVariablePrepareToSleep(cv);
+					ConditionVariablePrepareToSleep(cv);
 					sleeping = true;
 				}
-				//LWLockRelease(lfc_lock);
-				// ConditionVariableTimedSleep(cv, CV_WAIT_TIMEOUT, WAIT_EVENT_NEON_LFC_CV_WAIT);
-				// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+				LWLockRelease(lfc_lock);
+				ConditionVariableTimedSleep(cv, CV_WAIT_TIMEOUT, WAIT_EVENT_NEON_LFC_CV_WAIT);
+				LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 			}
 			if (sleeping)
 			{
-				// ConditionVariableCancelSleep();
+				ConditionVariableCancelSleep();
 			}
 		}
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 
-		// pgstat_report_wait_start(WAIT_EVENT_NEON_LFC_WRITE);
+		pgstat_report_wait_start(WAIT_EVENT_NEON_LFC_WRITE);
 		INSTR_TIME_SET_CURRENT(io_start);
-		// rc = pwritev(lfc_desc, iov, blocks_in_chunk,
-		// 			 ((off_t) entry_offset * lfc_blocks_per_chunk + chunk_offs) * BLCKSZ);
+		rc = pwritev(lfc_desc, iov, blocks_in_chunk,
+					 ((off_t) entry_offset * lfc_blocks_per_chunk + chunk_offs) * BLCKSZ);
 		INSTR_TIME_SET_CURRENT(io_end);
-		// pgstat_report_wait_end();
+		pgstat_report_wait_end();
 
 		if (rc != BLCKSZ * blocks_in_chunk)
 		{
@@ -1786,7 +2103,7 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		}
 		else
 		{
-			// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+			LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 			if (lfc_ctl->generation == generation)
 			{
@@ -1812,7 +2129,7 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 					FileCacheBlockState state = GET_STATE(entry, chunk_offs + i);
 					if (state == REQUESTED)
 					{
-						// ConditionVariableBroadcast(cv);
+						ConditionVariableBroadcast(cv);
 					}
 					if (state != AVAILABLE)
 					{
@@ -1832,7 +2149,7 @@ lfc_writev(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		buf_offset += blocks_in_chunk;
 		nblocks -= blocks_in_chunk;
 	}
-	//LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 }
 
 typedef struct
@@ -1843,7 +2160,8 @@ typedef struct
 #define NUM_NEON_GET_STATS_COLS	2
 
 PG_FUNCTION_INFO_V1(neon_get_lfc_stats);
-Datum
+
+extern "C" Datum
 neon_get_lfc_stats(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -1868,7 +2186,7 @@ neon_get_lfc_stats(PG_FUNCTION_ARGS)
 		fctx = (NeonGetStatsCtx *) palloc(sizeof(NeonGetStatsCtx));
 
 		/* Construct a tuple descriptor for the result rows. */
-		// tupledesc = CreateTemplateTupleDesc(NUM_NEON_GET_STATS_COLS);
+		tupledesc = CreateTemplateTupleDesc(NUM_NEON_GET_STATS_COLS, false);
 
 		TupleDescInitEntry(tupledesc, (AttrNumber) 1, "lfc_key",
 						   TEXTOID, -1, 0);
@@ -1956,7 +2274,6 @@ neon_get_lfc_stats(PG_FUNCTION_ARGS)
 	SRF_RETURN_NEXT(funcctx, result);
 }
 
-
 /*
  * Function returning data from the local file cache
  * relation node/tablespace/database/blocknum and access_counter
@@ -1989,7 +2306,7 @@ typedef struct
 
 #define NUM_LOCALCACHE_PAGES_ELEM	7
 
-Datum
+extern "C" Datum
 local_cache_pages(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -2029,7 +2346,7 @@ local_cache_pages(PG_FUNCTION_ARGS)
 			neon_log(ERROR, "incorrect number of output arguments");
 
 		/* Construct a tuple descriptor for the result rows. */
-		// tupledesc = CreateTemplateTupleDesc(expected_tupledesc->natts);
+		tupledesc = CreateTemplateTupleDesc(expected_tupledesc->natts, false);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 1, "pageoffs",
 						   INT8OID, -1, 0);
 #if PG_MAJORVERSION_NUM < 16
@@ -2052,57 +2369,46 @@ local_cache_pages(PG_FUNCTION_ARGS)
 
 		fctx->tupdesc = BlessTupleDesc(tupledesc);
 
-		if (lfc_ctl)
+		if (lfc_ctl && LFC_ENABLED())
 		{
-			// LWLockAcquire(lfc_lock, LW_SHARED);
-
-			if (LFC_ENABLED())
-			{
-				hash_seq_init(&status, lfc_hash);
-				// while ((entry = hash_seq_search(&status)) != NULL)
-				// {
-				// 	/* Skip hole tags */
-				// 	if (NInfoGetRelNumber(BufTagGetNRelFileInfo(entry->key)) != 0)
-				// 	{
-				// 		for (int i = 0; i < lfc_blocks_per_chunk; i++)
-				// 			n_pages += GET_STATE(entry, i) == AVAILABLE;
-				// 	}
-				// }
-			}
-		}
-		// fctx->record = (LocalCachePagesRec *)
-		// 	MemoryContextAllocHuge(CurrentMemoryContext,
-		// 						   sizeof(LocalCachePagesRec) * n_pages);
-		
-
-		/* Set max calls and remember the user function context. */
-		funcctx->max_calls = n_pages;
-		funcctx->user_fctx = fctx;
-
-		/* Return to original context when allocating transient memory */
-		MemoryContextSwitchTo(oldcontext);
-
-		if (n_pages != 0)
-		{
-			/*
-			 * Scan through all the cache entries, saving the relevant fields
-			 * in the fctx->record structure.
-			 */
 			uint32		n = 0;
 
-			// hash_seq_init(&status, lfc_hash);
-			while ((entry = (FileCacheEntry*)hash_seq_search(&status)) != NULL)
+			LWLockAcquire(lfc_lock, LW_SHARED);
+
+			hash_seq_init(&status, lfc_hash);
+			while ((entry = (FileCacheEntry *) hash_seq_search(&status)) != NULL)
 			{
+				/* Hole tags reuse hash slots and can contain stale state bits. */
+				if (!OidIsValid(NInfoGetRelNumber(BufTagGetNRelFileInfo(entry->key))))
+					continue;
 				for (int i = 0; i < lfc_blocks_per_chunk; i++)
+					n_pages += GET_STATE(entry, i) == AVAILABLE;
+			}
+
+			if (n_pages != 0)
+			{
+				fctx->record = (LocalCachePagesRec *)
+					MemoryContextAlloc(CurrentMemoryContext,
+									   sizeof(LocalCachePagesRec) * n_pages);
+
+				/*
+				 * Scan through all the cache entries, saving the relevant fields
+				 * in the fctx->record structure.
+				 */
+				hash_seq_init(&status, lfc_hash);
+				while ((entry = (FileCacheEntry *) hash_seq_search(&status)) != NULL)
 				{
-					if (NInfoGetRelNumber(BufTagGetNRelFileInfo(entry->key)) != 0)
+					NRelFileInfo rinfo = BufTagGetNRelFileInfo(entry->key);
+					if (!OidIsValid(NInfoGetRelNumber(rinfo)))
+						continue;
+					for (int i = 0; i < lfc_blocks_per_chunk; i++)
 					{
 						if (GET_STATE(entry, i) == AVAILABLE)
 						{
 							fctx->record[n].pageoffs = entry->offset * lfc_blocks_per_chunk + i;
-							fctx->record[n].relfilenode = NInfoGetRelNumber(BufTagGetNRelFileInfo(entry->key));
-							fctx->record[n].reltablespace = NInfoGetSpcOid(BufTagGetNRelFileInfo(entry->key));
-							fctx->record[n].reldatabase = NInfoGetDbOid(BufTagGetNRelFileInfo(entry->key));
+							fctx->record[n].relfilenode = NInfoGetRelNumber(rinfo);
+							fctx->record[n].reltablespace = NInfoGetSpcOid(rinfo);
+							fctx->record[n].reldatabase = NInfoGetDbOid(rinfo);
 							fctx->record[n].forknum = entry->key.forkNum;
 							fctx->record[n].blocknum = entry->key.blockNum + i;
 							fctx->record[n].accesscount = entry->access_count;
@@ -2110,11 +2416,18 @@ local_cache_pages(PG_FUNCTION_ARGS)
 						}
 					}
 				}
+				Assert(n_pages == n);
 			}
-			Assert(n_pages == n);
+
+			LWLockRelease(lfc_lock);
 		}
-		// if (lfc_ctl)
-		// 	//LWLockRelease(lfc_lock);
+
+		/* Set max calls and remember the user function context. */
+		funcctx->max_calls = n_pages;
+		funcctx->user_fctx = fctx;
+
+		/* Return to original context when allocating transient memory */
+		MemoryContextSwitchTo(oldcontext);
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
@@ -2179,7 +2492,7 @@ struct LfcMetrics
 callback_get_lfc_metrics_unsafe(void)
 {
 	struct LfcMetrics result = {
-		.lfc_cache_size_limit = (int64) lfc_size_limit * 1024 * 1024,
+		.lfc_cache_size_limit = (int64) lfc_size_limit * 1024,
 		.lfc_hits = lfc_ctl ? lfc_ctl->hits : 0,
 		.lfc_misses = lfc_ctl ? lfc_ctl->misses : 0,
 		.lfc_used = lfc_ctl ? lfc_ctl->used : 0,
@@ -2198,10 +2511,9 @@ callback_get_lfc_metrics_unsafe(void)
 	return result;
 }
 
-
 PG_FUNCTION_INFO_V1(get_local_cache_state);
 
-Datum
+extern "C" Datum
 get_local_cache_state(PG_FUNCTION_ARGS)
 {
 	size_t max_entries = PG_ARGISNULL(0) ? lfc_prewarm_limit : PG_GETARG_INT32(0);
@@ -2214,7 +2526,7 @@ get_local_cache_state(PG_FUNCTION_ARGS)
 
 PG_FUNCTION_INFO_V1(prewarm_local_cache);
 
-Datum
+extern "C" Datum
 prewarm_local_cache(PG_FUNCTION_ARGS)
 {
 	bytea* state = PG_GETARG_BYTEA_PP(0);
@@ -2228,7 +2540,7 @@ prewarm_local_cache(PG_FUNCTION_ARGS)
 
 PG_FUNCTION_INFO_V1(get_prewarm_info);
 
-Datum
+extern "C" Datum
 get_prewarm_info(PG_FUNCTION_ARGS)
 {
 	Datum		values[4];
@@ -2276,4 +2588,3 @@ get_prewarm_info(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
-

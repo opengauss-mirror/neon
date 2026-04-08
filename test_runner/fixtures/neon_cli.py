@@ -209,7 +209,7 @@ class NeonLocalCli(AbstractNeonCli):
             "--timeline-id",
             str(timeline_id),
             "--pg-version",
-            pg_version,
+            pg_version.neon_local_cli_arg,
         ]
         if conf is not None:
             for key, value in conf.items():
@@ -288,7 +288,7 @@ class NeonLocalCli(AbstractNeonCli):
             "--timeline-id",
             str(timeline_id),
             "--pg-version",
-            pg_version,
+            pg_version.neon_local_cli_arg,
         ]
 
         res = self.raw_cli(cmd)
@@ -341,7 +341,7 @@ class NeonLocalCli(AbstractNeonCli):
             "--timeline-id",
             str(timeline_id),
             "--pg-version",
-            pg_version,
+            pg_version.neon_local_cli_arg,
             "--branch-name",
             new_branch_name,
             "--base-lsn",
@@ -520,7 +520,7 @@ class NeonLocalCli(AbstractNeonCli):
             "--branch-name",
             branch_name,
             "--pg-version",
-            pg_version,
+            pg_version.neon_local_cli_arg,
         ]
         if lsn is not None:
             args.extend(["--lsn", str(lsn)])

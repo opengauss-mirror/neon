@@ -453,13 +453,23 @@ void
 _PG_init(void)
 {
 	/*
+	 * Neon must still be loaded from shared_preload_libraries.
+	 * In openGauss, this function can run more than once (postmaster and
+	 * backend threads). Keep one-time/global initialization guarded below, but
+	 * allow session-local GUC registration before that guard.
+	 */
+	if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress)
+		return;
+
+	/* LFC GUCs live in session context, so register them on each preload pass. */
+	lfc_init();
+
+	/*
 	 * Also load 'neon_rmgr'. This makes it unnecessary to list both 'neon'
 	 * and 'neon_rmgr' in shared_preload_libraries.
 	 */
-    if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress 
-		|| g_instance.loadedNeonPlugin){
-        return;
-    }
+	if (g_instance.loadedNeonPlugin)
+		return;
 
 //	if (u_sess == NULL || u_sess->mcxt_group == NULL) {
 //		return;
@@ -510,7 +520,6 @@ _PG_init(void)
 	/* Stage 1: Define GUCs, and other early intialization */
 	pg_init_libpagestore();
 	relsize_hash_init();
-	lfc_init();
 	pg_init_walproposer();
 	/*
 	 * init_lwlsncache 只应该在 shared_preload_libraries 阶段调用，
@@ -660,7 +669,7 @@ PG_FUNCTION_INFO_V1(backpressure_throttling_time);
 PG_FUNCTION_INFO_V1(approximate_working_set_size_seconds);
 PG_FUNCTION_INFO_V1(approximate_working_set_size);
 
-Datum
+extern "C" Datum
 pg_cluster_size(PG_FUNCTION_ARGS)
 {
 	int64		size;
@@ -673,7 +682,7 @@ pg_cluster_size(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(size);
 }
 
-Datum
+extern "C" Datum
 backpressure_lsns(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	writePtr;
@@ -699,14 +708,14 @@ backpressure_lsns(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-Datum
+extern "C" Datum
 backpressure_throttling_time(PG_FUNCTION_ARGS)
 {
 	// PG_RETURN_UINT64(BackpressureThrottlingTime());
 	PG_RETURN_INT64(BackpressureThrottlingTime());
 }
 
-Datum
+extern "C" Datum
 approximate_working_set_size_seconds(PG_FUNCTION_ARGS)
 {
 	time_t		duration;
@@ -721,7 +730,7 @@ approximate_working_set_size_seconds(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(dc);
 }
 
-Datum
+extern "C" Datum
 approximate_working_set_size(PG_FUNCTION_ARGS)
 {
 	bool		reset = PG_GETARG_BOOL(0);
@@ -748,7 +757,7 @@ neon_shmem_request_hook(void)
 		prev_shmem_request_hook();
 #endif
 
-	LfcShmemRequest(); // lfc默认关闭，先屏蔽
+	LfcShmemRequest();
 	NeonPerfCountersShmemRequest();
 	PagestoreShmemRequest();
 	RelsizeCacheShmemRequest();

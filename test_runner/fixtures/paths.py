@@ -122,6 +122,11 @@ def compatibility_neon_binpath() -> Iterator[Path | None]:
 def pg_distrib_dir(base_dir: Path) -> Iterator[Path]:
     if env_postgres_bin := os.environ.get("POSTGRES_DISTRIB_DIR"):
         distrib_dir = Path(env_postgres_bin).resolve()
+    elif (default_pg_version := os.environ.get("DEFAULT_PG_VERSION", "")).upper().startswith(
+        "V"
+    ) and (base_dir / "og_install").exists():
+        # openGauss layout uses og_install/<Vxxx>/...
+        distrib_dir = base_dir / "og_install"
     else:
         distrib_dir = base_dir / "pg_install"
 

@@ -394,6 +394,119 @@ fn maybe_cgexec(cmd: &str) -> Command {
     }
 }
 
+fn parse_sysv_key_hex(raw: &str) -> Option<u32> {
+    let key = raw.strip_prefix("0x").unwrap_or(raw);
+    u32::from_str_radix(key, 16).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_opengauss_ipc(pg_port: u16) {
+    let Some(base_key) = (pg_port as u32).checked_mul(1000) else {
+        return;
+    };
+    let key_min = base_key.saturating_add(1);
+    let key_max = base_key.saturating_add(999);
+    let current_user = env::var("USER").unwrap_or_default();
+    if current_user.is_empty() {
+        return;
+    }
+
+    // Remove stale shared memory segments owned by current user.
+    if let Ok(output) = Command::new("ipcs").arg("-m").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() < 6 {
+                    continue;
+                }
+                let Some(key) = parse_sysv_key_hex(cols[0]) else {
+                    continue;
+                };
+                if key < key_min || key > key_max {
+                    continue;
+                }
+
+                let shmid = cols[1];
+                let owner = cols[2];
+                let nattch = cols[5].parse::<u32>().ok();
+                if owner != current_user || nattch != Some(0) {
+                    continue;
+                }
+
+                if let Ok(status) = Command::new("ipcrm").args(["-m", shmid]).status() {
+                    if status.success() {
+                        info!(
+                            "removed stale openGauss shared memory segment: key=0x{key:08x}, shmid={shmid}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Build semid -> creator PID mapping via `ipcs -s -p`.
+    let mut sem_cpid: HashMap<String, u32> = HashMap::new();
+    if let Ok(output) = Command::new("ipcs").args(["-s", "-p"]).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() >= 3 {
+                    if let Ok(cpid) = cols[2].parse::<u32>() {
+                        sem_cpid.insert(cols[0].to_string(), cpid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove stale semaphore sets owned by current user.
+    if let Ok(output) = Command::new("ipcs").arg("-s").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() < 4 {
+                    continue;
+                }
+                let Some(key) = parse_sysv_key_hex(cols[0]) else {
+                    continue;
+                };
+                if key < key_min || key > key_max {
+                    continue;
+                }
+
+                let semid = cols[1];
+                let owner = cols[2];
+                if owner != current_user {
+                    continue;
+                }
+
+                if let Some(&cpid) = sem_cpid.get(semid) {
+                    if cpid > 0 && Path::new(&format!("/proc/{cpid}")).exists() {
+                        info!(
+                            "skipping active openGauss semaphore set: key=0x{key:08x}, semid={semid}, cpid={cpid}"
+                        );
+                        continue;
+                    }
+                }
+
+                if let Ok(status) = Command::new("ipcrm").args(["-s", semid]).status() {
+                    if status.success() {
+                        info!(
+                            "removed stale openGauss semaphore set: key=0x{key:08x}, semid={semid}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cleanup_stale_opengauss_ipc(_pg_port: u16) {}
+
 struct PostgresHandle {
     postgres: std::process::Child,
     log_collector: JoinHandle<Result<()>>,
@@ -1706,6 +1819,8 @@ impl ComputeNode {
     pub fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
         let pgdata_path = Path::new(&self.params.pgdata);
         info!("testneon start_postgres...");
+        let is_opengauss = self.params.pgbin.contains("gaussdb")
+            || self.params.pgbin.contains("openGauss");
 
         // Run postgres as a child process.
         let env_vars: Vec<(&str, &str)> = if let Some(storage_auth_token) = &storage_auth_token {
@@ -1734,6 +1849,12 @@ impl ComputeNode {
                 .collect::<Vec<_>>()
                 .join(" ");
             info!("Environment variables: {}", env_str);
+        }
+
+        if is_opengauss {
+            if let Some(pg_port) = self.params.connstr.port() {
+                cleanup_stale_opengauss_ipc(pg_port);
+            }
         }
         
         let mut cmd = maybe_cgexec(&self.params.pgbin);
