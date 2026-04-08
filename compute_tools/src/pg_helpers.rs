@@ -382,6 +382,13 @@ pub fn wait_for_postgres(pg: &mut Child, pgdata: &Path) -> Result<()> {
     loop {
         if let Ok(Some(status)) = pg.try_wait() {
             // Postgres exited, that is not what we expected, bail out earlier.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    bail!("Postgres exited unexpectedly: terminated by signal {}", sig);
+                }
+            }
             let code = status.code().unwrap_or(-1);
             bail!("Postgres exited unexpectedly with code {}", code);
         }

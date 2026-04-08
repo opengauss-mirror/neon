@@ -305,7 +305,8 @@ metric_to_datums(metric_t *m, Datum *values, bool *nulls)
 }
 
 PG_FUNCTION_INFO_V1(neon_get_backend_perf_counters);
-Datum
+
+extern "C" Datum
 neon_get_backend_perf_counters(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -358,7 +359,8 @@ qt_histogram_merge_into(QTHistogram into, QTHistogram from)
 }
 
 PG_FUNCTION_INFO_V1(neon_get_perf_counters);
-Datum
+
+extern "C" Datum
 neon_get_perf_counters(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;

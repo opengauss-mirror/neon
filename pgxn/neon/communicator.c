@@ -75,24 +75,6 @@
 #include "neon_perf_counters.h"
 #include "pagestore_client.h"
 
-/*
- * In openGauss (PGXC-based) builds, Neon runs inside a thread-pool style
- * backend rather than PostgreSQL's traditional one-process-per-backend
- * model.  The original prefetch implementation assumes a stable per-backend
- * PrefetchState (MyPState) lifetime, which does not hold in openGauss and
- * has caused crashes (NULL / partially initialised MyPState, lifetime
- * mismatches, etc.).
- *
- * For the purposes of basic Neon functionality on openGauss (branch
- * creation, page reads via pageserver, etc.), prefetch is an optimisation
- * only.  To favour correctness and stability, we completely disable prefetch
- * in PGXC builds: all prefetch entry points become cheap no-ops and never
- * touch MyPState or related state.
- */
-#ifdef PGXC
-#define NEON_PREFETCH_DISABLED 1
-#endif
-
 #if PG_VERSION_NUM >= 150000
 #include "access/xlogrecovery.h"
 #endif
@@ -135,6 +117,13 @@ THR_LOCAL static bool		timeout_set = false;
 THR_LOCAL static bool		timeout_signaled = false;
 
 /*
+ * openGauss doesn't initialize timeout.c state in backend startup path.
+ * We need to do that before first RegisterTimeout()/enable_timeout_after().
+ */
+THR_LOCAL static bool		timeout_module_initialized = false;
+
+
+/*
  * We have a CHECK_FOR_INTERRUPTS in page_server->receive(), and we don't want
  * that to handle any getpage responses if we're already working on the
  * backlog of those, as we'd hit issues with determining which prefetch slot
@@ -150,6 +139,16 @@ THR_LOCAL static bool		timeout_signaled = false;
 THR_LOCAL static bool		readpage_reentrant_guard = false;
 
 static void pagestore_timeout_handler(void);
+
+static inline void
+ensure_timeout_module_initialized(void)
+{
+	if (!timeout_module_initialized)
+	{
+		InitializeTimeouts();
+		timeout_module_initialized = true;
+	}
+}
 
 #define START_PREFETCH_RECEIVE_WORK() \
 	do { \
@@ -509,10 +508,6 @@ check_getpage_response(PrefetchRequest* slot, NeonResponse* resp)
 void
 communicator_prefetch_pump_state(void)
 {
-#ifdef NEON_PREFETCH_DISABLED
-	/* Prefetch is disabled in openGauss builds; nothing to do. */
-	return;
-#else
 	START_PREFETCH_RECEIVE_WORK();
 
 	while (MyPState->ring_receive != MyPState->ring_flush)
@@ -569,16 +564,11 @@ communicator_prefetch_pump_state(void)
 	END_PREFETCH_RECEIVE_WORK();
 
 	communicator_reconfigure_timeout_if_needed();
-#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 void
 readahead_buffer_resize(int newsize, void *extra)
 {
-#ifdef NEON_PREFETCH_DISABLED
-	/* No prefetch state to resize when prefetch is disabled. */
-	return;
-#else
 	uint64		end,
 				nfree = newsize;
 	PrefetchState *newPState;
@@ -696,7 +686,6 @@ readahead_buffer_resize(int newsize, void *extra)
 	prfh_destroy(MyPState->prf_hash);
 	pfree(MyPState);
 	MyPState = newPState;
-#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 
@@ -930,10 +919,6 @@ prefetch_read(PrefetchRequest *slot)
 bool
 communicator_prefetch_receive(BufferTag tag)
 {
-#ifdef NEON_PREFETCH_DISABLED
-	/* Prefetch is disabled; there is nothing pending to wait for. */
-	return false;
-#else
 	PrfHashEntry *entry;
 	PrefetchRequest hashkey;
 
@@ -946,7 +931,6 @@ communicator_prefetch_receive(BufferTag tag)
 		return true;
 	}
 	return false;
-#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 /*
@@ -958,19 +942,6 @@ communicator_prefetch_receive(BufferTag tag)
 void
 prefetch_on_ps_disconnect(void)
 {
-#ifdef NEON_PREFETCH_DISABLED
-	/*
-	 * In openGauss/PGXC mode we entirely disable prefetch.  This hook is still
-	 * invoked from pageserver_disconnect(), but to avoid any dependency on
-	 * backend-local Neon state (MyPState, MyNeonCounters, etc.) we make it a
-	 * strict no-op here.
-	 *
-	 * This guarantees that background worker threads or thread-pool workers
-	 * that never initialised Neon perf-counters or prefetch state cannot crash
-	 * during connection teardown.
-	 */
-	return;
-#else
 	/*
 	 * In some background processes (e.g. AVClauncher, WLM workers on openGauss),
 	 * the process can register the prefetch_on_exit() callback via
@@ -1097,7 +1068,6 @@ prefetch_on_ps_disconnect(void)
 	}
 
 	RESUME_INTERRUPTS();
-#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 /*
@@ -1216,16 +1186,6 @@ communicator_prefetch_lookupv(NRelFileInfo rinfo, ForkNumber forknum, BlockNumbe
 							  neon_request_lsns *lsns, BlockNumber nblocks,
 							  void **buffers, bits8 *mask)
 {
-#ifdef NEON_PREFETCH_DISABLED
-	/*
-	 * Prefetch is disabled, so there can never be any hits in the local
-	 * prefetch buffer.  Report zero hits and ensure the bitmap (if any) is
-	 * cleared so callers don't treat any blocks as already present.
-	 */
-	if (mask != NULL)
-		MemSet(mask, 0, BITMAPLEN(nblocks));
-	return 0;
-#else
 	int hits = 0;
 	PrefetchRequest hashkey;
 
@@ -1293,7 +1253,6 @@ communicator_prefetch_lookupv(NRelFileInfo rinfo, ForkNumber forknum, BlockNumbe
 	}
 	pgBufferUsage.prefetch.hits += hits;
 	return hits;
-#endif
 }
 
 /*
@@ -1321,21 +1280,12 @@ void
 communicator_prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 									   BlockNumber nblocks, const bits8 *mask)
 {
-#ifdef NEON_PREFETCH_DISABLED
-	/* Prefetch is disabled; registering speculative reads is a no-op. */
-	(void) tag;
-	(void) frlsns;
-	(void) nblocks;
-	(void) mask;
-	return;
-#else
 	uint64		ring_index PG_USED_FOR_ASSERTS_ONLY;
 
 	ring_index = prefetch_register_bufferv(tag, frlsns, nblocks, mask, true);
 
 	Assert(ring_index < MyPState->ring_unused &&
 		   MyPState->ring_last <= ring_index);
-#endif							/* NEON_PREFETCH_DISABLED */
 }
 
 /* Internal version. Returns the ring index of the last block (result of this function is used only
@@ -2811,6 +2761,8 @@ communicator_reconfigure_timeout_if_needed(void)
 
 	if (needs_set != timeout_set)
 	{
+		ensure_timeout_module_initialized();
+
 		/* The background writer doens't (shouldn't) read any pages */
 		Assert(!AmBackgroundWriterProcess());
 		/* The checkpointer doens't (shouldn't) read any pages */
@@ -2838,7 +2790,7 @@ communicator_reconfigure_timeout_if_needed(void)
 		else
 		{
 			Assert(timeout_set);
-			//disable_timeout(PS_TIMEOUT_ID, false);
+			disable_timeout((TimeoutId) PS_TIMEOUT_ID, false);
 			timeout_set = false;
 		}
 	}

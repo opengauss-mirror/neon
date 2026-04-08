@@ -278,14 +278,12 @@ impl FileCacheState {
             "updating file cache size {capped}",
         );
 
-        // note: even though the normal ways to get the cache size produce values with trailing "MB"
-        // (hence why we call pg_size_bytes in `get_file_cache_size`'s query), the format
-        // it expects to set the value is "integer number of MB" without trailing units.
-        // For some reason, this *really* wasn't working with normal arguments, so that's
-        // why we're constructing the query here.
+        // Set with an explicit unit to avoid depending on the GUC base unit.
+        // This keeps behavior stable across forks where custom memory GUCs can
+        // use different internal units (e.g. kB vs blocks).
         self.client
             .query(
-                &format!("ALTER SYSTEM SET neon.file_cache_size_limit = {num_mb};"),
+                &format!("ALTER SYSTEM SET neon.file_cache_size_limit = '{num_mb}MB';"),
                 &[],
             )
             .await

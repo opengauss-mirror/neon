@@ -7,6 +7,7 @@ import dataclasses
 import filecmp
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -166,6 +167,14 @@ def neon_api_base_url() -> str:
 @pytest.fixture(scope="session")
 def neon_api(neon_api_key: str, neon_api_base_url: str) -> NeonAPI:
     return NeonAPI(neon_api_key, neon_api_base_url)
+
+
+try:
+    import xdist  # noqa: F401
+except ImportError:
+    @pytest.fixture(scope="session")
+    def worker_id():
+        return "master"
 
 
 @pytest.fixture(scope="session")
@@ -1153,13 +1162,17 @@ class NeonEnv:
                 config.use_https_storage_controller_api,
             )
         else:
-            # Find two adjacent ports for storage controller and its postgres DB.  This
-            # loop would eventually throw from get_port() if we run out of ports (extremely
-            # unlikely): usually we find two adjacent free ports on the first iteration.
+            # Find three adjacent ports for storage controller:
+            # API port, DB port, and one extra DB-side listener port.
+            # The extra reservation avoids collisions with endpoint_storage.
             while True:
                 storage_controller_port = self.port_distributor.get_port()
                 storage_controller_pg_port = self.port_distributor.get_port()
-                if storage_controller_pg_port == storage_controller_port + 1:
+                storage_controller_db_aux_port = self.port_distributor.get_port()
+                if (
+                    storage_controller_pg_port == storage_controller_port + 1
+                    and storage_controller_db_aux_port == storage_controller_pg_port + 1
+                ):
                     break
 
             self.storage_controller_port = storage_controller_port
@@ -1365,6 +1378,16 @@ class NeonEnv:
                 # Silence those warnings categorically.
                 log.info("test may use old binaries, ignoring warnings about unknown config items")
                 ps.allowed_errors.append(".*ignoring unknown configuration item.*")
+
+            if self.pg_version.is_opengauss:
+                # openGauss initdb payload contains additional files unknown to pageserver's
+                # postgres datadir filter and can also exceed default upload compression warning
+                # thresholds during bootstrap.
+                ps.allowed_errors.append(".*compressed .* size of .* is above limit .*")
+                ps.allowed_errors.append(".*unrecognized file in postgres datadir: .*")
+                ps.allowed_errors.append(
+                    ".*max_imcs_cache \\* htap_borrow_mem_percent is larger than max_borrow_memory.*"
+                )
 
             self.pageservers.append(ps)
             cfg["pageservers"].append(ps_cfg)
@@ -3327,14 +3350,63 @@ class PgBin:
     def __init__(self, log_dir: Path, pg_distrib_dir: Path, pg_version: PgVersion):
         self.log_dir = log_dir
         self.pg_version = pg_version
+        self.pg_distrib_dir = pg_distrib_dir
         self.pg_bin_path = pg_distrib_dir / pg_version.v_prefixed / "bin"
         self.pg_lib_dir = pg_distrib_dir / pg_version.v_prefixed / "lib"
         self.env = os.environ.copy()
         self.env["LD_LIBRARY_PATH"] = str(self.pg_lib_dir)
 
+    def _resolve_opengauss_pgbench(self) -> Path | None:
+        if not self.pg_version.is_opengauss:
+            return None
+
+        arch = platform.machine().lower()
+        arch_dir = {"aarch64": "aarch64", "arm64": "aarch64", "x86_64": "x86_64", "amd64": "x86_64"}.get(arch)
+        if arch_dir is None:
+            return None
+
+        bundled = (
+            self.pg_distrib_dir.parent
+            / "vendor"
+            / "openGauss"
+            / "src"
+            / "test"
+            / "regress"
+            / "data"
+            / "pgbench"
+            / arch_dir
+            / "pgbench"
+        )
+        if not bundled.exists():
+            return None
+
+        if os.access(bundled, os.X_OK):
+            return bundled
+
+        # Keep repository files unchanged: copy bundled pgbench to writable test output.
+        fallback = self.log_dir / f"pgbench-{arch_dir}"
+        if not fallback.exists():
+            shutil.copy2(bundled, fallback)
+            fallback.chmod(fallback.stat().st_mode | 0o755)
+        return fallback
+
     def _fixpath(self, command: list[str]):
         if "/" not in str(command[0]):
-            command[0] = str(self.pg_bin_path / command[0])
+            binary = str(command[0])
+            default_path = self.pg_bin_path / binary
+            if default_path.exists():
+                command[0] = str(default_path)
+                return
+
+            if binary == "pgbench" and self.pg_version.is_opengauss:
+                if fallback_pgbench := self._resolve_opengauss_pgbench():
+                    log.info(
+                        f"'{default_path}' not found, using openGauss bundled pgbench at '{fallback_pgbench}'"
+                    )
+                    command[0] = str(fallback_pgbench)
+                    return
+
+            command[0] = str(default_path)
 
     def _build_env(self, env_add: Env | None) -> Env:
         if env_add is None:
@@ -4777,8 +4849,9 @@ class Endpoint(PgProtocol, LogUtils):
         self.logfile = self.endpoint_path() / "compute.log"
 
         # set small 'max_replication_write_lag' to enable backpressure
-        # and make tests more stable.
-        config_lines = ["max_replication_write_lag=15MB"] + config_lines
+        # and make tests more stable. openGauss does not support this GUC.
+        if not self.env.pg_version.is_opengauss:
+            config_lines = ["max_replication_write_lag=15MB"] + config_lines
 
         # Delete file cache if it exists (and we're recreating the endpoint)
         if USE_LFC:
@@ -4786,11 +4859,17 @@ class Endpoint(PgProtocol, LogUtils):
                 lfc_path.unlink()
             else:
                 lfc_path.parent.mkdir(parents=True, exist_ok=True)
+            has_max_file_cache_size = False
+            has_file_cache_size_limit = False
             for line in config_lines:
                 if (
                     line.find("neon.max_file_cache_size") > -1
                     or line.find("neon.file_cache_size_limit") > -1
                 ):
+                    if re.search(r"^\s*neon\.max_file_cache_size\b", line):
+                        has_max_file_cache_size = True
+                    if re.search(r"^\s*neon\.file_cache_size_limit\b", line):
+                        has_file_cache_size_limit = True
                     m = re.search(r"=\s*(\S+)", line)
                     assert m is not None, f"malformed config line {line}"
                     size = m.group(1)
@@ -4799,13 +4878,14 @@ class Endpoint(PgProtocol, LogUtils):
                             "LFC size cannot be set less than 1MB"
                         )
             lfc_path_escaped = str(lfc_path).replace("'", "''")
-            config_lines = [
-                f"neon.file_cache_path = '{lfc_path_escaped}'",
-                # neon.max_file_cache_size and neon.file_cache size limits are
-                # set to 1MB because small LFC is better for testing (helps to find more problems)
-                "neon.max_file_cache_size = 1MB",
-                "neon.file_cache_size_limit = 1MB",
-            ] + config_lines
+            lfc_default_lines = []
+            # Keep tiny defaults when test does not provide explicit LFC sizing.
+            if not has_max_file_cache_size:
+                lfc_default_lines.append("neon.max_file_cache_size = 1MB")
+            if not has_file_cache_size_limit:
+                lfc_default_lines.append("neon.file_cache_size_limit = 1MB")
+
+            config_lines = [f"neon.file_cache_path = '{lfc_path_escaped}'"] + lfc_default_lines + config_lines
         else:
             for line in config_lines:
                 assert line.find("neon.max_file_cache_size") == -1, (
@@ -6150,7 +6230,12 @@ def wait_for_last_flush_lsn(
     shards = tenant_get_shards(env, tenant, pageserver_id)
 
     if last_flush_lsn is None:
-        last_flush_lsn = Lsn(endpoint.safe_psql("SELECT pg_current_wal_flush_lsn()")[0][0])
+        flush_lsn_sql = (
+            "SELECT pg_current_xlog_location()"
+            if env.pg_version.is_opengauss
+            else "SELECT pg_current_wal_flush_lsn()"
+        )
+        last_flush_lsn = Lsn(endpoint.safe_psql(flush_lsn_sql)[0][0])
         # The last_flush_lsn may not correspond to a record boundary.
         # For example, if the compute flushed WAL on a page boundary,
         # the remaining part of the record might not be flushed for a long time.

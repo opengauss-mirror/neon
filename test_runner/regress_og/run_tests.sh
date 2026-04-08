@@ -178,7 +178,7 @@ parse_args() {
 
 # Detect ports from running Neon endpoints
 detect_endpoint_ports() {
-    local neon_local="${NEON_ROOT}/target/${BUILD_TYPE:-debug}/neon_local"
+    local neon_local="${NEON_ROOT}/target/${BUILD_TYPE:-release}/neon_local"
     
     if [[ -f "${neon_local}" ]] && [[ -d "${SCRIPT_DIR}/.neon" ]]; then
         log_info "Detecting endpoint ports from neon_local..."

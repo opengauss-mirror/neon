@@ -16,6 +16,9 @@ class PgVersion(StrEnum):
     V16 = "16"
     V17 = "17"
 
+    V702 = "V702"
+    V703 = "V703"
+
     # Postgres Version for tests that uses `fixtures.utils.run_only_on_default_postgres`
     DEFAULT = V17
 
@@ -32,11 +35,58 @@ class PgVersion(StrEnum):
     def __str__(self) -> str:
         return self.value
 
+    @property
+    def is_opengauss(self) -> bool:
+        return self in (PgVersion.V702, PgVersion.V703)
+
+    @property
+    def neon_local_cli_arg(self) -> str:
+        # neon_local currently accepts PostgreSQL major versions. openGauss variants
+        # use the PG14-compatible protocol/storage format in the local test setup.
+        if self.is_opengauss:
+            return "14"
+        return self.value
+
     # In GitHub workflows we use Postgres version with v-prefix (e.g. v14 instead of just 14),
     # sometime we need to do so in tests.
     @property
     def v_prefixed(self) -> str:
+        if self.is_opengauss:
+            return self.value
         return f"v{self.value}"
+
+    @override
+    def __int__(self) -> int:
+        if self == PgVersion.NOT_SET:
+            raise ValueError("Cannot convert PgVersion.NOT_SET to int")
+        return int(self.neon_local_cli_arg)
+
+    def _cmp_key(self) -> int:
+        return int(self)
+
+    @override
+    def __lt__(self, other: object) -> bool:
+        if isinstance(other, PgVersion):
+            return self._cmp_key() < other._cmp_key()
+        return NotImplemented
+
+    @override
+    def __le__(self, other: object) -> bool:
+        if isinstance(other, PgVersion):
+            return self._cmp_key() <= other._cmp_key()
+        return NotImplemented
+
+    @override
+    def __gt__(self, other: object) -> bool:
+        if isinstance(other, PgVersion):
+            return self._cmp_key() > other._cmp_key()
+        return NotImplemented
+
+    @override
+    def __ge__(self, other: object) -> bool:
+        if isinstance(other, PgVersion):
+            return self._cmp_key() >= other._cmp_key()
+        return NotImplemented
 
     @classmethod
     @override
