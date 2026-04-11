@@ -337,7 +337,7 @@ async fn task_stats(stats: Arc<BrokerStats>) {
                 let now = BrokerStats::now_millis();
                 if now > last_pulled && now - last_pulled > warn_duration.as_millis() as u64 {
                     let ts = chrono::DateTime::from_timestamp_millis(last_pulled as i64).expect("invalid timestamp");
-                    info!("no broker updates for some time, last update: {:?}", ts);
+                    debug!("no broker updates for some time, last update: {:?}", ts);
                 }
             }
         }

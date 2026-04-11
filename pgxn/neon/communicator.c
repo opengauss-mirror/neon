@@ -112,16 +112,27 @@ process_interrupts_callback_t ProcessInterruptsCallback = NULL;
  * at any CHECK_FOR_INTERRUPTS point.
  */
 int				readahead_getpage_pull_timeout_ms = 50;
-THR_LOCAL static int		PS_TIMEOUT_ID = 0;
+
+#ifdef ENABLE_NEON
+/*
+ * OpenGauss uses a thread-per-connection model. The timeout.c module uses
+ * process-global state (active_timeouts[], num_active_timeouts, SIGALRM via
+ * setitimer) that is NOT thread-safe. Multiple worker threads calling
+ * RegisterTimeout/enable_timeout/disable_timeout concurrently corrupt the
+ * shared active_timeouts array, leading to SIGSEGV in schedule_alarm() when
+ * active_timeouts[0] becomes NULL while num_active_timeouts > 0.
+ *
+ * Fix: replace SIGALRM-based timeout with a simple timestamp-based polling
+ * approach that is fully thread-local and avoids the unsafe timeout.c API.
+ */
 THR_LOCAL static bool		timeout_set = false;
 THR_LOCAL static bool		timeout_signaled = false;
-
-/*
- * openGauss doesn't initialize timeout.c state in backend startup path.
- * We need to do that before first RegisterTimeout()/enable_timeout_after().
- */
-THR_LOCAL static bool		timeout_module_initialized = false;
-
+THR_LOCAL static TimestampTz	last_pump_timestamp = 0;
+#else
+static int		PS_TIMEOUT_ID = 0;
+static bool		timeout_set = false;
+static bool		timeout_signaled = false;
+#endif
 
 /*
  * We have a CHECK_FOR_INTERRUPTS in page_server->receive(), and we don't want
@@ -138,17 +149,9 @@ THR_LOCAL static bool		timeout_module_initialized = false;
  */
 THR_LOCAL static bool		readpage_reentrant_guard = false;
 
+#ifndef ENABLE_NEON
 static void pagestore_timeout_handler(void);
-
-static inline void
-ensure_timeout_module_initialized(void)
-{
-	if (!timeout_module_initialized)
-	{
-		InitializeTimeouts();
-		timeout_module_initialized = true;
-	}
-}
+#endif
 
 #define START_PREFETCH_RECEIVE_WORK() \
 	do { \
@@ -2752,17 +2755,50 @@ communicator_read_slru_segment(SlruKind kind, int64 segno, neon_request_lsns *re
 	return n_blocks;
 }
 
+#ifdef ENABLE_NEON
+/*
+ * OpenGauss timestamp-polling replacement for SIGALRM-based timeout.
+ * Check if enough time has elapsed since last pump and set timeout_signaled.
+ */
 void
 communicator_reconfigure_timeout_if_needed(void)
 {
 	bool	needs_set = MyPState->ring_receive != MyPState->ring_unused &&
-						!AmPrewarmWorker && /* do not pump prefetch state in prewarm worker */
+						!AmPrewarmWorker &&
+						readahead_getpage_pull_timeout_ms > 0;
+
+	if (needs_set)
+	{
+		TimestampTz now = GetCurrentTimestamp();
+
+		if (!timeout_set)
+		{
+			last_pump_timestamp = now;
+			timeout_set = true;
+		}
+		else if (TimestampDifferenceExceeds(last_pump_timestamp, now,
+											readahead_getpage_pull_timeout_ms))
+		{
+			timeout_signaled = true;
+			InterruptPending = true;
+			last_pump_timestamp = now;
+		}
+	}
+	else if (timeout_set)
+	{
+		timeout_set = false;
+	}
+}
+#else
+void
+communicator_reconfigure_timeout_if_needed(void)
+{
+	bool	needs_set = MyPState->ring_receive != MyPState->ring_unused &&
+						!AmPrewarmWorker &&
 						readahead_getpage_pull_timeout_ms > 0;
 
 	if (needs_set != timeout_set)
 	{
-		ensure_timeout_module_initialized();
-
 		/* The background writer doens't (shouldn't) read any pages */
 		Assert(!AmBackgroundWriterProcess());
 		/* The checkpointer doens't (shouldn't) read any pages */
@@ -2776,7 +2812,7 @@ communicator_reconfigure_timeout_if_needed(void)
 		if (needs_set)
 		{
 #if PG_MAJORVERSION_NUM <= 14
-			enable_timeout_after((TimeoutId)PS_TIMEOUT_ID, readahead_getpage_pull_timeout_ms);
+			enable_timeout_after(PS_TIMEOUT_ID, readahead_getpage_pull_timeout_ms);
 #else
 			enable_timeout_every(
 				PS_TIMEOUT_ID,
@@ -2790,7 +2826,7 @@ communicator_reconfigure_timeout_if_needed(void)
 		else
 		{
 			Assert(timeout_set);
-			disable_timeout((TimeoutId) PS_TIMEOUT_ID, false);
+			disable_timeout(PS_TIMEOUT_ID, false);
 			timeout_set = false;
 		}
 	}
@@ -2800,16 +2836,12 @@ static void
 pagestore_timeout_handler(void)
 {
 #if PG_MAJORVERSION_NUM <= 14
-	/*
-	 * PG14: Setting a repeating timeout is not possible, so we signal here
-	 * that the timeout has already been reset, and by telling the system
-	 * that system will re-schedule it later if we need to.
-	 */
 	timeout_set = false;
 #endif
 	timeout_signaled = true;
 	InterruptPending = true;
 }
+#endif /* ENABLE_NEON */
 
 /*
  * Process new data received in our active PageStream sockets.

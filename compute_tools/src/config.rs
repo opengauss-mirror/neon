@@ -89,6 +89,8 @@ pub fn write_postgres_conf(
     writeln!(file, "enable_indexscan = on")?;
     writeln!(file, "enable_indexonlyscan = on")?;
     writeln!(file, "enable_bitmapscan = on")?;
+    writeln!(file, "enable_heap_prefetch = on")?;
+    writeln!(file, "enable_internal_error_code = off")?;
 
     // Logging configuration - use WARNING level to avoid excessive I/O
     writeln!(file, "# Logging configuration")?;

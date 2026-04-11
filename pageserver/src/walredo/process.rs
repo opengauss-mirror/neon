@@ -203,13 +203,6 @@ impl WalRedoProcess {
     ) -> anyhow::Result<Bytes> {
         debug_assert_current_span_has_tenant_id();
 
-        // [LAYERDBG] Log postgres walredo request
-        tracing::debug!(
-            "[LAYERDBG] apply_wal_records: rel={}/{}/{}.{}, blknum={}, base_img_size={}, records_count={}",
-            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum,
-            base_img.as_ref().map(|b| b.len()).unwrap_or(0), records.len()
-        );
-
         let tag = protocol::BufferTag { rel, blknum };
 
         // Serialize all the messages to send the WAL redo process first.
@@ -232,30 +225,6 @@ impl WalRedoProcess {
                 rec: postgres_rec,
             } = rec
             {
-                // [LAYERDBG] Log WAL record details before sending to walredo
-                // Parse and log XLogRecord header info
-                let header_info = if postgres_rec.len() >= 32 {
-                    let xl_tot_len = u32::from_le_bytes([postgres_rec[0], postgres_rec[1], postgres_rec[2], postgres_rec[3]]);
-                    // xl_info is at offset 24 (after xl_tot_len(4) + xl_term(4) + xl_xid(8) + xl_prev(8))
-                    let xl_info = postgres_rec[24];
-                    let xl_rmid = postgres_rec[25];
-                    // Parse first block header if exists (after XLogRecord header at offset 32)
-                    let (block_id, fork_flags) = if postgres_rec.len() >= 34 {
-                        (postgres_rec[32], postgres_rec[33])
-                    } else {
-                        (0xFF, 0)
-                    };
-                    format!("xl_tot_len={}, xl_info=0x{:02X}, xl_rmid={}, block_id={}, fork_flags=0x{:02X} (has_image={})",
-                            xl_tot_len, xl_info, xl_rmid, block_id, fork_flags, (fork_flags & 0x10) != 0)
-                } else {
-                    "record too short".to_string()
-                };
-                tracing::debug!(
-                    "[LAYERDBG] apply_wal_records: sending WAL record {} to walredo: \
-                     lsn={}, will_init={}, rec_len={}, header=[{}], first_40_bytes={:02x?}",
-                    idx, lsn, will_init, postgres_rec.len(), header_info,
-                    &postgres_rec[..std::cmp::min(40, postgres_rec.len())]
-                );
                 protocol::build_apply_record_msg(*lsn, postgres_rec, &mut writebuf);
             } else {
                 anyhow::bail!("tried to pass neon wal record to postgres WAL redo");
@@ -267,82 +236,11 @@ impl WalRedoProcess {
         let Ok(res) =
             tokio::time::timeout(wal_redo_timeout, self.apply_wal_records0(&writebuf)).await
         else {
-            tracing::debug!(
-                "[LAYERDBG] apply_wal_records: WAL redo timed out for rel={}/{}/{}.{}, blknum={}",
-                rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum
-            );
             anyhow::bail!("WAL redo timed out");
         };
 
         if res.is_err() {
-            tracing::debug!(
-                "[LAYERDBG] apply_wal_records: error for rel={}/{}/{}.{}, blknum={}: {:?}",
-                rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum, res
-            );
-            // not all of these can be caused by this particular input, however these are so rare
-            // in tests so capture all.
             self.record_and_log(&writebuf);
-        } else {
-            // Log success with page header info for debugging
-            // Also check for zero page which indicates rm_redo didn't properly initialize
-            if let Ok(ref page_bytes) = res {
-                if page_bytes.len() >= 24 {
-                    // Page header: pd_lsn (8 bytes), pd_checksum (2), pd_flags (2), 
-                    // pd_lower (2), pd_upper (2), pd_special (2), pd_pagesize_version (2), pd_prune_xid (4)
-                    let lsn_hi = u32::from_le_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
-                    let lsn_lo = u32::from_le_bytes([page_bytes[4], page_bytes[5], page_bytes[6], page_bytes[7]]);
-                    let pd_lower = u16::from_le_bytes([page_bytes[12], page_bytes[13]]);
-                    let pd_upper = u16::from_le_bytes([page_bytes[14], page_bytes[15]]);
-                    let pd_special = u16::from_le_bytes([page_bytes[16], page_bytes[17]]);
-                    
-                    // Check for zero page: pd_lower=0 AND pd_upper=0 indicates uninitialized page
-                    if pd_lower == 0 && pd_upper == 0 {
-                        tracing::warn!(
-                            "[WALREDO_ZERO_PAGE] walredo returned zero page for rel={}/{}/{}.{}, blknum={}, \
-                             base_img={}, records={}, page_lsn={:X}/{:X}, pd_special={}, \
-                             first_rec_will_init={}",
-                            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum,
-                            base_img.is_some(), records.len(),
-                            lsn_hi, lsn_lo, pd_special,
-                            records.first().map(|(_, r)| {
-                                if let NeonWalRecord::Postgres { will_init, .. } = r {
-                                    *will_init
-                                } else {
-                                    false
-                                }
-                            }).unwrap_or(false)
-                        );
-                        // Log the WAL records for debugging
-                        for (idx, (lsn, rec)) in records.iter().enumerate() {
-                            if let NeonWalRecord::Postgres { will_init, rec: postgres_rec } = rec {
-                                let header_info = if postgres_rec.len() >= 32 {
-                                    let xl_rmid = postgres_rec[25];
-                                    let xl_info = postgres_rec[24];
-                                    format!("xl_rmid={}, xl_info=0x{:02X}", xl_rmid, xl_info)
-                                } else {
-                                    "record_too_short".to_string()
-                                };
-                                tracing::warn!(
-                                    "[WALREDO_ZERO_PAGE] record[{}]: lsn={}, will_init={}, len={}, {}",
-                                    idx, lsn, will_init, postgres_rec.len(), header_info
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            "[LAYERDBG] apply_wal_records: success for rel={}/{}/{}.{}, blknum={}, \
-                             page_lsn={:X}/{:X}, pd_lower={}, pd_upper={}",
-                            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum,
-                            lsn_hi, lsn_lo, pd_lower, pd_upper
-                        );
-                    }
-                } else {
-                    tracing::debug!(
-                        "[LAYERDBG] apply_wal_records: page_too_small for rel={}/{}/{}.{}, blknum={}, len={}",
-                        rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blknum, page_bytes.len()
-                    );
-                }
-            }
         }
 
         res

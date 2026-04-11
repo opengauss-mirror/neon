@@ -23,7 +23,16 @@ NEON_ROOT="$(cd "${REGRESS_DIR}/../.." && pwd)"
 # Note: neon_local --pg-version expects "14", "15", "16", "17" (PostgreSQL version numbers)
 # For openGauss, "14" internally maps to V702
 PG_VERSION="${DEFAULT_PG_VERSION:-14}"
-BUILD_TYPE="${BUILD_TYPE:-debug}"
+if [[ -n "${BUILD_TYPE:-}" ]]; then
+    :
+elif [[ -f "${NEON_ROOT}/target/release/neon_local" ]]; then
+    BUILD_TYPE="release"
+elif [[ -f "${NEON_ROOT}/target/debug/neon_local" ]]; then
+    BUILD_TYPE="debug"
+else
+    echo "ERROR: No neon_local binary found in target/release or target/debug" >&2
+    exit 1
+fi
 NEON_BIN="${NEON_ROOT}/target/${BUILD_TYPE}"
 NEON_LOCAL="${NEON_BIN}/neon_local"
 # Don't set NEON_REPO_DIR - let neon_local use its default (.neon in current directory)

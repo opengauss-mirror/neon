@@ -490,28 +490,7 @@ pub fn decode_wal_record(
                 //   - vm_seg_blockno (BlockNumber/uint32)
                 
                 // openGauss has last_lsn (XLogRecPtr, 8 bytes) at the end of each block header
-                let last_lsn = buf.get_u64_le();
-                
-                // Debug: Log ALL blocks being decoded to understand the flow
-                tracing::debug!(
-                    "[WAL_DECODE_BLOCK] relnode={} dbnode={} spcnode={} blkno={} forknum={} has_image={} has_data={}",
-                    blk.rnode_relnode, blk.rnode_dbnode, blk.rnode_spcnode, blk.blkno, blk.forknum, blk.has_image, blk.has_data
-                );
-                
-                // Track system catalog tables specifically
-                // pg_database and other global catalogs have relnode=15353, 15354, 15355, etc.
-                // Database-specific catalogs: pg_class=14828, pg_attribute=14802, pg_type=14709
-                let is_global_catalog = blk.rnode_dbnode == 0 && blk.rnode_spcnode == 1664;  // Global tablespace
-                let is_db_catalog = blk.rnode_relnode == 14802 || blk.rnode_relnode == 14828 ||
-                   blk.rnode_relnode == 14709 || (blk.rnode_relnode >= 14700 && blk.rnode_relnode <= 14900);
-                let is_pg_database = blk.rnode_relnode == 15353;  // pg_database relfilenode
-                
-                if is_global_catalog || is_db_catalog || is_pg_database {
-                    tracing::info!(
-                        "[SYSCAT_WAL_DEBUG] decode_wal_record: relnode={} dbnode={} spcnode={} blkno={} forknum={} has_image={} has_data={} data_len={}",
-                        blk.rnode_relnode, blk.rnode_dbnode, blk.rnode_spcnode, blk.blkno, blk.forknum, blk.has_image, blk.has_data, blk.data_len
-                    );
-                }
+                let _last_lsn = buf.get_u64_le();
 
                 decoded.blocks.push(blk);
             }
@@ -1248,6 +1227,34 @@ impl XlXactParsedRecord {
             subxacts,
             xnodes,
             origin_lsn,
+        }
+    }
+
+    /// Decode an openGauss XLOG_XACT_COMMIT_COMPACT record.
+    ///
+    /// openGauss xl_xact_commit_compact:
+    ///   TimestampTz xact_time (8 bytes)
+    ///   uint64      csn       (8 bytes)
+    ///   int         nsubxacts (4 bytes)
+    ///   TransactionId subxacts[] (each 8 bytes)
+    pub fn decode_compact(buf: &mut Bytes, xid: TransactionId) -> XlXactParsedRecord {
+        let xact_time = buf.get_i64_le();
+        let _csn = buf.get_u64_le();
+        let nsubxacts = buf.get_i32_le();
+        let mut subxacts = Vec::<TransactionId>::with_capacity(nsubxacts as usize);
+        for _ in 0..nsubxacts {
+            subxacts.push(buf.get_u64_le());
+        }
+        XlXactParsedRecord {
+            xid,
+            info: pg_constants::XLOG_XACT_COMMIT,
+            xact_time,
+            xinfo: 0,
+            db_id: 0,
+            ts_id: 0,
+            subxacts,
+            xnodes: Vec::new(),
+            origin_lsn: Lsn::INVALID,
         }
     }
 }

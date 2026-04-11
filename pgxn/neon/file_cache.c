@@ -1825,7 +1825,7 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 	uint64		generation;
 	uint32		entry_offset;
 	instr_time io_start, io_end;
-	// ConditionVariable* cv;
+	ConditionVariable* cv;
 	FileCacheBlockState state;
 	XLogRecPtr lwlsn;
 
@@ -1847,13 +1847,13 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 
 	tag.blockNum = blkno - chunk_offs;
 	hash = get_hash_value(lfc_hash, &tag);
-	// cv = &lfc_ctl->cv[hash % N_COND_VARS];
+	cv = &lfc_ctl->cv[hash % N_COND_VARS];
 
-	// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+	LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 	if (!LFC_ENABLED() || !lfc_ensure_opened())
 	{
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 		return false;
 	}
 
@@ -1863,17 +1863,17 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 	{
 		elog(DEBUG1, "Skip LFC write for %u because LwLSN=%X/%X is greater than not_nodified_since LSN %X/%X",
 			 blkno, LSN_FORMAT_ARGS(lwlsn), LSN_FORMAT_ARGS(lsn));
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 		return false;
 	}
 
-	// entry = hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_ENTER, &found);
+	entry = (FileCacheEntry *) hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_ENTER, &found);
 	if (found)
 	{
-		// state = GET_STATE(entry, chunk_offs);
+		state = GET_STATE(entry, chunk_offs);
 		if (state != UNAVAILABLE) {
 			/* Do not rewrite existed LFC entry */
-			//LWLockRelease(lfc_lock);
+			LWLockRelease(lfc_lock);
 			return false;
 		}
 		/*
@@ -1894,7 +1894,7 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 			 * We can't process this chunk due to lack of space in LFC,
 			 * so skip to the next one
 			 */
-			//LWLockRelease(lfc_lock);
+			LWLockRelease(lfc_lock);
 			return false;
 		}
 	}
@@ -1904,14 +1904,14 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 
 	SET_STATE(entry, chunk_offs, PENDING);
 
-	//LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 
-	// pgstat_report_wait_start(WAIT_EVENT_NEON_LFC_WRITE);
+	pgstat_report_wait_start(WAIT_EVENT_NEON_LFC_WRITE);
 	INSTR_TIME_SET_CURRENT(io_start);
 	rc = pwrite(lfc_desc, buffer, BLCKSZ,
 				((off_t) entry_offset * lfc_blocks_per_chunk + chunk_offs) * BLCKSZ);
 	INSTR_TIME_SET_CURRENT(io_end);
-	// pgstat_report_wait_end();
+	pgstat_report_wait_end();
 
 	if (rc != BLCKSZ)
 	{
@@ -1919,7 +1919,7 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 	}
 	else
 	{
-		// LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
+		LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 
 		if (lfc_ctl->generation == generation)
 		{
@@ -1942,7 +1942,7 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 
 			state = GET_STATE(entry, chunk_offs);
 			if (state == REQUESTED) {
-				// ConditionVariableBroadcast(cv);
+				ConditionVariableBroadcast(cv);
 			}
 			if (state != AVAILABLE)
 			{
@@ -1954,7 +1954,7 @@ lfc_prefetch(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 		{
 			lfc_close_file();
 		}
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 	}
 	return true;
 }

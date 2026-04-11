@@ -364,9 +364,9 @@ impl Display for EndpointStatus {
 #[derive(Default, Clone, Copy, clap::ValueEnum)]
 pub enum EndpointTerminateMode {
     #[default]
-    /// Use pg_ctl stop -m fast
+    /// Use gs_ctl stop -m fast
     Fast,
-    /// Use pg_ctl stop -m immediate
+    /// Use gs_ctl stop -m immediate
     Immediate,
     /// Use /terminate?mode=immediate
     ImmediateTerminate,
@@ -465,7 +465,8 @@ impl Endpoint {
         conf.append("wal_log_hints", "off");
         conf.append("max_replication_slots", "10");
         conf.append("hot_standby", "on");
-        conf.append("shared_buffers", "16GB");
+        conf.append("shared_buffers", "1GB");
+        conf.append("full_page_writes", "off");
         // Postgres defaults to effective_io_concurrency=1, which does not exercise the pageserver's
         // batching logic.  Set this to 2 so that we exercise the code a bit without letting
         // individual tests do a lot of concurrent work on underpowered test machines
@@ -656,7 +657,8 @@ impl Endpoint {
             .context(format!("{} failed", pg_ctl_path.display()))?;
         if !pg_ctl.status.success() {
             anyhow::bail!(
-                "pg_ctl failed, exit code: {}, stdout: {}, stderr: {}",
+                "{} failed, exit code: {}, stdout: {}, stderr: {}",
+                pg_ctl_path.display(),
                 pg_ctl.status,
                 String::from_utf8_lossy(&pg_ctl.stdout),
                 String::from_utf8_lossy(&pg_ctl.stderr),
@@ -1158,7 +1160,7 @@ impl Endpoint {
         mode: EndpointTerminateMode,
         destroy: bool,
     ) -> Result<TerminateResponse> {
-        // pg_ctl stop is fast but doesn't allow us to collect LSN. /terminate is
+        // gs_ctl stop is fast but doesn't allow us to collect LSN. /terminate is
         // slow, and test runs time out. Solution: special mode "immediate-terminate"
         // which uses /terminate
         let response = if let EndpointTerminateMode::ImmediateTerminate = mode {

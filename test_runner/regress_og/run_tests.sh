@@ -178,7 +178,14 @@ parse_args() {
 
 # Detect ports from running Neon endpoints
 detect_endpoint_ports() {
-    local neon_local="${NEON_ROOT}/target/${BUILD_TYPE:-release}/neon_local"
+    local neon_local
+    if [[ -n "${BUILD_TYPE:-}" ]]; then
+        neon_local="${NEON_ROOT}/target/${BUILD_TYPE}/neon_local"
+    elif [[ -f "${NEON_ROOT}/target/release/neon_local" ]]; then
+        neon_local="${NEON_ROOT}/target/release/neon_local"
+    else
+        neon_local="${NEON_ROOT}/target/debug/neon_local"
+    fi
     
     if [[ -f "${neon_local}" ]] && [[ -d "${SCRIPT_DIR}/.neon" ]]; then
         log_info "Detecting endpoint ports from neon_local..."

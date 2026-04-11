@@ -50,7 +50,7 @@ impl MetricsCollector {
             let mut guard = self.last_collected.write().unwrap();
             *guard = collected.clone();
         }
-        tracing::info!(
+        tracing::debug!(
             "Collected {} metric families in {} ms",
             collected.metrics.len(),
             started.elapsed().as_millis()

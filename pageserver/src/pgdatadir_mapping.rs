@@ -318,9 +318,6 @@ impl Timeline {
     ) -> Vec<Result<Bytes, PageReconstructError>> {
         debug_assert_current_span_has_tenant_and_timeline_id();
 
-        // [LAYERDBG] Log batched page requests
-        debug!("[LAYERDBG] get_rel_page_at_lsn_batched: starting batch request");
-
         let mut slots_filled = 0;
         let page_count = pages.len();
 
@@ -1948,15 +1945,6 @@ impl DatadirModification<'_> {
     ) -> Result<(), WalIngestError> {
         let mut gaps_at_lsns = Vec::default();
 
-        // [LAYERDBG] Log batch info
-        if !batch.metadata.is_empty() {
-            debug!(
-                "[LAYERDBG] ingest_batch: processing {} metadata entries at LSN {}",
-                batch.metadata.len(),
-                self.lsn
-            );
-        }
-
         for meta in batch.metadata.iter() {
             let key = Key::from_compact(meta.key());
             let (rel, blkno) = key
@@ -1964,27 +1952,12 @@ impl DatadirModification<'_> {
                 .map_err(|_| WalIngestErrorKind::InvalidKey(key, meta.lsn()))?;
             let new_nblocks = blkno + 1;
 
-            // [LAYERDBG] Log each metadata entry details
-            debug!(
-                "[LAYERDBG] ingest_batch entry: key={}, rel={}/{}/{}.{}, blkno={}, lsn={}",
-                key, rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno,
-                meta.lsn()
-            );
-
             let old_nblocks = self.create_relation_if_required(rel, ctx).await?;
             if new_nblocks > old_nblocks {
-                debug!(
-                    "[LAYERDBG] ingest_batch: extending rel {}/{}/{}.{} from {} to {} blocks",
-                    rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, old_nblocks, new_nblocks
-                );
                 self.put_rel_extend(rel, new_nblocks, ctx).await?;
             }
 
             if let Some(gaps) = Self::find_gaps(rel, blkno, old_nblocks, shard) {
-                debug!(
-                    "[LAYERDBG] ingest_batch: found gap for rel {}/{}/{}.{}, blkno={}, old_nblocks={}",
-                    rel.spcnode, rel.dbnode, rel.relnode, rel.forknum as u8, blkno, old_nblocks
-                );
                 gaps_at_lsns.push((gaps, meta.lsn()));
             }
         }

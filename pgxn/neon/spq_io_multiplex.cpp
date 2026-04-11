@@ -222,10 +222,6 @@ void EpollIO::InitWaitEvent(WaitEvent* event, bool isModify)
     struct epoll_event epoll_ev;
     int rc;
 
-    if (!isModify && event->events == WL_LATCH_SET) {
-        return;
-    }
-
     /* pointer to our event, returned by epoll_wait */
     epoll_ev.data.ptr = event;
     /* always wait for errors */
