@@ -2148,43 +2148,19 @@ impl PageServerHandler {
         )?;
 
         if effective_request_lsn > last_record_lsn {
-            // Cap the LSN we wait for when the gap is large (> 8 MB).  During bulk
-            // inserts or large DDL (CREATE INDEX), openGauss may evict pages with a
-            // zero LSN and fall back to GetFlushRecPtr, which can be tens of MB ahead
-            // of what the pageserver has ingested.  For metadata requests (nblocks,
-            // exists, dbsize) a slightly stale answer is acceptable; vacuum/autovacuum
-            // will retry on the next cycle.  This mirrors the same cap that is already
-            // applied to the batched GetPage path.
-            const LARGE_LSN_GAP: u64 = 8 * 1024 * 1024;
-            let lsn_to_wait = if not_modified_since.0 - last_record_lsn.0 > LARGE_LSN_GAP {
-                last_record_lsn
-            } else {
-                not_modified_since
-            };
             timeline
                 .wait_lsn(
-                    lsn_to_wait,
+                    not_modified_since,
                     crate::tenant::timeline::WaitLsnWaiter::PageService,
                     timeline::WaitLsnTimeout::Default,
                     ctx,
                 )
                 .await?;
 
-            // Since we waited for 'lsn_to_wait' to arrive, that is now the last
+            // Since we waited for 'effective_request_lsn' to arrive, that is now the last
             // record LSN. (Or close enough for our purposes; the last-record LSN can
             // advance immediately after we return anyway)
         }
-
-        // Cap the effective LSN we return when the gap is large, matching the wait cap.
-        const LARGE_LSN_GAP: u64 = 8 * 1024 * 1024;
-        let effective_request_lsn =
-            if effective_request_lsn > last_record_lsn
-                && effective_request_lsn.0 - last_record_lsn.0 > LARGE_LSN_GAP
-            {
-                last_record_lsn
-            } else {
-                effective_request_lsn
-            };
 
         Ok(effective_request_lsn)
     }
@@ -2462,74 +2438,12 @@ impl PageServerHandler {
         };
 
         let last_record_lsn = timeline.get_last_record_lsn();
-        // When the gap between max_effective_lsn and last_record_lsn is large
-        // (e.g. bulk INSERT / CREATE INDEX during TPCC BUILD), two issues arise:
-        // 1. Waiting the full 300s default timeout stalls the load.
-        // 2. Capping the LSN to last_record_lsn causes MissingKey errors for
-        //    relations that were newly created inside the gap (they don't exist
-        //    at last_record_lsn in the pageserver layers yet).
-        //
-        // Solution: Use aggressive tiered timeouts to minimize Lock wait timeout errors
-        // during high-concurrency TPC-C workloads. OpenGauss uses update_lockwait_timeout=600s,
-        // but transactions should complete in seconds, not minutes.
-        //
-        // Tiered approach based on LSN gap:
-        // - Tiny gap (<1MB): 5s timeout - normal operations
-        // - Small gap (1-8MB): 15s timeout - some WAL lag
-        // - Medium gap (8-64MB): 60s timeout - moderate lag during bulk loads
-        // - Large gap (64-256MB): 120s timeout - significant lag during TPC-C benchmark
-        // - Huge gap (>256MB): 300s timeout - extreme lag, give maximum time
-        const TINY_LSN_GAP: u64 = 1 * 1024 * 1024;    // 1 MB
-        const SMALL_LSN_GAP: u64 = 8 * 1024 * 1024;   // 8 MB
-        const MEDIUM_LSN_GAP: u64 = 64 * 1024 * 1024; // 64 MB
-        const LARGE_LSN_GAP: u64 = 256 * 1024 * 1024; // 256 MB
-        
-        let lsn_gap = if max_effective_lsn > last_record_lsn {
-            max_effective_lsn.0 - last_record_lsn.0
-        } else {
-            0
-        };
-
-        let effective_lsn_for_wait = max_effective_lsn;
-        let wait_timeout = if lsn_gap > LARGE_LSN_GAP {
-            // Huge gap (>256MB): maximum timeout
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(300))
-        } else if lsn_gap > MEDIUM_LSN_GAP {
-            // Large gap (64-256MB): 120s for heavy TPC-C workloads
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(120))
-        } else if lsn_gap > SMALL_LSN_GAP {
-            // Medium gap (8-64MB): 60s for bulk operations
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(60))
-        } else if lsn_gap > TINY_LSN_GAP {
-            // Small gap (1-8MB): 15s
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(15))
-        } else if lsn_gap > 0 {
-            // Tiny gap (<1MB): 5s
-            timeline::WaitLsnTimeout::Custom(Duration::from_secs(5))
-        } else {
-            timeline::WaitLsnTimeout::Default
-        };
-
-        if effective_lsn_for_wait > last_record_lsn {
-            // Log LSN gap for debugging WAL lag issues
-            if lsn_gap > SMALL_LSN_GAP {
-                let timeout_secs = match &wait_timeout {
-                    timeline::WaitLsnTimeout::Default => 60,
-                    timeline::WaitLsnTimeout::Custom(d) => d.as_secs(),
-                };
-                info!(
-                    "[LSN_GAP] waiting for LSN {}, last_record={}, gap={}MB, timeout={}s",
-                    effective_lsn_for_wait,
-                    last_record_lsn,
-                    lsn_gap / (1024 * 1024),
-                    timeout_secs
-                );
-            }
+        if max_effective_lsn > last_record_lsn {
             if let Err(e) = timeline
                 .wait_lsn(
-                    effective_lsn_for_wait,
+                    max_effective_lsn,
                     crate::tenant::timeline::WaitLsnWaiter::PageService,
-                    wait_timeout,
+                    timeline::WaitLsnTimeout::Default,
                     &ctx,
                 )
                 .maybe_perf_instrument(&ctx, |current_perf_span| {
@@ -2541,13 +2455,6 @@ impl PageServerHandler {
                 })
                 .await
             {
-                warn!(
-                    "[LSN_TIMEOUT] failed to wait for LSN {}, last_record={}, gap={}MB: {}",
-                    effective_lsn_for_wait,
-                    last_record_lsn,
-                    lsn_gap / (1024 * 1024),
-                    e
-                );
                 return Vec::from_iter(requests.into_iter().map(|req| {
                     Err(BatchedPageStreamError {
                         err: PageStreamError::from(e.clone()),

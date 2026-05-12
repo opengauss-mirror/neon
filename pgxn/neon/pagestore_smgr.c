@@ -174,11 +174,28 @@ log_newpages_copy(NRelFileInfo * rinfo, ForkNumber forkNum, BlockNumber blkno,
 static bool
 PageIsEmptyHeapPage(char *buffer)
 {
-	PGIOAlignedBlock empty_page;
+	PageHeader phdr = (PageHeader) buffer;
 
-	PageInit((Page) empty_page.data, BLCKSZ, 0);
+	/*
+	 * Check if this is a properly initialized but empty heap page:
+	 * - Valid page size
+	 * - Zero LSN (not yet WAL-logged)
+	 * - No tuples (pd_lower at the base, pd_upper == pd_special)
+	 *
+	 * This works for both PostgreSQL and openGauss, regardless of
+	 * extra header fields (pd_xid_base etc.) that openGauss adds.
+	 */
+	if (!PageIsNew((Page) buffer) &&
+		PageGetPageSize((Page) buffer) == BLCKSZ &&
+		PageGetLSN((Page) buffer) == InvalidXLogRecPtr &&
+		phdr->pd_lower <= phdr->pd_upper &&
+		phdr->pd_upper == phdr->pd_special &&
+		PageGetMaxOffsetNumber((Page) buffer) == InvalidOffsetNumber)
+	{
+		return true;
+	}
 
-	return memcmp(buffer, empty_page.data, BLCKSZ) == 0;
+	return false;
 }
 
 #if PG_MAJORVERSION_NUM >= 17
@@ -280,18 +297,15 @@ neon_wallog_pagev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 * and in a release build just LOG the error and soldier on. We
 			 * update the last-written LSN of the page with a conservative
 			 * value in that case, which is the last replayed LSN.
-			 *
-			 * openGauss compatibility: openGauss may evict pages with zero LSN
-			 * during bulk inserts (e.g., TPC-C load phase) due to differences in
-			 * buffer management. Downgrade PANIC to WARNING and soldier on.
 			 */
-			ereport(WARNING,
-					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN, using GetFlushRecPtr as fallback",
+			ereport(RecoveryInProgress() ? LOG : PANIC,
+					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN",
 							blkno,
 							RelFileInfoFmt(InfoFromSMgrRel(reln)),
 							forknum)));
+			Assert(false);
 
-			lsn = GetFlushRecPtr(); /* use flush LSN: already sent to safekeeper, safe for pageserver */
+			lsn = GetXLogReplayRecPtr(NULL); /* in standby mode, soldier on */
 		}
 	}
 	else
@@ -424,17 +438,15 @@ neon_wallog_page(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, co
 			 * and in a release build just LOG the error and soldier on. We
 			 * update the last-written LSN of the page with a conservative
 			 * value in that case, which is the last replayed LSN.
-			 *
-			 * openGauss compatibility: openGauss may evict pages with zero LSN
-			 * during bulk inserts. Downgrade PANIC to WARNING and soldier on.
 			 */
-			ereport(WARNING,
-					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN, using GetFlushRecPtr as fallback",
+			ereport(RecoveryInProgress() ? LOG : PANIC,
+					(errmsg(NEON_TAG "Page %u of relation %u/%u/%u.%u is evicted with zero LSN",
 							blocknum,
 							RelFileInfoFmt(InfoFromSMgrRel(reln)),
 							forknum)));
+			Assert(false);
 
-			lsn = GetFlushRecPtr(); /* use flush LSN: already sent to safekeeper, safe for pageserver */
+			lsn = GetXLogReplayRecPtr(NULL); /* in standby mode, soldier on */
 		}
 	}
 	else
@@ -667,18 +679,13 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 			 * "WAL before data" rule. However, such case does exist at index
 			 * building, _bt_blwritepage logs the full page without flushing WAL
 			 * before smgrextend (files are fsynced before build ends).
-			 *
-			 * Never call XLogWaitFlush here - it can stall the backend for
-			 * seconds to minutes during bulk inserts (16 concurrent workers
-			 * can always be in this gap).  The clamp below caps
-			 * last_written_lsn to flushlsn safely.
 			 */
 			if (last_written_lsn > flushlsn)
 			{
-				neon_log(DEBUG5, "last-written LSN %X/%X is ahead of last flushed LSN %X/%X (gap=%lu), clamping",
+				neon_log(DEBUG5, "last-written LSN %X/%X is ahead of last flushed LSN %X/%X",
 						 LSN_FORMAT_ARGS(last_written_lsn),
-						 LSN_FORMAT_ARGS(flushlsn),
-						 (unsigned long)(last_written_lsn - flushlsn));
+						 LSN_FORMAT_ARGS(flushlsn));
+				XLogWaitFlush(last_written_lsn);
 			}
 
 			/*
@@ -725,9 +732,8 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 		 *
 		 * request_lsn = UINT64_MAX: always ask for the latest version.
 		 * not_modified_since = last_written_lsn: the exact LSN at which this
-		 * block was last written.  No clamping needed: pageserver now skips
-		 * wait_lsn when the gap is large (> 8 MB), so 300-second timeouts
-		 * during bulk inserts are eliminated on the pageserver side.
+		 * block was last written.  XLogWaitFlush above guarantees WAL up to
+		 * this LSN has been flushed, so walproposer can send it immediately.
 		 */
 		{
 			result->request_lsn = UINT64_MAX;
@@ -754,23 +760,9 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 		 * a re-read on the next access.  This avoids repeated 20-60 s stalls
 		 * when pageserver lags behind compute during heavy WAL generation.
 		 *
-		 * ENABLE_NEON (openGauss): Disable VM optimization for openGauss.
-		 * In high-concurrency DELETE scenarios, stale VM pages cause
-		 * index-heap inconsistency: SELECT via index sees rows that
-		 * DELETE cannot find in heap, causing infinite retry loops.
-		 * FSM optimization is still safe as it only affects space allocation.
+		 * Both FSM and VM use stale optimization: set not_modified_since=1
+		 * so the pageserver answers immediately with whatever version it has.
 		 */
-#ifdef ENABLE_NEON
-		/* openGauss: Only use stale optimization for FSM, not VM */
-		if (forknum == FSM_FORKNUM)
-		{
-			result->not_modified_since = 1;
-			neon_log(DEBUG1,
-					 "neon_get_request_lsns FSM: set not_modified_since=1 to skip wait (lwlsn=%X/%X)",
-					 LSN_FORMAT_ARGS(last_written_lsn));
-		}
-#else
-		/* PostgreSQL: Original behavior - both FSM and VM use stale optimization */
 		if (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM)
 		{
 			result->not_modified_since = 1;
@@ -778,7 +770,6 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 					 "neon_get_request_lsns FSM/VM: set not_modified_since=1 to skip wait (lwlsn=%X/%X)",
 					 LSN_FORMAT_ARGS(last_written_lsn));
 		}
-#endif
 		else if (rinfo.spcNode == GLOBALTABLESPACE_OID)
 		{
 			/*

@@ -1399,10 +1399,6 @@ impl WalIngest {
         rel: RelTag,
         ctx: &RequestContext,
     ) -> Result<(), WalIngestError> {
-        tracing::info!(
-            "[SMGR_DEBUG] walingest::put_rel_creation called: spcnode={}, dbnode={}, relnode={}, forknum={}",
-            rel.spcnode, rel.dbnode, rel.relnode, rel.forknum
-        );
         modification.put_rel_creation(rel, 0, ctx).await?;
         Ok(())
     }

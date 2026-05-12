@@ -234,8 +234,8 @@ nwp_register_gucs(void)
 							"neon.safekeeper_reconnect_timeout",
 							"Walproposer reconnects to offline safekeepers once in this interval.",
 							NULL,
-							&wal_acceptor_reconnect_timeout,
-							1000, 0, INT_MAX,	/* default, min, max */
+						&wal_acceptor_reconnect_timeout,
+						1000, 0, INT_MAX,	/* default, min, max */
 							PGC_SIGHUP, /* context */
 							GUC_UNIT_MS,	/* flags */
 							NULL, NULL, NULL);
@@ -969,6 +969,7 @@ walprop_pg_init_standalone_sync_safekeepers(void)
 	}
 	// BackgroundWorkerUnblockSignals(); 替换为 gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
 	gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
+	(void)gs_signal_unblock_sigusr2();
 }
 
 /*
@@ -1006,6 +1007,7 @@ walprop_pg_init_bgworker(void)
 
 	// BackgroundWorkerUnblockSignals();
 	gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
+	(void)gs_signal_unblock_sigusr2();
 
 	u_sess->attr.attr_common.application_name = (char *) "walproposer";	/* for
 												 * synchronous_standby_names */
@@ -1883,13 +1885,13 @@ static bool standaloneLatchInitialized = false;
 /*
  * Get the appropriate latch to use.
  * In standalone sync-safekeepers mode, t_thrd.proc is NULL, so we use
- * a local latch instead of t_thrd.proc->procLatch.
+ * a local latch instead of &MyWalSnd->latch.
  */
 static Latch *
 walprop_get_latch(void)
 {
-	if (t_thrd.proc != NULL) {
-		return &t_thrd.proc->procLatch;
+	if (MyWalSnd != NULL) {
+		return &MyWalSnd->latch;
 	} else {
 		/* Initialize standalone latch if not already done */
 		if (!standaloneLatchInitialized) {

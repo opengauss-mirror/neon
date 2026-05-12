@@ -211,9 +211,9 @@ communicator_new_bgworker_main(Datum main_arg)
 		before = GetCurrentTimestamp();
 
 		CHECK_FOR_INTERRUPTS();
-		if (t_thrd.bgwriter_cxt.got_SIGHUP)
+		if (t_thrd.worker_sig_flags.got_SIGHUP)
 		{
-			t_thrd.bgwriter_cxt.got_SIGHUP = false;
+			t_thrd.worker_sig_flags.got_SIGHUP = false;
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 

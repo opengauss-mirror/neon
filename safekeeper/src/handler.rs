@@ -16,7 +16,7 @@ use regex::Regex;
 use safekeeper_api::Term;
 use safekeeper_api::models::ConnectionId;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{Instrument, debug, info, info_span};
+use tracing::{Instrument, debug, info_span};
 use utils::auth::{Claims, JwtAuth, Scope};
 use utils::id::{TenantId, TenantTimelineId, TimelineId};
 use utils::lsn::Lsn;
@@ -323,7 +323,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send> postgres_backend::Handler<IO>
 
             let _guard = PG_QUERIES_GAUGE.with_label_values(&[cmd_str]).guard();
 
-            info!("got query {:?}", query_string);
+            debug!("got query {:?}", query_string);
 
             let tenant_id = self.tenant_id.context("tenantid is required")?;
             let timeline_id = self.timeline_id.context("timelineid is required")?;

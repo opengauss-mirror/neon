@@ -150,14 +150,6 @@ impl SerializedValueBatch {
             record.batch.raw = Vec::with_capacity(estimate);
         }
 
-        // Debug: Log total blocks in decoded record
-        if !decoded.blocks.is_empty() {
-            tracing::info!(
-                "[WAL_BLOCKS_DEBUG] Processing {} blocks from WAL record, xl_rmid={}, xl_info=0x{:02X}",
-                decoded.blocks.len(), decoded.xl_rmid, decoded.xl_info
-            );
-        }
-
         for blk in decoded.blocks.iter() {
             let rel = RelTag {
                 spcnode: blk.rnode_spcnode,
@@ -165,21 +157,6 @@ impl SerializedValueBatch {
                 relnode: blk.rnode_relnode,
                 forknum: blk.forknum,
             };
-
-            // Debug: Log system catalog blocks specifically
-            // Global catalogs: pg_database (relnode=15353), etc. in spcnode=1664, dbnode=0
-            // Database catalogs: pg_class=14828, pg_attribute=14802, pg_type=14709
-            let is_global_catalog = blk.rnode_dbnode == 0 && blk.rnode_spcnode == 1664;
-            let is_db_catalog = blk.rnode_relnode == 14802 || blk.rnode_relnode == 14828 || blk.rnode_relnode == 14709 ||
-               (blk.rnode_relnode >= 14700 && blk.rnode_relnode <= 14900);
-            let is_pg_database = blk.rnode_relnode == 15353;
-            
-            if is_global_catalog || is_db_catalog || is_pg_database {
-                tracing::info!(
-                    "[SYSCAT_BLOCK_DEBUG] Found system catalog block: relnode={}, dbnode={}, spcnode={}, blkno={} (global={})",
-                    blk.rnode_relnode, blk.rnode_dbnode, blk.rnode_spcnode, blk.blkno, is_global_catalog
-                );
-            }
 
             let key = rel_block_to_key(rel, blk.blkno);
 
@@ -228,14 +205,6 @@ impl SerializedValueBatch {
                 // so them have to be copied multiple times.
                 //
                 let val = if Self::block_is_image(&decoded, blk, pg_version) {
-                    // Extract page image from FPI record
-                    tracing::info!(
-                        "[LAYERDBG] serialized_batch: extracting FPI as Image, \
-                         rel={}/{}/{}.{}, blkno={}, xl_rmid={}, xl_info=0x{:02X}, \
-                         has_image={}, apply_image={}, bimg_len={}",
-                        blk.rnode_spcnode, blk.rnode_dbnode, blk.rnode_relnode, blk.forknum, blk.blkno,
-                        decoded.xl_rmid, decoded.xl_info, blk.has_image, blk.apply_image, blk.bimg_len
-                    );
                     let img_len = blk.bimg_len as usize;
                     let img_offs = blk.bimg_offset as usize;
                     let mut image = BytesMut::with_capacity(BLCKSZ as usize);
@@ -270,17 +239,6 @@ impl SerializedValueBatch {
                     // 1. If will_init=true, the redo function knows to start from a zero page
                     // 2. If will_init=false, we need a base image to apply the WAL record
                     //
-                    // Note: This is different from FPI handling. FPI records are extracted as
-                    // Value::Image in the block_is_image branch above.
-                    tracing::info!(
-                        "[LAYERDBG] serialized_batch: storing WAL record as NeonWalRecord::Postgres, \
-                         rel={}/{}/{}.{}, blkno={}, has_image={}, apply_image={}, blk_will_init={}, \
-                         final_will_init={}, xl_rmid={}, xl_info=0x{:02X}",
-                        blk.rnode_spcnode, blk.rnode_dbnode, blk.rnode_relnode, blk.forknum, blk.blkno,
-                        blk.has_image, blk.apply_image, blk.will_init,
-                        blk.will_init,  // final value used for will_init
-                        decoded.xl_rmid, decoded.xl_info
-                    );
                     Value::WalRecord(NeonWalRecord::Postgres {
                         will_init: blk.will_init,
                         rec: decoded.record.clone(),

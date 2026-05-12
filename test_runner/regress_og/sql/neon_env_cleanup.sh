@@ -20,8 +20,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REGRESS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 NEON_ROOT="$(cd "${REGRESS_DIR}/../.." && pwd)"
 
-# Configuration
-BUILD_TYPE="${BUILD_TYPE:-debug}"
+# Auto-detect BUILD_TYPE: prefer release if available, otherwise debug
+if [[ -n "${BUILD_TYPE:-}" ]]; then
+    :
+elif [[ -f "${NEON_ROOT}/target/release/neon_local" ]]; then
+    BUILD_TYPE="release"
+elif [[ -f "${NEON_ROOT}/target/debug/neon_local" ]]; then
+    BUILD_TYPE="debug"
+else
+    echo "ERROR: No neon_local binary found in target/release or target/debug" >&2
+    exit 1
+fi
 NEON_BIN="${NEON_ROOT}/target/${BUILD_TYPE}"
 NEON_LOCAL="${NEON_BIN}/neon_local"
 

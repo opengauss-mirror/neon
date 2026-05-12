@@ -46,6 +46,10 @@ static BufferTag page_tag[MAX_PAGES];
 static char page_body[MAX_PAGES][BLCKSZ];
 static int	used_pages;
 
+#ifdef ENABLE_NEON
+extern struct buftag *redo_target_tag;
+#endif
+
 static int
 locate_page(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno)
 {
@@ -246,13 +250,25 @@ inmem_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	pg = locate_page(reln, forknum, blocknum);
 	if (pg < 0)
 	{
+#ifdef ENABLE_NEON
 		/*
-		 * We assume the buffer cache is large enough to hold all the buffers
-		 * needed for most operations. Overflowing to this "in-mem smgr" in
-		 * rare cases is OK. But if we find that we're using more than
-		 * WARN_PAGES, print a warning so that we get alerted and get to
-		 * investigate why we're accessing so many buffers.
+		 * In walredo mode, non-target blocks are allocated by redo functions
+		 * (e.g. _bt_restore_meta, btree_xlog_split) via RBM_ZERO_AND_LOCK.
+		 * They are populated from WAL record data and never read back from
+		 * inmem_smgr across redo records.  Discarding them here prevents
+		 * overflow of the 64-slot storage when replaying long WAL chains
+		 * (hundreds of btree splits).  inmem_read returns zeroes for missing
+		 * blocks, which is the correct initial state for RBM_ZERO_AND_LOCK.
 		 */
+		if (redo_target_tag != NULL)
+		{
+			BufferTag write_tag;
+			InitBufferTag(&write_tag, &InfoFromSMgrRel(reln), forknum, blocknum);
+			if (!BufferTagsEqual(&write_tag, (BufferTag *)redo_target_tag))
+				return;
+		}
+#endif
+
 		if (used_pages >= WARN_PAGES)
 			ereport(WARNING, (errmsg("inmem_write() called for %u/%u/%u.%u blk %u: used_pages %u",
 								   RelFileInfoFmt(InfoFromSMgrRel(reln)),
@@ -267,19 +283,7 @@ inmem_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		InitBufferTag(&page_tag[pg], &InfoFromSMgrRel(reln), forknum, blocknum);
 	}
-	else
-	{
-		elog(DEBUG1, "inmem_write() called for %u/%u/%u.%u blk %u: found at %u",
-			 RelFileInfoFmt(InfoFromSMgrRel(reln)),
-			 forknum,
-			 blocknum,
-			 used_pages);
-	}
 	memcpy(page_body[pg], buffer, BLCKSZ);
-
-	{
-		NRelFileInfo rinfo = InfoFromSMgrRel(reln);
-	}
 }
 
 #if PG_MAJORVERSION_NUM >= 17

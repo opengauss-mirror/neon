@@ -20,7 +20,9 @@ OG_INSTALL := $(NEON_ROOT)/og_install
 OG_VERSION ?= V702
 # PG_VERSION: PostgreSQL major version number for neon_local (14 maps to V702 internally)
 PG_VERSION ?= 14
-BUILD_TYPE ?= debug
+# Auto-detect BUILD_TYPE: prefer release if available, otherwise debug
+_BUILD_TYPE := $(shell test -f $(NEON_ROOT)/target/release/neon_local && echo release || echo debug)
+BUILD_TYPE ?= $(_BUILD_TYPE)
 
 # Binaries
 NEON_BIN := $(NEON_ROOT)/target/$(BUILD_TYPE)
@@ -247,7 +249,7 @@ help:
 	@echo "  PORT=<port>              Database port (default: 55432)"
 	@echo "  OG_VERSION=<ver>         openGauss directory version (default: V702)"
 	@echo "  PG_VERSION=<ver>         PostgreSQL version for neon_local (default: 14)"
-	@echo "  BUILD_TYPE=<type>        Build type (default: debug)"
+	@echo "  BUILD_TYPE=<type>        Build type (auto-detected: release or debug)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make check-basic         # Run basic tests"

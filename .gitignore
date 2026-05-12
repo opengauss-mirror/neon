@@ -39,3 +39,4 @@ docker-compose/docker-compose-parallel.yml
 local_proxy.json
 
 og_install/
+.neon/

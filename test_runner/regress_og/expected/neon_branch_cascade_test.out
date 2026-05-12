@@ -124,7 +124,8 @@ SELECT * FROM test_branch;
   2 | branch_data_name |   200 |
   3 | branch_data_name |   300 |
   4 | branch_data_name |   999 |
-(4 rows)
+  5 | tx_test          |   500 |
+(5 rows)
 -- create new table in branch
 CREATE TABLE branch_only_table (id INT PRIMARY KEY, data TEXT);
 gsql:NEON_ROOT/sql/neon_branch_cascade_test.sql:79: NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "branch_only_table_pkey" for table "branch_only_table"
@@ -275,7 +276,8 @@ SELECT * FROM test_branch;
   2 | branch_data_name |   200 |
   3 | branch_data_name |   300 |
   4 | branch_data_name |   999 |
-(4 rows)
+  5 | tx_test          |   500 |
+(5 rows)
 SELECT * FROM branch_only_table;
  id |      data
 ----+-----------------

@@ -241,15 +241,6 @@ async fn import_slru(
         let r = reader.read_exact(&mut buf).await;
         match r {
             Ok(_) => {
-                // NOTE: We no longer call fix_clog_page_for_bootstrap here.
-                // The previous fix that marked all IN_PROGRESS (0x00) transactions 
-                // as COMMITTED (0x01) caused PANIC errors ("cannot abort transaction, 
-                // it was already committed") because future transaction slots were
-                // incorrectly pre-marked as committed.
-                //
-                // openGauss bootstrap transactions should use special handling:
-                // - Bootstrap xids are typically frozen or have special visibility
-                // - The system catalogs created by initdb use frozen xids
                 modification.put_slru_page_image(
                     slru,
                     segno,
@@ -276,39 +267,6 @@ async fn import_slru(
     Ok(())
 }
 
-/// Fix CLOG page for bootstrap: mark all IN_PROGRESS transactions as COMMITTED.
-///
-/// CLOG format: each transaction uses 2 bits:
-/// - 0x00: TRANSACTION_STATUS_IN_PROGRESS
-/// - 0x01: TRANSACTION_STATUS_COMMITTED
-/// - 0x02: TRANSACTION_STATUS_ABORTED
-/// - 0x03: TRANSACTION_STATUS_SUB_COMMITTED
-///
-/// Each byte contains 4 transactions. We iterate through the page and change
-/// all 0x00 (IN_PROGRESS) to 0x01 (COMMITTED).
-fn fix_clog_page_for_bootstrap(page: &mut [u8]) {
-    const CLOG_BITS_PER_XACT: u8 = 2;
-    const CLOG_XACTS_PER_BYTE: u8 = 8 / CLOG_BITS_PER_XACT; // 4
-    const CLOG_XACT_BITMASK: u8 = (1 << CLOG_BITS_PER_XACT) - 1; // 0x03
-
-    const TRANSACTION_STATUS_IN_PROGRESS: u8 = 0x00;
-    const TRANSACTION_STATUS_COMMITTED: u8 = 0x01;
-
-    for byte in page.iter_mut() {
-        let mut new_byte = 0u8;
-        for i in 0..CLOG_XACTS_PER_BYTE {
-            let shift = i * CLOG_BITS_PER_XACT;
-            let status = (*byte >> shift) & CLOG_XACT_BITMASK;
-            let new_status = if status == TRANSACTION_STATUS_IN_PROGRESS {
-                TRANSACTION_STATUS_COMMITTED
-            } else {
-                status
-            };
-            new_byte |= new_status << shift;
-        }
-        *byte = new_byte;
-    }
-}
 
 /// Scan PostgreSQL WAL files in given directory and load all records between
 /// 'startpoint' and 'endpoint' into the repository.

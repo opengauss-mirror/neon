@@ -433,7 +433,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> PostgresBackend<IO> {
                 Ok(())
             }
             Err(QueryError::Disconnected(e)) => {
-                info!("Disconnected ({e:#})");
+                debug!("Disconnected ({e:#})");
                 // Disconnection is not an error: we just use it that way internally to drop
                 // out of loops.
                 Ok(())
@@ -870,7 +870,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> PostgresBackend<IO> {
             _ => false,
         };
         if expected_end {
-            info!("terminated: {:#}", end);
+            debug!("terminated: {:#}", end);
         } else {
             error!("terminated: {:?}", end);
         }
