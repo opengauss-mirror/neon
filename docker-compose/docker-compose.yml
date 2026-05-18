@@ -1,210 +1,262 @@
+name: neon_poc
+
 services:
-  minio:
-    restart: always
-    image: quay.io/minio/minio:RELEASE.2022-10-20T00-55-09Z
-    ports:
-      - 9000:9000
-      - 9001:9001
-    environment:
-      - MINIO_ROOT_USER=minio
-      - MINIO_ROOT_PASSWORD=password
-    command: server /data --address :9000 --console-address ":9001"
-
-  minio_create_buckets:
-    image: minio/mc
-    environment:
-      - MINIO_ROOT_USER=minio
-      - MINIO_ROOT_PASSWORD=password
-    entrypoint:
-      - "/bin/sh"
-      - "-c"
-    command:
-      - "until (/usr/bin/mc alias set minio http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD) do
-             echo 'Waiting to start minio...' && sleep 1;
-         done;
-         /usr/bin/mc mb minio/neon --region=eu-north-1;
-         exit 0;"
-    depends_on:
-      - minio
-
-  pageserver:
-    restart: always
-    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon:${TAG:-latest}
-    environment:
-      - AWS_ACCESS_KEY_ID=minio
-      - AWS_SECRET_ACCESS_KEY=password
-      #- RUST_BACKTRACE=1
-    ports:
-       #- 6400:6400  # pg protocol handler
-       - 9898:9898 # http endpoints
+  data_permissions:
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    user: "0:0"
     volumes:
-      - ./pageserver_config:/data/.neon/
-    depends_on:
-      - storage_broker
-      - minio_create_buckets
-
-  safekeeper1:
-    restart: always
-    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon:${TAG:-latest}
-    environment:
-      - SAFEKEEPER_ADVERTISE_URL=safekeeper1:5454
-      - SAFEKEEPER_ID=1
-      - BROKER_ENDPOINT=http://storage_broker:50051
-      - AWS_ACCESS_KEY_ID=minio
-      - AWS_SECRET_ACCESS_KEY=password
-      #- RUST_BACKTRACE=1
-    ports:
-      #- 5454:5454 # pg protocol handler
-      - 7676:7676 # http endpoints
-    entrypoint:
-      - "/bin/sh"
-      - "-c"
+      - ./.neon/pageserver:/data/.neon/pageserver
+      - ./.neon/endpoint_storage:/data/.neon/endpoint_storage
+      - ./.neon/storage_controller_db:/var/db/omm
+      - ./.neon/safekeeper1:/data/.neon/safekeeper1
+      - ./.neon/safekeeper2:/data/.neon/safekeeper2
+      - ./.neon/safekeeper3:/data/.neon/safekeeper3
+      - ./.neon/compute1:/var/db/gaussdb
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - "safekeeper --listen-pg=$$SAFEKEEPER_ADVERTISE_URL
-                    --listen-http='0.0.0.0:7676'
-                    --id=$$SAFEKEEPER_ID
-                    --broker-endpoint=$$BROKER_ENDPOINT
-                    -D /data
-                    --remote-storage=\"{endpoint='http://minio:9000',
-                                        bucket_name='neon',
-                                        bucket_region='eu-north-1',
-                                        prefix_in_bucket='/safekeeper/'}\""
-    depends_on:
-      - storage_broker
-      - minio_create_buckets
-
-  safekeeper2:
-    restart: always
-    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon:${TAG:-latest}
-    environment:
-      - SAFEKEEPER_ADVERTISE_URL=safekeeper2:5454
-      - SAFEKEEPER_ID=2
-      - BROKER_ENDPOINT=http://storage_broker:50051
-      - AWS_ACCESS_KEY_ID=minio
-      - AWS_SECRET_ACCESS_KEY=password
-      #- RUST_BACKTRACE=1
-    ports:
-      #- 5454:5454 # pg protocol handler
-      - 7677:7676 # http endpoints
-    entrypoint:
-      - "/bin/sh"
-      - "-c"
-    command:
-      - "safekeeper --listen-pg=$$SAFEKEEPER_ADVERTISE_URL
-                    --listen-http='0.0.0.0:7676'
-                    --id=$$SAFEKEEPER_ID
-                    --broker-endpoint=$$BROKER_ENDPOINT
-                    -D /data
-                    --remote-storage=\"{endpoint='http://minio:9000',
-                                        bucket_name='neon',
-                                        bucket_region='eu-north-1',
-                                        prefix_in_bucket='/safekeeper/'}\""
-    depends_on:
-      - storage_broker
-      - minio_create_buckets
-
-  safekeeper3:
-    restart: always
-    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon:${TAG:-latest}
-    environment:
-      - SAFEKEEPER_ADVERTISE_URL=safekeeper3:5454
-      - SAFEKEEPER_ID=3
-      - BROKER_ENDPOINT=http://storage_broker:50051
-      - AWS_ACCESS_KEY_ID=minio
-      - AWS_SECRET_ACCESS_KEY=password
-      #- RUST_BACKTRACE=1
-    ports:
-      #- 5454:5454 # pg protocol handler
-      - 7678:7676 # http endpoints
-    entrypoint:
-      - "/bin/sh"
-      - "-c"
-    command:
-      - "safekeeper --listen-pg=$$SAFEKEEPER_ADVERTISE_URL
-                    --listen-http='0.0.0.0:7676'
-                    --id=$$SAFEKEEPER_ID
-                    --broker-endpoint=$$BROKER_ENDPOINT
-                    -D /data
-                    --remote-storage=\"{endpoint='http://minio:9000',
-                                        bucket_name='neon',
-                                        bucket_region='eu-north-1',
-                                        prefix_in_bucket='/safekeeper/'}\""
-    depends_on:
-      - storage_broker
-      - minio_create_buckets
+      - |
+        mkdir -p \
+          /data/.neon/pageserver \
+          /data/.neon/endpoint_storage \
+          /var/db/omm \
+          /data/.neon/safekeeper1 \
+          /data/.neon/safekeeper2 \
+          /data/.neon/safekeeper3 \
+          /var/db/gaussdb/compute \
+          /var/db/gaussdb/specs \
+          /var/db/gaussdb/configs
+        chmod -R 0777 /data/.neon /var/db/omm /var/db/gaussdb
 
   storage_broker:
     restart: always
-    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon:${TAG:-latest}
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     ports:
       - 50051:50051
     command:
-      - "storage_broker"
-      - "--listen-addr=0.0.0.0:50051"
+      - storage_broker
+      - --listen-addr=0.0.0.0:50051
+
+  storage_controller_db:
+    restart: always
+    image: ${COMPUTE_IMAGE:-compute-node-opengauss-v702:latest}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      - ./.neon/storage_controller_db:/var/db/omm
+    entrypoint: ["/shell/storage_controller_db.sh"]
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
+
+  storage_controller:
+    restart: always
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    ports:
+      - 1234:1234
+    command:
+      - storage_controller
+      - --listen=0.0.0.0:1234
+      - --database-url=postgresql://omm@storage_controller_db:5432/storage_controller
+      - --db-connect-timeout=60s
+      - --dev
+    depends_on:
+      - storage_broker
+      - storage_controller_db
+
+  endpoint_storage:
+    restart: always
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - RUST_LOG=${RUST_LOG:-info}
+    ports:
+      - 9993:9993
+    volumes:
+      - ./.neon/endpoint_storage:/data/.neon/endpoint_storage
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /data/.neon/endpoint_storage/etc
+        cat > /data/.neon/endpoint_storage/etc/public-key.pem <<'EOF'
+        -----BEGIN PUBLIC KEY-----
+        MCowBQYDK2VwAyEADY0al/U0bgB3+9fUGk+3PKWnsck9OyxN5DjHIN6Xep0=
+        -----END PUBLIC KEY-----
+        EOF
+        exec endpoint_storage --config '{"listen":"0.0.0.0:9993","pemfile":"/data/.neon/endpoint_storage/etc/public-key.pem","type":"LocalFs","local_path":"/data/.neon/endpoint_storage/local_fs_remote_storage"}'
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
+
+  pageserver:
+    restart: always
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    ports:
+      - 9898:9898
+    volumes:
+      - ./.neon/pageserver:/data/.neon/pageserver
+      - ./pageserver_config/identity.toml:/data/.neon/pageserver/identity.toml:ro
+      - ./pageserver_config/pageserver.toml:/data/.neon/pageserver/pageserver.toml:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /data/.neon/pageserver/remote_storage
+        exec pageserver -D /data/.neon/pageserver
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
+      storage_broker:
+        condition: service_started
+      storage_controller:
+        condition: service_started
+
+  safekeeper1:
+    restart: always
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - SAFEKEEPER_ADVERTISE_URL=safekeeper1:5454
+      - SAFEKEEPER_ID=1
+      - BROKER_ENDPOINT=http://storage_broker:50051
+    ports:
+      - 7676:7676
+    volumes:
+      - ./.neon/safekeeper1:/data/.neon/safekeeper1
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        exec safekeeper \
+          --listen-pg=$$SAFEKEEPER_ADVERTISE_URL \
+          --listen-http=0.0.0.0:7676 \
+          --id=$$SAFEKEEPER_ID \
+          --broker-endpoint=$$BROKER_ENDPOINT \
+          -D /data/.neon/safekeeper1
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
+      storage_broker:
+        condition: service_started
+
+  safekeeper2:
+    restart: always
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - SAFEKEEPER_ADVERTISE_URL=safekeeper2:5454
+      - SAFEKEEPER_ID=2
+      - BROKER_ENDPOINT=http://storage_broker:50051
+    ports:
+      - 7677:7676
+    volumes:
+      - ./.neon/safekeeper2:/data/.neon/safekeeper2
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        exec safekeeper \
+          --listen-pg=$$SAFEKEEPER_ADVERTISE_URL \
+          --listen-http=0.0.0.0:7676 \
+          --id=$$SAFEKEEPER_ID \
+          --broker-endpoint=$$BROKER_ENDPOINT \
+          -D /data/.neon/safekeeper2
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
+      storage_broker:
+        condition: service_started
+
+  safekeeper3:
+    restart: always
+    image: ${NEON_IMAGE:-neon:latest_opgs}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - SAFEKEEPER_ADVERTISE_URL=safekeeper3:5454
+      - SAFEKEEPER_ID=3
+      - BROKER_ENDPOINT=http://storage_broker:50051
+    ports:
+      - 7678:7676
+    volumes:
+      - ./.neon/safekeeper3:/data/.neon/safekeeper3
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        exec safekeeper \
+          --listen-pg=$$SAFEKEEPER_ADVERTISE_URL \
+          --listen-http=0.0.0.0:7676 \
+          --id=$$SAFEKEEPER_ID \
+          --broker-endpoint=$$BROKER_ENDPOINT \
+          -D /data/.neon/safekeeper3
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
+      storage_broker:
+        condition: service_started
 
   compute1:
     restart: always
-    build:
-      context: ./compute_wrapper/
-      args:
-        - REPOSITORY=${REPOSITORY:-ghcr.io/neondatabase}
-        - COMPUTE_IMAGE=compute-node-v${PG_VERSION:-16}
-        - TAG=${COMPUTE_TAG:-${TAG:-latest}}
-        - http_proxy=${http_proxy:-}
-        - https_proxy=${https_proxy:-}
-    image: built-compute
+    image: ${COMPUTE_IMAGE:-compute-node-opengauss-v702:latest}
+    pull_policy: never
     environment:
-      - PG_VERSION=${PG_VERSION:-16}
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - OTEL_SDK_DISABLED=true
       - TENANT_ID=${TENANT_ID:-}
       - TIMELINE_ID=${TIMELINE_ID:-}
-      #- RUST_BACKTRACE=1
-    # Mount the test files directly, for faster editing cycle.
     volumes:
-      - ./compute_wrapper/var/db/postgres/configs/:/var/db/postgres/configs/
-      - ./compute_wrapper/shell/:/shell/
+      - ./.neon/compute1:/var/db/gaussdb
+      - ../compute/gaussdb/configs/config.json:/var/db/gaussdb/configs/config.json:ro
     ports:
-      - 55433:55433 # pg protocol handler
-      - 3080:3080 # http endpoints
-    entrypoint:
-      - "/shell/compute.sh"
-    # Ad an alias for compute1 for compatibility
+      - 55433:55433
+      - 3080:3080
+    entrypoint: ["/shell/compute.sh"]
     networks:
       default:
         aliases:
-            - compute
+          - compute
     depends_on:
       - safekeeper1
       - safekeeper2
       - safekeeper3
       - pageserver
+      - endpoint_storage
 
   compute_is_ready:
-    image: postgres:latest
+    image: ${COMPUTE_IMAGE:-compute-node-opengauss-v702:latest}
+    pull_policy: never
+    network_mode: service:compute1
     environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - GAUSSHOME=/usr/local/${OG_VERSION:-V702}
+      - LD_LIBRARY_PATH=/usr/lib64:/usr/local/${OG_VERSION:-V702}/lib
       - PARALLEL_COMPUTES=1
-    entrypoint:
-      - "/bin/sh"
-      - "-c"
+    entrypoint: ["/bin/bash", "-c"]
     command:
-      - "for i in $(seq 1 $${PARALLEL_COMPUTES}); do
-           until pg_isready -h compute$$i -p 55433 -U cloud_admin ; do
-             sleep 1;
-           done;
-         done;
-         echo All computes are started"
-    depends_on:
-      - compute1
-
-  neon-test-extensions:
-    profiles: ["test-extensions"]
-    image: ${REPOSITORY:-ghcr.io/neondatabase}/neon-test-extensions-v${PG_TEST_VERSION:-${PG_VERSION:-16}}:${TEST_EXTENSIONS_TAG:-${TAG:-latest}}
-    environment:
-      - PGUSER=${PGUSER:-cloud_admin}
-      - PGPASSWORD=${PGPASSWORD:-cloud_admin}
-    entrypoint:
-      - "/bin/bash"
-      - "-c"
-    command:
-      - sleep 3600
+      - |
+        export PATH=/usr/local/$${OG_VERSION}/bin:$$PATH
+        until /usr/local/$${OG_VERSION}/bin/gsql -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -c 'SELECT 1' >/dev/null 2>&1; do
+          sleep 1
+        done
+        echo All computes are started
     depends_on:
       - compute1
