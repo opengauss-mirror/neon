@@ -1768,6 +1768,9 @@ pub struct WalRedoManagerProcessStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalRedoManagerStatus {
     pub last_redo_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub processes: Vec<WalRedoManagerProcessStatus>,
+    /// Deprecated: use `processes`. Kept for API compatibility with existing clients.
     pub process: Option<WalRedoManagerProcessStatus>,
 }
 

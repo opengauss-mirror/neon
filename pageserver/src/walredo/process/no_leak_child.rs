@@ -5,7 +5,7 @@ use std::process::{Child, Command};
 use pageserver_api::shard::TenantShardId;
 use tracing::{error, info, instrument};
 
-use crate::metrics::{WAL_REDO_PROCESS_COUNTERS, WalRedoKillCause};
+use crate::metrics::{WalRedoKillCause, WAL_REDO_PROCESS_COUNTERS};
 
 /// Wrapper type around `std::process::Child` which guarantees that the child
 /// will be killed and waited-for by this process before being dropped.

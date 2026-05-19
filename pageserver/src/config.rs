@@ -34,6 +34,9 @@ use crate::tenant::{TENANTS_SEGMENT_NAME, TIMELINES_SEGMENT_NAME};
 use crate::virtual_file::io_engine;
 use crate::{TENANT_HEATMAP_BASENAME, TENANT_LOCATION_CONFIG_NAME, virtual_file};
 
+const MAX_WAL_REDO_CONCURRENCY: usize = 8;
+const MAX_WAL_REDO_GLOBAL_EXTRA_CONCURRENCY: usize = 64;
+
 /// Global state of pageserver.
 ///
 /// It's mostly immutable configuration, but some semaphores and the
@@ -88,6 +91,10 @@ pub struct PageServerConf {
     pub wal_redo_timeout: Duration,
     // Number of concurrent walredo processes per tenant (process pool size).
     pub wal_redo_concurrency: std::num::NonZeroUsize,
+    // Number of extra walredo processes shared by all tenants, beyond the guaranteed
+    // one walredo process per tenant.
+    pub wal_redo_global_extra_concurrency: usize,
+    pub wal_redo_global_extra_permits: Arc<tokio::sync::Semaphore>,
 
     pub superuser: String,
     pub locale: String,
@@ -405,6 +412,8 @@ impl PageServerConf {
             availability_zone,
             wait_lsn_timeout,
             wal_redo_timeout,
+            wal_redo_concurrency,
+            wal_redo_global_extra_concurrency,
             superuser,
             locale,
             page_cache_size,
@@ -464,6 +473,18 @@ impl PageServerConf {
             force_metric_collection_on_scrape,
         } = config_toml;
 
+        ensure!(
+            wal_redo_concurrency.get() <= MAX_WAL_REDO_CONCURRENCY,
+            "wal_redo_concurrency must be at most {MAX_WAL_REDO_CONCURRENCY}"
+        );
+
+        let wal_redo_global_extra_concurrency = wal_redo_global_extra_concurrency
+            .unwrap_or_else(|| wal_redo_concurrency.get().saturating_sub(1));
+        ensure!(
+            wal_redo_global_extra_concurrency <= MAX_WAL_REDO_GLOBAL_EXTRA_CONCURRENCY,
+            "wal_redo_global_extra_concurrency must be at most {MAX_WAL_REDO_GLOBAL_EXTRA_CONCURRENCY}"
+        );
+
         let mut conf = PageServerConf {
             // ------------------------------------------------------------
             // fields that are already fully validated by the ConfigToml Deserialize impl
@@ -478,7 +499,11 @@ impl PageServerConf {
             availability_zone,
             wait_lsn_timeout,
             wal_redo_timeout,
-            wal_redo_concurrency: std::num::NonZeroUsize::new(4).unwrap(),
+            wal_redo_concurrency,
+            wal_redo_global_extra_concurrency,
+            wal_redo_global_extra_permits: Arc::new(tokio::sync::Semaphore::new(
+                wal_redo_global_extra_concurrency,
+            )),
             superuser,
             locale,
             page_cache_size,

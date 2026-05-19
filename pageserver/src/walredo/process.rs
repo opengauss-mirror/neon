@@ -12,16 +12,16 @@ use anyhow::Context;
 use bytes::Bytes;
 use pageserver_api::reltag::RelTag;
 use pageserver_api::shard::TenantShardId;
-use postgres_ffi::{BLCKSZ, PgMajorVersion};
+use postgres_ffi::{PgMajorVersion, BLCKSZ};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{Instrument, debug, error, instrument};
+use tracing::{debug, error, instrument, Instrument};
 use utils::lsn::Lsn;
 use utils::poison::Poison;
 use wal_decoder::models::record::NeonWalRecord;
 
 use self::no_leak_child::NoLeakChild;
 use crate::config::PageServerConf;
-use crate::metrics::{WAL_REDO_PROCESS_COUNTERS, WAL_REDO_RECORD_COUNTER, WalRedoKillCause};
+use crate::metrics::{WalRedoKillCause, WAL_REDO_PROCESS_COUNTERS, WAL_REDO_RECORD_COUNTER};
 use crate::page_cache::PAGE_SZ;
 use crate::span::debug_assert_current_span_has_tenant_id;
 
@@ -66,7 +66,11 @@ impl WalRedoProcess {
         let pg_lib_dir_path = conf.pg_lib_dir(pg_version).context("pg_lib_dir")?;
 
         use no_leak_child::NoLeakChildCommandExt;
-        let binary = if pg_bin_dir_path.join("gaussdb").exists() { "gaussdb" } else { "postgres" };
+        let binary = if pg_bin_dir_path.join("gaussdb").exists() {
+            "gaussdb"
+        } else {
+            "postgres"
+        };
         let child = Command::new(pg_bin_dir_path.join(binary))
             // the first arg must be --wal-redo so the child process enters into walredo mode
             .arg("--wal-redo")

@@ -197,6 +197,8 @@ pub struct ConfigToml {
     pub wait_lsn_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub wal_redo_timeout: Duration,
+    pub wal_redo_concurrency: std::num::NonZeroUsize,
+    pub wal_redo_global_extra_concurrency: Option<usize>,
     pub superuser: String,
     pub locale: String,
     pub page_cache_size: usize,
@@ -728,6 +730,8 @@ impl Default for ConfigToml {
                 .expect("cannot parse default wait lsn timeout")),
             wal_redo_timeout: (humantime::parse_duration(DEFAULT_WAL_REDO_TIMEOUT)
                 .expect("cannot parse default wal redo timeout")),
+            wal_redo_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
+            wal_redo_global_extra_concurrency: None,
             superuser: (DEFAULT_SUPERUSER.to_string()),
             locale: DEFAULT_LOCALE.to_string(),
             page_cache_size: (DEFAULT_PAGE_CACHE_SIZE),
