@@ -206,12 +206,20 @@ static XLogReaderState *reader_state;
 #include <sys/syscall.h>
 #include <errno.h>
 
+#ifndef __NR_close_range
+#ifdef __aarch64__
+#define __NR_close_range 436
+#elif defined(__x86_64__)
+#define __NR_close_range 436
+#else
+#error "Unknown architecture: cannot determine __NR_close_range"
+#endif
+#endif
+
 static int
 close_range_syscall(unsigned int start_fd, unsigned int count, unsigned int flags)
 {
-    // return syscall(__NR_close_range, start_fd, count, flags);
-	// TODO: MUST FIX IT!!!
-	return 0;
+	return syscall(__NR_close_range, start_fd, count, flags);
 }
 
 
@@ -258,9 +266,20 @@ enter_seccomp_mode(void)
 	 * wal records. See the comment in the Rust code that launches this process.
 	 */
 	if (close_range_syscall(3, ~0U, 0) != 0)
-		ereport(FATAL,
-				(errcode(ERRCODE_SYSTEM_ERROR),
-				 errmsg("seccomp: could not close files >= fd 3")));
+	{
+		if (errno == ENOSYS)
+		{
+			int maxfd = sysconf(_SC_OPEN_MAX);
+			if (maxfd < 0)
+				maxfd = 1024;
+			for (int fd = 3; fd < maxfd; fd++)
+				close(fd);
+		}
+		else
+			ereport(FATAL,
+					(errcode(ERRCODE_SYSTEM_ERROR),
+					 errmsg("seccomp: could not close files >= fd 3")));
+	}
 
 #ifdef MALLOC_NO_MMAP
 	/* Ask glibc not to use mmap() */
