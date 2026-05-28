@@ -1,7 +1,7 @@
 This directory contains files that are needed to build the compute
 images, or included in the compute images.
 
-compute-node.Dockerfile
+compute-node-opengauss.Dockerfile
 	To build the compute image
 
 vm-image-spec.yaml

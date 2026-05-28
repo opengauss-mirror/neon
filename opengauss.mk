@@ -24,7 +24,7 @@ opengauss-build-%: FORCE
 	@echo "Building openGauss $*"
 	@test -s $(OPENGAUSS_SRC)/build.sh || { \
 		echo "openGauss submodule not found. Run: git submodule update --init --recursive"; exit 1; }
-	@cd $(OPENGAUSS_SRC) && sh build.sh -m release -3rd $(OPENGAUSS_BINARYLIBS_DIR) --cmake --cmake_opt "-DENABLE_NEON=ON"
+	@cd $(OPENGAUSS_SRC) && bash build.sh -m release -3rd $(OPENGAUSS_BINARYLIBS_DIR) --cmake --cmake_opt "-DENABLE_NEON=ON"
 	@rm -rf $(OPENGAUSS_INSTALL_DIR)/$* && mkdir -p $(OPENGAUSS_INSTALL_DIR)/$*
 	@test -d $(OPENGAUSS_SRC)/mppdb_temp_install && \
 		cp -r $(OPENGAUSS_SRC)/mppdb_temp_install/* $(OPENGAUSS_INSTALL_DIR)/$*/ || \

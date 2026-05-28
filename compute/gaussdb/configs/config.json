@@ -11,11 +11,6 @@
             "name": "docker_compose_test",
             "state": "restarted",
             "roles": [
-                {
-                    "name": "cloud_admin",
-                    "encrypted_password": "b093c0d3b281ba6da1eacc608620abd8",
-                    "options": null
-                }
             ],
             "databases": [
             ],
@@ -32,8 +27,23 @@
                 },
                 {
                     "name": "wal_log_hints",
+                    "value": "off",
+                    "vartype": "bool"
+                },
+                {
+                    "name": "hot_standby",
                     "value": "on",
                     "vartype": "bool"
+                },
+                {
+                    "name": "full_page_writes",
+                    "value": "off",
+                    "vartype": "bool"
+                },
+                {
+                    "name": "effective_io_concurrency",
+                    "value": "2",
+                    "vartype": "integer"
                 },
                 {
                     "name": "log_connections",
@@ -47,7 +57,7 @@
                 },
                 {
                     "name": "shared_buffers",
-                    "value": "1MB",
+                    "value": "1GB",
                     "vartype": "string"
                 },
                 {
@@ -76,16 +86,6 @@
                     "vartype": "string"
                 },
                 {
-                    "name": "wal_keep_size",
-                    "value": "0",
-                    "vartype": "integer"
-                },
-                {
-                    "name": "password_encryption",
-                    "value": "md5",
-                    "vartype": "enum"
-                },
-                {
                     "name": "restart_after_crash",
                     "value": "off",
                     "vartype": "bool"
@@ -97,7 +97,7 @@
                 },
                 {
                     "name": "shared_preload_libraries",
-                    "value": "neon,pg_cron,timescaledb,pg_stat_statements",
+                    "value": "neon",
                     "vartype": "string"
                 },
                 {
@@ -118,21 +118,6 @@
                 {
                     "name": "neon.pageserver_connstring",
                     "value": "host=pageserver port=6400",
-                    "vartype": "string"
-                },
-                {
-                    "name": "max_replication_write_lag",
-                    "value": "500MB",
-                    "vartype": "string"
-                },
-                {
-                    "name": "max_replication_flush_lag",
-                    "value": "10GB",
-                    "vartype": "string"
-                },
-                {
-                    "name": "cron.database",
-                    "value": "postgres",
                     "vartype": "string"
                 }
             ]
