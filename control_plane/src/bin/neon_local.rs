@@ -6,11 +6,12 @@
 //! rely on `neon_local` to set up the environment for each test.
 //!
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +19,9 @@ use clap::Parser;
 use compute_api::requests::ComputeClaimsScope;
 use compute_api::spec::{ComputeMode, PageserverProtocol};
 use control_plane::broker::StorageBroker;
-use control_plane::endpoint::{ComputeControlPlane, EndpointStatus, EndpointTerminateMode};
+use control_plane::endpoint::{
+    ComputeControlPlane, Endpoint, EndpointStatus, EndpointTerminateMode,
+};
 use control_plane::endpoint_storage::{ENDPOINT_STORAGE_DEFAULT_ADDR, EndpointStorage};
 use control_plane::local_env;
 use control_plane::local_env::{
@@ -102,6 +105,8 @@ enum NeonLocalCmd {
     Endpoint(EndpointCmd),
     #[command(subcommand)]
     Mappings(MappingsCmd),
+    #[command(subcommand)]
+    Branch(BranchCmd),
 
     Start(StartCmdArgs),
     Stop(StopCmdArgs),
@@ -238,6 +243,173 @@ enum TimelineCmd {
     Branch(TimelineBranchCmdArgs),
     Create(TimelineCreateCmdArgs),
     Import(TimelineImportCmdArgs),
+}
+
+#[derive(clap::Subcommand)]
+#[clap(about = "Diff and merge local Neon branches through running endpoints")]
+enum BranchCmd {
+    Diff(BranchDiffCmdArgs),
+    Merge(BranchMergeCmdArgs),
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Diff a source branch against a target branch")]
+struct BranchDiffCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Source branch name")]
+    source_branch: String,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the source branch")]
+    source_endpoint: Option<String>,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(
+        long,
+        default_value = "public",
+        help = "Remote schema to import from source branch"
+    )]
+    source_schema: String,
+
+    #[clap(long, default_value = "public", help = "Target schema to compare")]
+    target_schema: String,
+
+    #[clap(
+        long,
+        default_value = "postgres",
+        help = "Database name on both endpoints"
+    )]
+    database: String,
+
+    #[clap(
+        long,
+        default_value = "cloud_admin",
+        help = "Database user on both endpoints"
+    )]
+    user: String,
+
+    #[clap(
+        long,
+        default_value = "neon_merge_src",
+        help = "Temporary FDW schema on target"
+    )]
+    fdw_schema: String,
+
+    #[clap(
+        long,
+        default_value = "neon_merge_src",
+        help = "Temporary FDW server on target"
+    )]
+    fdw_server: String,
+
+    #[clap(
+        long,
+        help = "Keep the temporary FDW schema and server after the command"
+    )]
+    keep_fdw: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum BranchMergeStrategy {
+    Fail,
+    Ours,
+    Theirs,
+}
+
+impl BranchMergeStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            BranchMergeStrategy::Fail => "fail",
+            BranchMergeStrategy::Ours => "ours",
+            BranchMergeStrategy::Theirs => "theirs",
+        }
+    }
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Merge a source branch into a target branch")]
+struct BranchMergeCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Source branch name")]
+    source_branch: String,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the source branch")]
+    source_endpoint: Option<String>,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(
+        long,
+        default_value = "public",
+        help = "Remote schema to import from source branch"
+    )]
+    source_schema: String,
+
+    #[clap(long, default_value = "public", help = "Target schema to merge into")]
+    target_schema: String,
+
+    #[clap(
+        long,
+        default_value = "postgres",
+        help = "Database name on both endpoints"
+    )]
+    database: String,
+
+    #[clap(
+        long,
+        default_value = "cloud_admin",
+        help = "Database user on both endpoints"
+    )]
+    user: String,
+
+    #[clap(
+        long,
+        value_enum,
+        default_value = "fail",
+        help = "Conflict strategy: fail, ours, or theirs"
+    )]
+    strategy: BranchMergeStrategy,
+
+    #[clap(
+        long,
+        default_value = "neon_merge_src",
+        help = "Temporary FDW schema on target"
+    )]
+    fdw_schema: String,
+
+    #[clap(
+        long,
+        default_value = "neon_merge_src",
+        help = "Temporary FDW server on target"
+    )]
+    fdw_server: String,
+
+    #[clap(long, help = "Do not copy tables that exist only on the source branch")]
+    no_copy_source_only_tables: bool,
+
+    #[clap(
+        long,
+        help = "Keep the temporary FDW schema and server after the command"
+    )]
+    keep_fdw: bool,
 }
 
 #[derive(clap::Args)]
@@ -863,6 +1035,7 @@ fn main() -> Result<()> {
             }
             NeonLocalCmd::Endpoint(subcmd) => rt.block_on(handle_endpoint(&subcmd, env)),
             NeonLocalCmd::Mappings(subcmd) => handle_mappings(&subcmd, env),
+            NeonLocalCmd::Branch(subcmd) => rt.block_on(handle_branch(&subcmd, env)),
         };
 
         let subcommand_result = if &original_env != env {
@@ -1423,15 +1596,15 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                 if let Some(lsn) = endpoint_lsn {
                     println!("Waiting for pageserver to sync WAL to {}...", lsn);
                     println!("(This may take a while for large transactions)");
-                    
+
                     let pageserver = get_default_pageserver(env);
                     let tenant_shard_id = TenantShardId::unsharded(tenant_id);
-                    
+
                     // Use longer timeout (5 minutes) and retry mechanism for large WAL volumes
                     let max_retries = 3;
                     let timeout_per_attempt = Duration::from_secs(120); // 2 minutes per attempt
                     let mut success = false;
-                    
+
                     for attempt in 1..=max_retries {
                         let mut timelines = HashMap::new();
                         timelines.insert(ancestor_timeline_id, lsn);
@@ -1439,7 +1612,7 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                             timelines,
                             timeout: timeout_per_attempt,
                         };
-                        
+
                         match pageserver.http_client.wait_lsn(tenant_shard_id, wait_req).await {
                             Ok(_) => {
                                 println!("WAL sync complete.");
@@ -1455,7 +1628,7 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                             }
                         }
                     }
-                    
+
                     if !success {
                         eprintln!("Proceeding with branch creation anyway. Data may be incomplete.");
                     }
@@ -1486,6 +1659,979 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                 "Created timeline '{}' at Lsn {last_record_lsn} for tenant: {tenant_id}. Ancestor timeline: '{ancestor_branch_name}'",
                 timeline_info.timeline_id
             );
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_branch_endpoint(
+    cplane: &ComputeControlPlane,
+    env: &local_env::LocalEnv,
+    tenant_id: TenantId,
+    branch_name: &str,
+    endpoint_id: &Option<String>,
+    endpoint_arg_name: &str,
+) -> Result<(String, Arc<Endpoint>)> {
+    let timeline_id = env
+        .get_branch_timeline_id(branch_name, tenant_id)
+        .ok_or_else(|| anyhow!("Found no timeline id for branch name '{branch_name}'"))?;
+
+    if let Some(endpoint_id) = endpoint_id {
+        let endpoint = cplane
+            .endpoints
+            .get(endpoint_id)
+            .with_context(|| format!("postgres endpoint {endpoint_id} is not found"))?;
+
+        if endpoint.tenant_id != tenant_id || endpoint.timeline_id != timeline_id {
+            bail!(
+                "endpoint {endpoint_id} does not belong to branch {branch_name} in tenant {tenant_id}"
+            );
+        }
+
+        if endpoint.status() != EndpointStatus::Running {
+            bail!("endpoint {endpoint_id} for branch {branch_name} is not running");
+        }
+
+        return Ok((endpoint_id.clone(), Arc::clone(endpoint)));
+    }
+
+    let mut matches = cplane
+        .endpoints
+        .iter()
+        .filter(|(_, endpoint)| {
+            endpoint.tenant_id == tenant_id
+                && endpoint.timeline_id == timeline_id
+                && endpoint.status() == EndpointStatus::Running
+        })
+        .map(|(endpoint_id, endpoint)| (endpoint_id.clone(), Arc::clone(endpoint)))
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        bail!(
+            "no running endpoint found for branch {branch_name}; start one or pass --{}-endpoint",
+            endpoint_arg_name
+        );
+    }
+
+    if matches.len() > 1 {
+        let endpoint_ids = matches
+            .iter()
+            .map(|(endpoint_id, _)| endpoint_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "multiple running endpoints found for branch {branch_name}: {endpoint_ids}; pass an explicit endpoint id"
+        );
+    }
+
+    Ok(matches.remove(0))
+}
+
+async fn connect_to_endpoint(
+    endpoint: &Endpoint,
+    user: &str,
+    database: &str,
+) -> Result<tokio_opengauss::Client> {
+    let connstr = endpoint.connstr(user, database);
+    let (client, connection) = tokio_opengauss::connect(&connstr, NoTls)
+        .await
+        .with_context(|| format!("failed to connect to endpoint at {connstr}"))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    Ok(client)
+}
+
+struct SourceColumn {
+    name: String,
+    data_type: String,
+    not_null: bool,
+    default_expr: Option<String>,
+}
+
+struct SourceConstraint {
+    name: String,
+    definition: String,
+}
+
+struct SourceIndex {
+    definition: String,
+}
+
+fn quote_sql_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+fn quote_sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn import_branch_source_foreign_tables(
+    target_client: &mut tokio_opengauss::Client,
+    source_endpoint: &Endpoint,
+    source_schema: &str,
+    fdw_schema: &str,
+    fdw_server: &str,
+    database: &str,
+    user: &str,
+) -> Result<()> {
+    let source_client = connect_to_endpoint(source_endpoint, user, database).await?;
+    let rows = source_client
+        .query(
+            "SELECT c.relname::text,
+                    a.attname::text,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
+                    a.attnotnull
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             JOIN pg_attribute a ON a.attrelid = c.oid
+             WHERE n.nspname = $1
+               AND c.relkind = 'r'
+               AND a.attnum > 0
+               AND NOT a.attisdropped
+             ORDER BY c.relname, a.attnum",
+            &[&source_schema],
+        )
+        .await
+        .with_context(|| format!("failed to read source schema {source_schema} metadata"))?;
+
+    let mut tables: BTreeMap<String, Vec<SourceColumn>> = BTreeMap::new();
+    for row in rows {
+        let table_name: String = row.get(0);
+        tables.entry(table_name).or_default().push(SourceColumn {
+            name: row.get(1),
+            data_type: row.get(2),
+            not_null: row.get(3),
+            default_expr: None,
+        });
+    }
+
+    for (table_name, columns) in tables {
+        let column_defs = columns
+            .iter()
+            .map(|column| {
+                let not_null = if column.not_null { " NOT NULL" } else { "" };
+                format!(
+                    "{} {}{}",
+                    quote_sql_ident(&column.name),
+                    column.data_type,
+                    not_null
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let create_sql = format!(
+            "CREATE FOREIGN TABLE {}.{} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
+            quote_sql_ident(fdw_schema),
+            quote_sql_ident(&table_name),
+            column_defs,
+            quote_sql_ident(fdw_server),
+            quote_sql_literal(source_schema),
+            quote_sql_literal(&table_name)
+        );
+
+        target_client
+            .batch_execute(&create_sql)
+            .await
+            .with_context(|| format!("failed to create foreign table {fdw_schema}.{table_name}"))?;
+    }
+
+    Ok(())
+}
+
+async fn read_database_compatibility(client: &tokio_opengauss::Client) -> Result<String> {
+    let row = client
+        .query_one(
+            "SELECT datcompatibility::text
+             FROM pg_database
+             WHERE datname = current_database()",
+            &[],
+        )
+        .await
+        .context("failed to read database compatibility")?;
+    Ok(row.get(0))
+}
+
+async fn ensure_branch_database_compatibility(
+    target_client: &tokio_opengauss::Client,
+    source_endpoint: &Endpoint,
+    database: &str,
+    user: &str,
+) -> Result<()> {
+    let source_client = connect_to_endpoint(source_endpoint, user, database).await?;
+    let source_compatibility = read_database_compatibility(&source_client)
+        .await
+        .context("failed to read source database compatibility")?;
+    let target_compatibility = read_database_compatibility(target_client)
+        .await
+        .context("failed to read target database compatibility")?;
+
+    if source_compatibility != target_compatibility {
+        bail!(
+            "database compatibility mismatch: source database {database} is {source_compatibility}, target database {database} is {target_compatibility}"
+        );
+    }
+
+    Ok(())
+}
+
+async fn list_schema_tables(
+    client: &tokio_opengauss::Client,
+    schema: &str,
+) -> Result<BTreeSet<String>> {
+    let rows = client
+        .query(
+            "SELECT c.relname::text
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1
+               AND c.relkind = 'r'
+             ORDER BY c.relname",
+            &[&schema],
+        )
+        .await
+        .with_context(|| format!("failed to list tables in schema {schema}"))?;
+
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+async fn load_source_columns(
+    source_client: &tokio_opengauss::Client,
+    source_schema: &str,
+    table_name: &str,
+) -> Result<Vec<SourceColumn>> {
+    let rows = source_client
+        .query(
+            "SELECT a.attname::text,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
+                    a.attnotnull,
+                    pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             JOIN pg_attribute a ON a.attrelid = c.oid
+             LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+             WHERE n.nspname = $1
+               AND c.relname = $2
+               AND c.relkind = 'r'
+               AND a.attnum > 0
+               AND NOT a.attisdropped
+             ORDER BY a.attnum",
+            &[&source_schema, &table_name],
+        )
+        .await
+        .with_context(|| format!("failed to read columns for {source_schema}.{table_name}"))?;
+
+    if rows.is_empty() {
+        bail!("source table {source_schema}.{table_name} does not exist or has no columns");
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SourceColumn {
+            name: row.get(0),
+            data_type: row.get(1),
+            not_null: row.get(2),
+            default_expr: row.get(3),
+        })
+        .collect())
+}
+
+async fn load_source_constraints(
+    source_client: &tokio_opengauss::Client,
+    source_schema: &str,
+    table_name: &str,
+) -> Result<Vec<SourceConstraint>> {
+    let rows = source_client
+        .query(
+            "SELECT con.conname::text,
+                    pg_catalog.pg_get_constraintdef(con.oid, true)::text
+             FROM pg_constraint con
+             JOIN pg_class c ON c.oid = con.conrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1
+               AND c.relname = $2
+               AND con.contype IN ('p', 'u', 'c')
+             ORDER BY CASE con.contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 ELSE 2 END,
+                      con.conname",
+            &[&source_schema, &table_name],
+        )
+        .await
+        .with_context(|| format!("failed to read constraints for {source_schema}.{table_name}"))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SourceConstraint {
+            name: row.get(0),
+            definition: row.get(1),
+        })
+        .collect())
+}
+
+async fn reject_unsupported_source_schema_objects(
+    source_client: &tokio_opengauss::Client,
+    source_schema: &str,
+) -> Result<()> {
+    let rows = source_client
+        .query(
+            "SELECT object_name, feature
+             FROM (
+                 SELECT c.relname::text AS object_name,
+                        CASE c.relkind
+                            WHEN 'v' THEN 'views'
+                            WHEN 'm' THEN 'materialized views'
+                            WHEN 'S' THEN 'sequences'
+                            WHEN 'f' THEN 'foreign tables'
+                            ELSE 'non-regular relations'
+                        END AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relkind IN ('v', 'm', 'S', 'f')
+
+                 UNION ALL
+
+                 SELECT p.proname::text AS object_name,
+                        'functions or procedures'::text AS feature
+                 FROM pg_proc p
+                 JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname = $1
+             ) unsupported
+             ORDER BY feature, object_name",
+            &[&source_schema],
+        )
+        .await
+        .with_context(|| {
+            format!("failed to inspect unsupported objects in schema {source_schema}")
+        })?;
+
+    let objects = rows
+        .into_iter()
+        .map(|row| {
+            let object_name: String = row.get(0);
+            let feature: String = row.get(1);
+            format!("{object_name} ({feature})")
+        })
+        .collect::<Vec<_>>();
+
+    if !objects.is_empty() {
+        bail!(
+            "source schema {source_schema} contains unsupported objects: {}",
+            objects.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+async fn reject_unsupported_source_table_features(
+    source_client: &tokio_opengauss::Client,
+    source_schema: &str,
+    table_name: &str,
+) -> Result<()> {
+    let rows = source_client
+        .query(
+            "SELECT feature
+             FROM (
+                 SELECT 'foreign key constraints'::text AS feature
+                 FROM pg_constraint con
+                 JOIN pg_class c ON c.oid = con.conrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND con.contype = 'f'
+
+                 UNION ALL
+
+                 SELECT 'sequence or auto-increment defaults'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 JOIN pg_attribute a ON a.attrelid = c.oid
+                 JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND c.relkind = 'r'
+                   AND pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%'
+
+                 UNION ALL
+
+                 SELECT 'table or column comments'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND (
+                       pg_catalog.obj_description(c.oid, 'pg_class') IS NOT NULL
+                       OR EXISTS (
+                           SELECT 1
+                           FROM pg_attribute a
+                           WHERE a.attrelid = c.oid
+                             AND a.attnum > 0
+                             AND NOT a.attisdropped
+                             AND pg_catalog.col_description(c.oid, a.attnum) IS NOT NULL
+                       )
+                   )
+
+                 UNION ALL
+
+                 SELECT 'owner or explicit privileges'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND (
+                       pg_catalog.pg_get_userbyid(c.relowner) <> current_user
+                       OR c.relacl IS NOT NULL
+                   )
+
+                 UNION ALL
+
+                 SELECT 'partitioned tables'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND EXISTS (
+                       SELECT 1
+                       FROM pg_partition p
+                       WHERE p.parentid = c.oid
+                          OR p.oid = c.oid
+                   )
+
+                 UNION ALL
+
+                 SELECT 'triggers'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 JOIN pg_trigger t ON t.tgrelid = c.oid
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND NOT t.tgisinternal
+
+                 UNION ALL
+
+                 SELECT 'tablespace settings'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND c.reltablespace <> 0
+
+                 UNION ALL
+
+                 SELECT 'storage parameters'::text AS feature
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND EXISTS (
+                       SELECT 1
+                       FROM unnest(c.reloptions) AS opt
+                       WHERE opt NOT IN ('orientation=row', 'compression=no')
+                         AND opt NOT LIKE 'collate=%'
+                   )
+             ) unsupported
+             ORDER BY feature",
+            &[&source_schema, &table_name],
+        )
+        .await
+        .with_context(|| {
+            format!("failed to inspect unsupported features for {source_schema}.{table_name}")
+        })?;
+
+    let features = rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    if !features.is_empty() {
+        bail!(
+            "source-only table {source_schema}.{table_name} uses unsupported features: {}",
+            features.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+fn retarget_index_definition(
+    indexdef: &str,
+    target_schema: &str,
+    table_name: &str,
+) -> Result<String> {
+    let on_pos = indexdef
+        .find(" ON ")
+        .ok_or_else(|| anyhow!("could not parse index definition: {indexdef}"))?;
+    let rel_start = on_pos + " ON ".len();
+    let tail = &indexdef[rel_start..];
+    let rel_end = tail
+        .find(" USING ")
+        .or_else(|| tail.find(" ("))
+        .ok_or_else(|| anyhow!("could not parse index relation in definition: {indexdef}"))?;
+    let target_relation = format!(
+        "{}.{}",
+        quote_sql_ident(target_schema),
+        quote_sql_ident(table_name)
+    );
+
+    Ok(format!(
+        "{}{}{}",
+        &indexdef[..rel_start],
+        target_relation,
+        &tail[rel_end..]
+    ))
+}
+
+async fn load_source_indexes(
+    source_client: &tokio_opengauss::Client,
+    source_schema: &str,
+    target_schema: &str,
+    table_name: &str,
+) -> Result<Vec<SourceIndex>> {
+    let rows = source_client
+        .query(
+            "SELECT pg_catalog.pg_get_indexdef(i.indexrelid)::text
+             FROM pg_index i
+             JOIN pg_class t ON t.oid = i.indrelid
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE n.nspname = $1
+               AND t.relname = $2
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM pg_constraint con
+                   WHERE con.conindid = i.indexrelid
+               )
+             ORDER BY i.indexrelid::text",
+            &[&source_schema, &table_name],
+        )
+        .await
+        .with_context(|| format!("failed to read indexes for {source_schema}.{table_name}"))?;
+
+    rows.into_iter()
+        .map(|row| {
+            let definition: String = row.get(0);
+            Ok(SourceIndex {
+                definition: retarget_index_definition(&definition, target_schema, table_name)?,
+            })
+        })
+        .collect()
+}
+
+async fn copy_source_only_tables_with_schema(
+    target_client: &mut tokio_opengauss::Client,
+    source_endpoint: &Endpoint,
+    source_schema: &str,
+    target_schema: &str,
+    fdw_schema: &str,
+    database: &str,
+    user: &str,
+    copy_source_only_tables: bool,
+) -> Result<(Vec<(String, i64)>, Vec<String>)> {
+    let source_client = connect_to_endpoint(source_endpoint, user, database).await?;
+    reject_unsupported_source_schema_objects(&source_client, source_schema).await?;
+
+    target_client
+        .batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {}",
+            quote_sql_ident(target_schema)
+        ))
+        .await
+        .with_context(|| format!("failed to create target schema {target_schema}"))?;
+
+    let source_tables = list_schema_tables(&source_client, source_schema).await?;
+    let target_tables = list_schema_tables(target_client, target_schema).await?;
+    let source_only_tables = source_tables
+        .difference(&target_tables)
+        .cloned()
+        .collect::<Vec<_>>();
+    let common_tables = source_tables
+        .intersection(&target_tables)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !copy_source_only_tables && !source_only_tables.is_empty() {
+        bail!(
+            "target table {}.{} does not exist",
+            target_schema,
+            source_only_tables[0]
+        );
+    }
+
+    let mut copied_tables = Vec::new();
+    for table_name in source_only_tables {
+        reject_unsupported_source_table_features(&source_client, source_schema, &table_name)
+            .await?;
+        let columns = load_source_columns(&source_client, source_schema, &table_name).await?;
+        let constraints =
+            load_source_constraints(&source_client, source_schema, &table_name).await?;
+        let indexes =
+            load_source_indexes(&source_client, source_schema, target_schema, &table_name).await?;
+
+        let column_defs = columns
+            .iter()
+            .map(|column| {
+                let default_expr = column
+                    .default_expr
+                    .as_ref()
+                    .map(|expr| format!(" DEFAULT {expr}"))
+                    .unwrap_or_default();
+                let not_null = if column.not_null { " NOT NULL" } else { "" };
+                format!(
+                    "{} {}{}{}",
+                    quote_sql_ident(&column.name),
+                    column.data_type,
+                    default_expr,
+                    not_null
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let create_table_sql = format!(
+            "CREATE TABLE {}.{} ({})",
+            quote_sql_ident(target_schema),
+            quote_sql_ident(&table_name),
+            column_defs
+        );
+        target_client
+            .batch_execute(&create_table_sql)
+            .await
+            .with_context(|| {
+                format!("failed to create target table {target_schema}.{table_name}")
+            })?;
+
+        for constraint in constraints {
+            let add_constraint_sql = format!(
+                "ALTER TABLE {}.{} ADD CONSTRAINT {} {}",
+                quote_sql_ident(target_schema),
+                quote_sql_ident(&table_name),
+                quote_sql_ident(&constraint.name),
+                constraint.definition
+            );
+            target_client
+                .batch_execute(&add_constraint_sql)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to add constraint {} on {target_schema}.{table_name}",
+                        constraint.name
+                    )
+                })?;
+        }
+
+        for index in indexes {
+            target_client
+                .batch_execute(&index.definition)
+                .await
+                .with_context(|| {
+                    format!("failed to create index on {target_schema}.{table_name}")
+                })?;
+        }
+
+        let column_list = columns
+            .iter()
+            .map(|column| quote_sql_ident(&column.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let copy_sql = format!(
+            "INSERT INTO {}.{} ({}) SELECT {} FROM {}.{}",
+            quote_sql_ident(target_schema),
+            quote_sql_ident(&table_name),
+            column_list,
+            column_list,
+            quote_sql_ident(fdw_schema),
+            quote_sql_ident(&table_name)
+        );
+        let copied_count = target_client
+            .execute(copy_sql.as_str(), &[])
+            .await
+            .with_context(|| format!("failed to copy rows into {target_schema}.{table_name}"))?;
+        copied_tables.push((table_name, copied_count as i64));
+    }
+
+    Ok((copied_tables, common_tables))
+}
+
+fn name_array_literal(names: &[String]) -> String {
+    let values = names
+        .iter()
+        .map(|name| quote_sql_literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ARRAY[{values}]::name[]")
+}
+
+async fn prepare_branch_source_fdw(
+    client: &mut tokio_opengauss::Client,
+    args_source_schema: &str,
+    fdw_schema: &str,
+    fdw_server: &str,
+    source_endpoint: &Endpoint,
+    database: &str,
+    user: &str,
+) -> Result<()> {
+    client
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS neon")
+        .await
+        .context("failed to create neon extension on target endpoint")?;
+
+    let source_host = source_endpoint.pg_address.ip().to_string();
+    let source_port = i32::from(source_endpoint.pg_address.port());
+
+    let prepare_sql = format!(
+        "DROP SERVER IF EXISTS {} CASCADE;
+         DROP SCHEMA IF EXISTS {} CASCADE;
+         CREATE SCHEMA {};
+         CREATE SERVER {} FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host {}, port {}, dbname {});
+         CREATE USER MAPPING FOR CURRENT_USER SERVER {} OPTIONS (user {});",
+        quote_sql_ident(fdw_server),
+        quote_sql_ident(fdw_schema),
+        quote_sql_ident(fdw_schema),
+        quote_sql_ident(fdw_server),
+        quote_sql_literal(&source_host),
+        quote_sql_literal(&source_port.to_string()),
+        quote_sql_literal(database),
+        quote_sql_ident(fdw_server),
+        quote_sql_literal(user),
+    );
+
+    client
+        .batch_execute(&prepare_sql)
+        .await
+        .context("failed to prepare postgres_fdw source schema")?;
+
+    import_branch_source_foreign_tables(
+        client,
+        source_endpoint,
+        args_source_schema,
+        fdw_schema,
+        fdw_server,
+        database,
+        user,
+    )
+    .await
+    .context("failed to create source foreign tables")?;
+
+    Ok(())
+}
+
+async fn cleanup_branch_source_fdw(
+    client: &mut tokio_opengauss::Client,
+    fdw_schema: &str,
+    fdw_server: &str,
+) -> Result<()> {
+    client
+        .query(
+            "SELECT neon_branch_cleanup_source($1::name, $2::name)",
+            &[&fdw_schema, &fdw_server],
+        )
+        .await
+        .context("failed to clean up postgres_fdw source schema")?;
+
+    Ok(())
+}
+
+async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<()> {
+    let cplane = ComputeControlPlane::load(env.clone())?;
+
+    match subcmd {
+        BranchCmd::Diff(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (source_endpoint_id, source_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.source_branch,
+                &args.source_endpoint,
+                "source",
+            )?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            println!(
+                "Diffing source branch '{}' ({}) against target branch '{}' ({})",
+                args.source_branch, source_endpoint_id, args.target_branch, target_endpoint_id
+            );
+
+            let mut client =
+                connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            ensure_branch_database_compatibility(
+                &client,
+                &source_endpoint,
+                &args.database,
+                &args.user,
+            )
+            .await?;
+            prepare_branch_source_fdw(
+                &mut client,
+                &args.source_schema,
+                &args.fdw_schema,
+                &args.fdw_server,
+                &source_endpoint,
+                &args.database,
+                &args.user,
+            )
+            .await?;
+
+            let diff_result = client
+                .query(
+                    "SELECT schema_name, table_name, diff_type, row_data FROM neon_branch_diff($1::name, $2::name, NULL::name[])",
+                    &[&args.fdw_schema, &args.target_schema],
+                )
+                .await;
+
+            if !args.keep_fdw {
+                if let Err(e) =
+                    cleanup_branch_source_fdw(&mut client, &args.fdw_schema, &args.fdw_server).await
+                {
+                    eprintln!("Warning: {e:#}");
+                }
+            }
+
+            for row in diff_result.context("branch diff failed")? {
+                let schema_name: String = row.get(0);
+                let table_name: String = row.get(1);
+                let diff_type: String = row.get(2);
+                let row_data: Option<String> = row.get(3);
+                let row_data = row_data.unwrap_or_default();
+
+                println!("{schema_name}.{table_name}\t{diff_type}\t{row_data}");
+            }
+        }
+        BranchCmd::Merge(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (source_endpoint_id, source_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.source_branch,
+                &args.source_endpoint,
+                "source",
+            )?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            println!(
+                "Merging source branch '{}' ({}) into target branch '{}' ({}) with strategy '{}'",
+                args.source_branch,
+                source_endpoint_id,
+                args.target_branch,
+                target_endpoint_id,
+                args.strategy.as_str()
+            );
+
+            let mut client =
+                connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            ensure_branch_database_compatibility(
+                &client,
+                &source_endpoint,
+                &args.database,
+                &args.user,
+            )
+            .await?;
+            prepare_branch_source_fdw(
+                &mut client,
+                &args.source_schema,
+                &args.fdw_schema,
+                &args.fdw_server,
+                &source_endpoint,
+                &args.database,
+                &args.user,
+            )
+            .await?;
+
+            let copy_source_only_tables = !args.no_copy_source_only_tables;
+            client
+                .batch_execute("BEGIN")
+                .await
+                .context("failed to start branch merge transaction")?;
+
+            let merge_result: Result<(Vec<(String, i64)>, Vec<tokio_opengauss::Row>)> = async {
+                let (copied_tables, common_tables) = copy_source_only_tables_with_schema(
+                    &mut client,
+                    &source_endpoint,
+                    &args.source_schema,
+                    &args.target_schema,
+                    &args.fdw_schema,
+                    &args.database,
+                    &args.user,
+                    copy_source_only_tables,
+                )
+                .await?;
+
+                let include_tables_sql = name_array_literal(&common_tables);
+                let merge_sql = format!(
+                    "SELECT schema_name, table_name, inserted_count, updated_count
+                     FROM neon_branch_merge($1::name, $2::name, $3, {include_tables_sql}, false)"
+                );
+                let merged_tables = client
+                    .query(
+                        merge_sql.as_str(),
+                        &[
+                            &args.fdw_schema,
+                            &args.target_schema,
+                            &args.strategy.as_str(),
+                        ],
+                    )
+                    .await?;
+
+                client
+                    .batch_execute("COMMIT")
+                    .await
+                    .context("failed to commit branch merge transaction")?;
+
+                Ok((copied_tables, merged_tables))
+            }
+            .await;
+
+            if merge_result.is_err() {
+                if let Err(e) = client.batch_execute("ROLLBACK").await {
+                    eprintln!("Warning: failed to roll back branch merge transaction: {e:#}");
+                }
+            }
+
+            if !args.keep_fdw {
+                if let Err(e) =
+                    cleanup_branch_source_fdw(&mut client, &args.fdw_schema, &args.fdw_server).await
+                {
+                    eprintln!("Warning: {e:#}");
+                }
+            }
+
+            let (copied_tables, merged_tables) = merge_result.context("branch merge failed")?;
+            for (table_name, inserted_count) in copied_tables {
+                println!(
+                    "{}.{}\tinserted={}\tupdated=0",
+                    args.target_schema, table_name, inserted_count
+                );
+            }
+
+            for row in merged_tables {
+                let schema_name: String = row.get(0);
+                let table_name: String = row.get(1);
+                let inserted_count: i64 = row.get(2);
+                let updated_count: i64 = row.get(3);
+
+                println!(
+                    "{schema_name}.{table_name}\tinserted={inserted_count}\tupdated={updated_count}"
+                );
+            }
         }
     }
 

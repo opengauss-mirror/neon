@@ -44,18 +44,6 @@ endif
 EXTENSION = neon
 DATA = \
 	neon--1.0.sql \
-	neon--1.0--1.1.sql \
-	neon--1.1--1.2.sql \
-	neon--1.2--1.3.sql \
-	neon--1.3--1.4.sql \
-	neon--1.4--1.5.sql \
-	neon--1.5--1.6.sql \
-	neon--1.6--1.5.sql \
-	neon--1.5--1.4.sql \
-	neon--1.4--1.3.sql \
-	neon--1.3--1.2.sql \
-	neon--1.2--1.1.sql \
-	neon--1.1--1.0.sql \
 	neon.control
 PGFILEDESC = "neon - cloud storage for PostgreSQL"
 

@@ -275,8 +275,7 @@ RUN set -e \
     && p='GRANT pg_signal_backend TO ' \
     && r=$(printf "%-${#p}s" "-- SKIP pg_signal_backend") \
     && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
-    && { for f in /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.0.sql /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.0--1.1.sql /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.1--1.2.sql /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.2--1.3.sql /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.3--1.4.sql /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.4--1.5.sql /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.5--1.6.sql; do printf '\n-- %s\n' "$f"; cat "$f"; done; } > /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.6.sql \
-    && sed -i -E 's/[[:space:]]*PARALLEL (UNSAFE|SAFE)//g' /usr/local/${OG_VERSION}/share/postgresql/extension/neon--1.6.sql \
+    && sed -i -E 's/[[:space:]]*PARALLEL (UNSAFE|SAFE)//g' /usr/local/${OG_VERSION}/share/postgresql/extension/neon*.sql \
     && sed -i -E '/TO [Pp][Gg]_[Mm][Oo][Nn][Ii][Tt][Oo][Rr];/d' /usr/local/${OG_VERSION}/share/postgresql/extension/neon*.sql
 
 COPY --chown=omm:omm compute/gaussdb/configs/ /var/db/gaussdb/configs/
