@@ -236,6 +236,14 @@ impl MetadataRecord {
                     } else if info == pg_constants::XLOG_HEAP_UPDATE
                         || info == pg_constants::XLOG_HEAP_HOT_UPDATE
                     {
+                        // In openGauss, when XLOG_HEAP_INIT_PAGE is set, main_data starts with
+                        // pd_xid_base before xl_heap_update, just like insert and multi-insert.
+                        // If we don't skip it, the all-visible-cleared flags are decoded from the
+                        // wrong offset and the pageserver can retain stale VM bits after VACUUM.
+                        if decoded.xl_info & pg_constants::XLOG_HEAP_INIT_PAGE > 0 {
+                            let _pd_xid_base = buf.get_u64_le();
+                        }
+
                         let xlrec = OgXlHeapUpdate::decode(buf);
                         // the size of tuple data is inferred from the size of the record.
                         // we can't validate the remaining number of bytes without parsing

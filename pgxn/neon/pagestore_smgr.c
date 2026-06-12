@@ -727,69 +727,9 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 			 * The problem can be fixed by callingGetFlushRecPtr() before checking if the page is in the buffer cache.
 			 * But you can't do that within smgrprefetch(), would need to modify the caller.
 			 */
-		/*
-		 * Set LSN fields for the page request.
-		 *
-		 * request_lsn = UINT64_MAX: always ask for the latest version.
-		 * not_modified_since = last_written_lsn: the exact LSN at which this
-		 * block was last written.  XLogWaitFlush above guarantees WAL up to
-		 * this LSN has been flushed, so walproposer can send it immediately.
-		 */
-		{
 			result->request_lsn = UINT64_MAX;
 			result->not_modified_since = last_written_lsn;
 			result->effective_request_lsn = last_written_lsn;
-		}
-
-		/*
-		 * FSM (Free Space Map) and VM (Visibility Map) pages are advisory
-		 * hints only.  Reading a stale version is always safe.
-		 *
-		 * FSM/VM changes are normally not WAL-logged.  Neon force-logs them
-		 * at eviction time with a very recent LSN, causing the pageserver to
-		 * stall for 30-50 s during bulk loads.
-		 *
-		 * Fix: set not_modified_since = effective_request_lsn = 1 so the
-		 * pageserver answers immediately with whatever version it already has.
-		 *
-		 * Additionally, global-catalog pages (spcnode == GLOBALTABLESPACE_OID,
-		 * i.e. pg_global) that are read during bulk loads are purely
-		 * informational lookups (e.g. pg_database).  Returning a version
-		 * that is a few WAL records behind is safe because the catalog row
-		 * itself is protected by transaction visibility; the worst case is
-		 * a re-read on the next access.  This avoids repeated 20-60 s stalls
-		 * when pageserver lags behind compute during heavy WAL generation.
-		 *
-		 * Both FSM and VM use stale optimization: set not_modified_since=1
-		 * so the pageserver answers immediately with whatever version it has.
-		 */
-		if (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM)
-		{
-			result->not_modified_since = 1;
-			neon_log(DEBUG1,
-					 "neon_get_request_lsns FSM/VM: set not_modified_since=1 to skip wait (lwlsn=%X/%X)",
-					 LSN_FORMAT_ARGS(last_written_lsn));
-		}
-		else if (rinfo.spcNode == GLOBALTABLESPACE_OID)
-		{
-			/*
-			 * pg_global system catalog pages: clamp not_modified_since to
-			 * the pageserver's last known LSN so we never wait beyond what
-			 * has already been ingested.  Use GetFlushRecPtr() as a proxy
-			 * for "pageserver has seen up to here" on the compute side.
-			 */
-			XLogRecPtr flushlsn = GetFlushRecPtr();
-			if (result->not_modified_since > flushlsn)
-			{
-				result->not_modified_since = flushlsn;
-				result->effective_request_lsn = flushlsn;
-				neon_log(DEBUG1,
-						 "neon_get_request_lsns pg_global: clamped not_modified_since to flushlsn=%X/%X (lwlsn=%X/%X)",
-						 LSN_FORMAT_ARGS(flushlsn),
-						 LSN_FORMAT_ARGS(last_written_lsn));
-			}
-		}
-
 		}
 	}
 }

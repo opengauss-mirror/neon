@@ -7120,8 +7120,8 @@ impl Timeline {
                     )
                     .await;
                 let redo_elapsed = redo_start.elapsed();
-                // Log if WAL redo takes more than 10ms
-                if redo_elapsed.as_millis() > 10 {
+                // Log only unusually slow WAL redo requests to avoid distorting benchmarks.
+                if redo_elapsed.as_millis() > 1000 {
                     info!(
                         "slow walredo: key={} records={} took {:.3}s",
                         key, num_records, redo_elapsed.as_secs_f64()

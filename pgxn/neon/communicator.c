@@ -1551,9 +1551,7 @@ Retry:
 static bool
 equal_requests(NeonRequest* a, NeonRequest* b)
 {
-	// FIX ME
-	return true;
-	// return a->reqid == b->reqid && a->lsn == b->lsn && a->not_modified_since == b->not_modified_since;
+	return a->reqid == b->reqid && a->lsn == b->lsn && a->not_modified_since == b->not_modified_since;
 }
 
 
