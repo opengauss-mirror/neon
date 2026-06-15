@@ -318,14 +318,19 @@ neon_get_backend_perf_counters(PG_FUNCTION_ARGS)
 
 	for (int procno = 0; procno < NUM_NEON_PERF_COUNTER_SLOTS; procno++)
 	{
-		PGPROC	   *proc;// = GetPGProcByNumber(procno);
-		int			pid = proc->pid;
+		PGPROC	   *proc = g_instance.proc_base_all_procs[procno];
+		int64		pid;
 		neon_per_backend_counters *counters = &neon_per_backend_counters_shared[procno];
-		metric_t   *metrics = neon_perf_counters_to_metrics(counters);
+		metric_t   *metrics;
+
+		if (proc == NULL || proc->pid == 0)
+			continue;
+		pid = proc->pid;
+		metrics = neon_perf_counters_to_metrics(counters);
 
 		values[0] = Int32GetDatum(procno);
 		nulls[0] = false;
-		values[1] = Int32GetDatum(pid);
+		values[1] = Int64GetDatum(pid);
 		nulls[1] = false;
 
 		for (int i = 0; metrics[i].name != NULL; i++)
@@ -336,6 +341,7 @@ neon_get_backend_perf_counters(PG_FUNCTION_ARGS)
 
 		pfree(metrics);
 	}
+	tuplestore_donestoring(rsinfo->setResult);
 
 	return (Datum) 0;
 }
@@ -404,6 +410,7 @@ neon_get_perf_counters(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	pfree(metrics);
+	tuplestore_donestoring(rsinfo->setResult);
 
 	return (Datum) 0;
 }

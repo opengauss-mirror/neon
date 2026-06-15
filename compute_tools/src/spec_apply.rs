@@ -1060,7 +1060,7 @@ async fn get_operations<'a>(
             })))
         }
         ApplySpecPhase::HandleNeonExtension => {
-            let operations = vec![
+            let mut operations = vec![
                 Operation {
                     query: String::from("CREATE EXTENSION IF NOT EXISTS neon WITH SCHEMA neon"),
                     comment: Some(String::from(
@@ -1077,14 +1077,24 @@ async fn get_operations<'a>(
                     query: String::from("ALTER EXTENSION neon SET SCHEMA neon"),
                     comment: Some(String::from("compat/fix: alter neon extension schema")),
                 },
-                Operation {
+            ];
+
+            if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                info!("refreshing neon extension compatibility views on openGauss");
+                operations.push(Operation {
+                    query: String::from(crate::spec::OPENGAUSS_NEON_EXTENSION_COMPAT_SQL),
+                    comment: Some(String::from(
+                        "compat/update: refresh neon extension views on openGauss",
+                    )),
+                });
+            } else {
+                operations.push(Operation {
                     query: String::from("ALTER EXTENSION neon UPDATE"),
                     comment: Some(String::from("compat/update: update neon extension version")),
-                },
-            ]
-            .into_iter();
+                });
+            }
 
-            Ok(Box::new(operations))
+            Ok(Box::new(operations.into_iter()))
         }
         ApplySpecPhase::CreateAvailabilityCheck => Ok(Box::new(once(Operation {
             query: String::from(include_str!("sql/add_availabilitycheck_tables.sql")),

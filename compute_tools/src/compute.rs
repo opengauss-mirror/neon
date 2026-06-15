@@ -1909,6 +1909,7 @@ impl ComputeNode {
     #[instrument(skip_all)]
     pub fn post_apply_config(&self) -> Result<()> {
         let conf = self.get_tokio_conn_conf(Some("compute_ctl:post_apply_config"));
+        let is_opengauss = is_opengauss_pgbin(&self.params.pgbin);
         tokio::spawn(async move {
             let res = async {
                 let (mut client, connection) = conf.connect(NoTls).await?;
@@ -1918,7 +1919,7 @@ impl ComputeNode {
                     }
                 });
 
-                handle_neon_extension_upgrade(&mut client)
+                handle_neon_extension_upgrade(&mut client, is_opengauss)
                     .await
                     .context("handle_neon_extension_upgrade")?;
                 Ok::<_, anyhow::Error>(())
