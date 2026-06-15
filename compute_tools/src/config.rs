@@ -81,7 +81,7 @@ pub fn write_postgres_conf(
     if is_opengauss {
         // Reduce prefetch pressure to avoid cascading disconnects under bulk load.
         // Walredo is serial; fewer in-flight requests = less queue depth = fewer timeouts.
-        writeln!(file, "neon.readahead_buffer_size=32")?;
+        writeln!(file, "neon.readahead_buffer_size=128")?;
     }
     writeln!(file, "enable_double_write = off")?;
     writeln!(file, "enable_incremental_checkpoint = off")?;

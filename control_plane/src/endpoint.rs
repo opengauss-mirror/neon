@@ -40,6 +40,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -64,6 +65,7 @@ use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm, KeyOperations,
     OctetKeyPairParameters, OctetKeyPairType, PublicKeyUse,
 };
+use nix::libc;
 use nix::sys::signal::{Signal, kill};
 use pem::Pem;
 use reqwest::header::CONTENT_TYPE;
@@ -467,10 +469,7 @@ impl Endpoint {
         conf.append("hot_standby", "on");
         conf.append("shared_buffers", "1GB");
         conf.append("full_page_writes", "off");
-        // Postgres defaults to effective_io_concurrency=1, which does not exercise the pageserver's
-        // batching logic.  Set this to 2 so that we exercise the code a bit without letting
-        // individual tests do a lot of concurrent work on underpowered test machines
-        conf.append("effective_io_concurrency", "2");
+        conf.append("effective_io_concurrency", "8");
         conf.append("fsync", "off");
         conf.append("max_connections", "100");
         conf.append("wal_level", "logical");
@@ -927,6 +926,17 @@ impl Endpoint {
 
         if let Some(privileged_role_name) = self.privileged_role_name.clone() {
             cmd.args(["--privileged-role-name", &privileged_role_name]);
+        }
+
+        // Detach compute_ctl from neon_local's process group. The endpoint is
+        // managed later through compute_ctl.pid, and should outlive this CLI.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
 
         let child = cmd.spawn()?;

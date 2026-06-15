@@ -83,7 +83,7 @@ CREATE VIEW neon_backend_perf_counters AS
   SELECT P.procno, P.pid, P.metric, P.bucket_le, P.value
   FROM get_backend_perf_counters() AS P (
     procno integer,
-    pid integer,
+    pid bigint,
     metric text,
     bucket_le float8,
     value float8

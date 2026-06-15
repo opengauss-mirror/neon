@@ -968,7 +968,7 @@ lfc_get_state(size_t max_entries)
 	if (lfc_maybe_disabled() || max_entries == 0)	/* fast exit if file cache is disabled */
 		return NULL;
 
-	//LWLockAcquire(lfc_lock, LW_SHARED);
+	LWLockAcquire(lfc_lock, LW_SHARED);
 
 	if (LFC_ENABLED())
 	{
@@ -1002,11 +1002,11 @@ lfc_get_state(size_t max_entries)
 		}
 		Assert(i == n_entries);
 		fcs->n_pages = n_pages;
-		//Assert(pg_popcount((char*)bitmap, ((n_entries << lfc_chunk_size_log) + 7)/8) == n_pages);
+		Assert(pg_popcount((char*)bitmap, ((n_entries << lfc_chunk_size_log) + 7)/8) == n_pages);
 		elog(LOG, "LFC: save state of %d chunks %d pages", (int)n_entries, (int)n_pages);
 	}
 
-	//LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 
 	return fcs;
 }
@@ -1371,17 +1371,17 @@ lfc_cache_containsv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 	tag.blockNum = blkno - chunk_offs;
 	hash = get_hash_value(lfc_hash, &tag);
 
-	//LWLockAcquire(lfc_lock, LW_SHARED);
+	LWLockAcquire(lfc_lock, LW_SHARED);
 
 	if (!LFC_ENABLED())
 	{
-		//LWLockRelease(lfc_lock);
+		LWLockRelease(lfc_lock);
 		return 0;
 	}
 	while (true)
 	{
 		int		this_chunk = Min(nblocks - i, lfc_blocks_per_chunk - chunk_offs);
-		//entry = hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
+		entry = (FileCacheEntry *) hash_search_with_hash_value(lfc_hash, &tag, hash, HASH_FIND, NULL);
 
 		if (entry != NULL)
 		{
@@ -1414,7 +1414,7 @@ lfc_cache_containsv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber blkno,
 		hash = get_hash_value(lfc_hash, &tag);
 	}
 
-	//LWLockRelease(lfc_lock);
+	LWLockRelease(lfc_lock);
 
 #ifdef USE_ASSERT_CHECKING
 	{

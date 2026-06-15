@@ -266,12 +266,55 @@ pub fn add_standby_signal_ext(
 }
 
 #[instrument(skip_all)]
-pub async fn handle_neon_extension_upgrade(client: &mut Client) -> Result<()> {
-    let query = "ALTER EXTENSION neon UPDATE";
+pub async fn handle_neon_extension_upgrade(client: &mut Client, is_opengauss: bool) -> Result<()> {
+    let query = if is_opengauss {
+        info!("refreshing neon extension compatibility views on openGauss");
+        OPENGAUSS_NEON_EXTENSION_COMPAT_SQL
+    } else {
+        "ALTER EXTENSION neon UPDATE"
+    };
     info!("update neon extension version with query: {}", query);
     client.simple_query(query).await?;
 
     Ok(())
+}
+
+pub const OPENGAUSS_NEON_EXTENSION_COMPAT_SQL: &str = r#"
+DELETE FROM pg_depend
+ WHERE refclassid = 'pg_extension'::regclass
+   AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'neon')
+   AND classid = 'pg_class'::regclass
+   AND objid IN (
+     SELECT c.oid
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'neon'
+        AND c.relname IN ('neon_backend_perf_counters', 'neon_perf_counters')
+   );
+
+DROP VIEW IF EXISTS neon.neon_backend_perf_counters;
+CREATE VIEW neon.neon_backend_perf_counters AS
+  SELECT P.procno, P.pid, P.metric, P.bucket_le, P.value
+  FROM neon.get_backend_perf_counters() AS P (
+    procno integer,
+    pid bigint,
+    metric text,
+    bucket_le float8,
+    value float8
+  );
+
+DROP VIEW IF EXISTS neon.neon_perf_counters;
+CREATE VIEW neon.neon_perf_counters AS
+  SELECT P.metric, P.bucket_le, P.value
+  FROM neon.get_perf_counters() AS P (
+    metric text,
+    bucket_le float8,
+    value float8
+  );
+"#;
+
+pub fn is_opengauss_pgbin(pgbin: &str) -> bool {
+    pgbin.contains("gaussdb") || pgbin.contains("openGauss")
 }
 
 #[instrument(skip_all)]
