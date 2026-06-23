@@ -2711,6 +2711,8 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .clone()
                 .unwrap_or_else(|| format!("ep-{branch_name}"));
 
+            cplane.check_endpoint_id_available(&endpoint_id)?;
+
             let timeline_id = env
                 .get_branch_timeline_id(&branch_name, tenant_id)
                 .ok_or_else(|| anyhow!("Found no timeline id for branch name '{branch_name}'"))?;

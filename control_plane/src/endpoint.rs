@@ -158,6 +158,52 @@ impl ComputeControlPlane {
             .unwrap_or(self.base_port)
     }
 
+    pub fn check_endpoint_id_available(&self, endpoint_id: &str) -> Result<()> {
+        // Local endpoint directories are keyed only by endpoint id:
+        //
+        //   .neon/endpoints/<endpoint_id>
+        //
+        // Tenant and timeline ids live inside endpoint.json, not in the directory
+        // path. Reusing the same endpoint id for another tenant would overwrite
+        // that metadata while leaving the old pgdata and compute process behind.
+        // Keep endpoint ids globally unique inside one local Neon environment.
+        //
+        // This is intentionally checked before resolving the branch timeline or
+        // allocating ports. A duplicate endpoint id is a local control-plane
+        // problem, independent of the tenant/timeline that the caller selected.
+        // Reporting it early makes the failure mode match what the user has to
+        // fix: choose another endpoint id, or destroy the existing endpoint.
+        //
+        // Do not relax this to allow the same endpoint id under different
+        // tenants unless the on-disk layout is changed as well. A tenant-scoped
+        // endpoint namespace would need paths such as:
+        //
+        //   .neon/endpoints/<tenant_id>/<endpoint_id>
+        //
+        // and every endpoint command would then need to resolve ambiguity using
+        // the tenant id. With the current flat layout, endpoint_id is the only
+        // durable key for the compute node directory.
+        if self.endpoints.contains_key(endpoint_id) {
+            bail!(
+                "endpoint id '{endpoint_id}' already exists. Endpoint ids are global within a local Neon environment, not scoped by tenant. Choose a different endpoint id, or stop and destroy the existing endpoint first."
+            );
+        }
+
+        // The in-memory map is loaded from endpoint.json files, but an orphaned
+        // directory can still exist if a previous create was interrupted. Refuse
+        // to write into it too, because it may contain pgdata or config files
+        // from an older compute node.
+        let endpoint_path = self.env.endpoints_path().join(endpoint_id);
+        if endpoint_path.exists() {
+            bail!(
+                "endpoint directory {} already exists. Refusing to overwrite existing endpoint metadata.",
+                endpoint_path.display()
+            );
+        }
+
+        Ok(())
+    }
+
     /// Create a JSON Web Key Set. This ideally matches the way we create a JWKS
     /// from the production control plane.
     fn create_jwks_from_pem(pem: &Pem) -> Result<JwkSet> {
@@ -205,6 +251,8 @@ impl ComputeControlPlane {
         drop_subscriptions_before_start: bool,
         privileged_role_name: Option<String>,
     ) -> Result<Arc<Endpoint>> {
+        self.check_endpoint_id_available(endpoint_id)?;
+
         let pg_port = pg_port.unwrap_or_else(|| self.get_port());
         let external_http_port = external_http_port.unwrap_or_else(|| self.get_port() + 1);
         let internal_http_port = internal_http_port.unwrap_or_else(|| external_http_port + 1);
