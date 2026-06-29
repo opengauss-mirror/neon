@@ -2109,19 +2109,114 @@ impl ComputeNode {
         }
     }
 
-    // Wrapped this around `pg_ctl reload`, but right now we don't use
-    // `pg_ctl` for start / stop.
+    // Wrapped this around `pg_ctl`/`gs_ctl reload`, but right now we don't use
+    // `pg_ctl`/`gs_ctl` for start / stop.
     #[instrument(skip_all)]
     fn pg_reload_conf(&self) -> Result<()> {
-        let pgctl_bin = Path::new(&self.params.pgbin)
+        let ctl_name = if is_opengauss_pgbin(&self.params.pgbin) {
+            "gs_ctl"
+        } else {
+            "pg_ctl"
+        };
+        let ctl_bin = Path::new(&self.params.pgbin)
             .parent()
             .unwrap()
-            .join("pg_ctl");
-        Command::new(pgctl_bin)
+            .join(ctl_name);
+        let output = Command::new(&ctl_bin)
             .args(["reload", "-D", &self.params.pgdata])
             .output()
-            .expect("cannot run pg_ctl process");
+            .with_context(|| format!("cannot run {} reload", ctl_bin.display()))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "{} reload failed with status {} stdout={:?} stderr={:?}",
+                ctl_bin.display(),
+                output.status,
+                stdout,
+                stderr
+            ));
+        }
+
+        if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+            info!(
+                stdout = %stdout.trim(),
+                stderr = %stderr.trim(),
+                "{} reload finished",
+                ctl_bin.display()
+            );
+        }
+
         Ok(())
+    }
+
+    #[instrument(skip_all, fields(expected = %expected))]
+    fn wait_for_pageserver_connstring_reload(&self, expected: &str) -> Result<()> {
+        const MAX_RELOAD_ATTEMPTS: usize = 5;
+        const RELOAD_SETTLE_BASE_MS: u64 = 200;
+
+        let mut last_actual = None;
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_RELOAD_ATTEMPTS {
+            self.pg_reload_conf()
+                .with_context(|| format!("failed to reload postgres config, attempt {attempt}"))?;
+            std::thread::sleep(Duration::from_millis(
+                RELOAD_SETTLE_BASE_MS * attempt as u64,
+            ));
+
+            match self.get_runtime_pageserver_connstring() {
+                Ok(actual) if actual == expected => {
+                    info!(
+                        attempt,
+                        pageserver_connstring = %actual,
+                        "postgres config reload applied"
+                    );
+                    return Ok(());
+                }
+                Ok(actual) => {
+                    warn!(
+                        attempt,
+                        expected = %expected,
+                        actual = %actual,
+                        "postgres config reload has not applied pageserver connstring yet"
+                    );
+                    last_actual = Some(actual);
+                    last_error = None;
+                }
+                Err(err) => {
+                    warn!(
+                        attempt,
+                        error = %err,
+                        "failed to read runtime pageserver connstring after reload"
+                    );
+                    last_error = Some(err.to_string());
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "postgres config reload did not apply neon.pageserver_connstring after {MAX_RELOAD_ATTEMPTS} attempts: expected={expected:?}, last_actual={last_actual:?}, last_error={last_error:?}"
+        ))
+    }
+
+    fn get_runtime_pageserver_connstring(&self) -> Result<String> {
+        let mut conf = self.get_conn_conf(Some("compute_ctl:verify_reload"));
+        conf.connect_timeout(Duration::from_secs(5));
+
+        let mut client = conf
+            .connect(NoTls)
+            .context("failed to connect to postgres to verify pageserver connstring")?;
+        client
+            .simple_query("SET statement_timeout = '5s'")
+            .context("failed to set statement_timeout for reload verification")?;
+        let row = client
+            .query_one("SHOW neon.pageserver_connstring", &[])
+            .context("failed to query runtime neon.pageserver_connstring")?;
+
+        Ok(row.get(0))
     }
 
     /// Similar to `apply_config()`, but does a bit different sequence of operations,
@@ -2178,7 +2273,15 @@ impl ComputeNode {
             tls_config,
         )?;
 
-        self.pg_reload_conf()?;
+        if let Some(expected_pageserver_connstring) = spec
+            .pageserver_connstring
+            .clone()
+            .or_else(|| spec.cluster.settings.find("neon.pageserver_connstring"))
+        {
+            self.wait_for_pageserver_connstring_reload(&expected_pageserver_connstring)?;
+        } else {
+            self.pg_reload_conf()?;
+        }
 
         if !spec.skip_pg_catalog_updates {
             let max_concurrent_connections = spec.reconfigure_concurrency;
