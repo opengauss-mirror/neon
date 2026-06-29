@@ -10,9 +10,7 @@ use compute_api::responses::TlsConfig;
 use compute_api::spec::{ComputeAudit, ComputeMode, ComputeSpec, GenericOption};
 
 use crate::compute::ComputeNodeParams;
-use crate::pg_helpers::{
-    GenericOptionExt, GenericOptionsSearch, PgOptionsSerialize, escape_conf_value,
-};
+use crate::pg_helpers::{GenericOptionExt, GenericOptionsSearch, escape_conf_value};
 use crate::tls::{self, SERVER_CRT, SERVER_KEY};
 
 /// Check that `line` is inside a text file and put it there if it is not.
@@ -220,10 +218,18 @@ pub fn write_postgres_conf(
         escape_conf_value(params.privileged_role_name.as_str())
     )?;
 
-    // If there are any extra options in the 'settings' field, append those
-    if spec.cluster.settings.is_some() {
+    // If there are any extra options in the 'settings' field, append those.
+    // Prefer top-level fields when both old and new spec formats carry the same GUC.
+    if let Some(settings) = &spec.cluster.settings {
         writeln!(file, "# Managed by compute_ctl: begin")?;
-        write!(file, "{}", spec.cluster.settings.as_pg_settings())?;
+        for setting in settings {
+            if spec.pageserver_connstring.is_some()
+                && setting.name == "neon.pageserver_connstring"
+            {
+                continue;
+            }
+            writeln!(file, "{}", setting.to_pg_setting())?;
+        }
         writeln!(file, "# Managed by compute_ctl: end")?;
     }
 
