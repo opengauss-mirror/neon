@@ -463,6 +463,7 @@ _PG_init(void)
 
 	/* LFC GUCs live in session context, so register them on each preload pass. */
 	lfc_init();
+	pg_init_libpagestore();
 
 	/*
 	 * Also load 'neon_rmgr'. This makes it unnecessary to list both 'neon'
@@ -518,7 +519,6 @@ _PG_init(void)
 	 */
 
 	/* Stage 1: Define GUCs, and other early intialization */
-	pg_init_libpagestore();
 	relsize_hash_init();
 	pg_init_walproposer();
 	/*
