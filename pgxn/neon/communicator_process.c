@@ -151,8 +151,8 @@ communicator_new_bgworker_main(Datum main_arg)
 	logging = communicator_worker_configure_logging();
 
 	proc_handle = communicator_worker_launch(
-		neon_tenant[0] == '\0' ? NULL : neon_tenant,
-		neon_timeline[0] == '\0' ? NULL : neon_timeline,
+		GetNeonTenantId()[0] == '\0' ? NULL : GetNeonTenantId(),
+		GetNeonTimelineId()[0] == '\0' ? NULL : GetNeonTimelineId(),
 		&errmsg
 		);
 	if (proc_handle == NULL)

@@ -194,7 +194,7 @@ NeonOnDemandXLogReaderRoutines(XLogReaderRoutine *xlr)
 	 * If safekeepers are not configured, assume we don't need neon_walreader,
 	 * i.e. running neon fork locally.
 	 */
-	if (wal_acceptors_list[0] == '\0')
+	if (GetWalAcceptorsList()[0] == '\0')
 		return;
 
 	if (!wal_reader)

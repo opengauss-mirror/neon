@@ -77,6 +77,11 @@ neon_download_extension_file_http(const char *filename, bool is_library)
 void
 pg_init_extension_server()
 {
+	static THR_LOCAL bool extension_server_gucs_initialized = false;
+
+	if (extension_server_gucs_initialized)
+		return;
+
 	/* Port to connect to compute_ctl on localhost */
 	/* to request extension files. */
 	DefineCustomIntVariable("neon.extension_server_port",
@@ -109,4 +114,5 @@ pg_init_extension_server()
 	/* set download_extension_file_hook */
 	//prev_download_extension_file_hook = download_extension_file_hook;
 	//download_extension_file_hook = neon_download_extension_file_http;
+	extension_server_gucs_initialized = true;
 }

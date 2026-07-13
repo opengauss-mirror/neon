@@ -25,10 +25,13 @@ extern void CalcMaxBackends(void);
 #define PG_IOV_MAX Min(IOV_MAX, 32)
 
 /* GUCs */
-extern char *neon_auth_token;
-extern char *neon_timeline;
-extern char *neon_tenant;
-extern char *wal_acceptors_list;
+extern THR_LOCAL char *neon_auth_token;
+extern THR_LOCAL char *neon_timeline;
+extern THR_LOCAL char *neon_tenant;
+extern THR_LOCAL char *wal_acceptors_list;
+extern const char *GetNeonTenantId(void);
+extern const char *GetNeonTimelineId(void);
+extern const char *GetWalAcceptorsList(void);
 extern int	wal_acceptor_reconnect_timeout;
 extern int	wal_acceptor_connection_timeout;
 extern int	readahead_getpage_pull_timeout_ms;

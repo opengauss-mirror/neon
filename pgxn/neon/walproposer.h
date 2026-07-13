@@ -478,6 +478,9 @@ typedef struct WalproposerShmemState
 	/* aggregated feedback with min LSNs across shards */
 	PageserverFeedback min_ps_feedback;
 
+	char		safekeepers_list[MAXCONNINFO];
+	char		safekeeper_conninfo_options[MAXCONNINFO];
+
 	/* BEGIN_HADRON */
 	/* The WAL rate limiter */
 	WalRateLimiter wal_rate_limiter;

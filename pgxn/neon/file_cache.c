@@ -420,6 +420,8 @@ typedef struct FileCacheControl
 	bool   prewarm_active;
 	bool   prewarm_canceled;
 	//dsm_handle prewarm_lfc_state_handle;
+
+	char	path[MAXPGPATH];
 } FileCacheControl;
 
 #define FILE_CACHE_STATE_MAGIC 0xfcfcfcfc
@@ -437,7 +439,8 @@ static int	lfc_prewarm_limit;
 static int	lfc_prewarm_batch;
 static int	lfc_chunk_size_log = MAX_BLOCKS_PER_CHUNK_LOG;
 static int	lfc_blocks_per_chunk = MAX_BLOCKS_PER_CHUNK;
-static char *lfc_path;
+static THR_LOCAL char *lfc_path;
+static char lfc_default_path[] = "file.cache";
 /*
  * openGauss keeps custom GUC definitions in session context, so each backend
  * thread must register them once. Keep the guard thread-local.
@@ -463,6 +466,21 @@ bool AmPrewarmWorker;
 #endif
 
 PGDLLEXPORT void lfc_prewarm_main(Datum main_arg);
+
+static char *
+lfc_get_path(void)
+{
+	if (lfc_ctl && lfc_ctl->path[0])
+		return lfc_ctl->path;
+
+	return lfc_path ? lfc_path : lfc_default_path;
+}
+
+static const char *
+lfc_show_path(void)
+{
+	return lfc_get_path();
+}
 
 /*
  * Close LFC file if opened.
@@ -513,11 +531,11 @@ lfc_switch_off(void)
 		 * We need to use unlink to to avoid races in LFC write, because it is not
 		 * protected by lock
 		 */
-		unlink(lfc_path);
+		unlink(lfc_get_path());
 
-		fd = LFC_OPEN_FILE(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
+		fd = LFC_OPEN_FILE(lfc_get_path(), O_RDWR | O_CREAT | O_TRUNC);
 		if (fd < 0)
-			elog(WARNING, "LFC: failed to recreate local file cache %s: %m", lfc_path);
+			elog(WARNING, "LFC: failed to recreate local file cache %s: %m", lfc_get_path());
 		else
 			close(fd);
 
@@ -531,7 +549,7 @@ lfc_switch_off(void)
 static void
 lfc_disable(char const *op)
 {
-	elog(WARNING, "LFC: failed to %s local file cache at %s: %m, disabling local file cache", op, lfc_path);
+	elog(WARNING, "LFC: failed to %s local file cache at %s: %m, disabling local file cache", op, lfc_get_path());
 
 	LWLockAcquire(lfc_lock, LW_EXCLUSIVE);
 	lfc_switch_off();
@@ -562,7 +580,7 @@ lfc_ensure_opened(void)
 	/* Open cache file if not done yet */
 	if (lfc_desc < 0)
 	{
-		lfc_desc = LFC_OPEN_FILE(lfc_path, O_RDWR);
+		lfc_desc = LFC_OPEN_FILE(lfc_get_path(), O_RDWR);
 
 		if (lfc_desc < 0)
 		{
@@ -607,15 +625,16 @@ LfcShmemInit(void)
 		memset(lfc_ctl, 0, sizeof(FileCacheControl));
 		dlist_init(&lfc_ctl->lru);
 		dlist_init(&lfc_ctl->holes);
+		strlcpy(lfc_ctl->path, lfc_get_path(), sizeof(lfc_ctl->path));
 
 		/* Initialize hyper-log-log structure for estimating working set size */
 		initSHLL(&lfc_ctl->wss_estimation);
 
 		/* Recreate file cache on restart */
-		fd = LFC_OPEN_FILE(lfc_path, O_RDWR | O_CREAT | O_TRUNC);
+		fd = LFC_OPEN_FILE(lfc_get_path(), O_RDWR | O_CREAT | O_TRUNC);
 		if (fd < 0)
 		{
-			elog(WARNING, "LFC: failed to create local file cache %s: %m", lfc_path);
+			elog(WARNING, "LFC: failed to create local file cache %s: %m", lfc_get_path());
 			lfc_ctl->limit = 0;
 		}
 		else
@@ -916,7 +935,7 @@ lfc_init(void)
 							   0,
 							   NULL,
 							   NULL,
-							   NULL);
+							   lfc_show_path);
 
 	DefineCustomIntVariable("neon.file_cache_chunk_size",
 							"LFC chunk size in blocks (should be power of two)",
