@@ -237,13 +237,16 @@ extern void prefetch_on_ps_disconnect(void);
 
 extern page_server_api *page_server;
 
-extern char *page_server_connstring;
+extern THR_LOCAL char *page_server_connstring;
 extern int	flush_every_n_requests;
 extern int	readahead_buffer_size;
-extern char *neon_timeline;
-extern char *neon_tenant;
+extern THR_LOCAL char *neon_timeline;
+extern THR_LOCAL char *neon_tenant;
 extern int32 max_cluster_size;
 extern int  neon_protocol_version;
+
+extern const char *GetNeonTenantId(void);
+extern const char *GetNeonTimelineId(void);
 
 extern shardno_t get_shard_number(BufferTag* tag);
 

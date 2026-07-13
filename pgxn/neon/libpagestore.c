@@ -51,6 +51,9 @@
 
 #define MIN_RECONNECT_INTERVAL_USEC 1000
 #define MAX_RECONNECT_INTERVAL_USEC 1000000
+#define NEON_ID_HEX_LENGTH 32
+#define NEON_ID_BUFSIZE (NEON_ID_HEX_LENGTH + 1)
+#define NEON_METADATA_BUFSIZE MAXPGPATH
 
 enum NeonComputeMode {
 	CP_MODE_PRIMARY = 0,
@@ -66,14 +69,14 @@ static const struct config_enum_entry neon_compute_modes[] = {
 };
 
 /* GUCs */
-char	   *neon_timeline;
-char	   *neon_tenant;
-char	   *neon_project_id;
-char	   *neon_branch_id;
-char	   *neon_endpoint_id;
+THR_LOCAL char	   *neon_timeline;
+THR_LOCAL char	   *neon_tenant;
+THR_LOCAL char	   *neon_project_id;
+THR_LOCAL char	   *neon_branch_id;
+THR_LOCAL char	   *neon_endpoint_id;
 int32		max_cluster_size;
-char	   *page_server_connstring;
-char	   *neon_auth_token;
+THR_LOCAL char	   *page_server_connstring;
+THR_LOCAL char	   *neon_auth_token;
 
 /* Reduced from 128 to 64: limits walredo queue depth under high concurrency */
 int			readahead_buffer_size = 64;
@@ -141,6 +144,11 @@ typedef struct
 	pg_atomic_uint64 begin_update_counter;
 	pg_atomic_uint64 end_update_counter;
 	ShardMap	shard_map;
+	char		tenant_id[NEON_ID_BUFSIZE];
+	char		timeline_id[NEON_ID_BUFSIZE];
+	char		project_id[NEON_METADATA_BUFSIZE];
+	char		branch_id[NEON_METADATA_BUFSIZE];
+	char		endpoint_id[NEON_METADATA_BUFSIZE];
 } PagestoreShmemState;
 
 static PagestoreShmemState *pagestore_shared;
@@ -234,6 +242,104 @@ static bool
 PagestoreShmemIsValid(void)
 {
 	return pagestore_shared && UsedShmemSegAddr;
+}
+
+const char *
+GetNeonTenantId(void)
+{
+	if (PagestoreShmemIsValid() && pagestore_shared->tenant_id[0])
+		return pagestore_shared->tenant_id;
+
+	return neon_tenant ? neon_tenant : "";
+}
+
+const char *
+GetNeonTimelineId(void)
+{
+	if (PagestoreShmemIsValid() && pagestore_shared->timeline_id[0])
+		return pagestore_shared->timeline_id;
+
+	return neon_timeline ? neon_timeline : "";
+}
+
+static const char *
+GetNeonProjectId(void)
+{
+	if (PagestoreShmemIsValid() && pagestore_shared->project_id[0])
+		return pagestore_shared->project_id;
+
+	return neon_project_id ? neon_project_id : "";
+}
+
+static const char *
+GetNeonBranchId(void)
+{
+	if (PagestoreShmemIsValid() && pagestore_shared->branch_id[0])
+		return pagestore_shared->branch_id;
+
+	return neon_branch_id ? neon_branch_id : "";
+}
+
+static const char *
+GetNeonEndpointId(void)
+{
+	if (PagestoreShmemIsValid() && pagestore_shared->endpoint_id[0])
+		return pagestore_shared->endpoint_id;
+
+	return neon_endpoint_id ? neon_endpoint_id : "";
+}
+
+static const char *
+ShowNeonTenantId(void)
+{
+	return GetNeonTenantId();
+}
+
+static const char *
+ShowNeonTimelineId(void)
+{
+	return GetNeonTimelineId();
+}
+
+static const char *
+ShowNeonProjectId(void)
+{
+	return GetNeonProjectId();
+}
+
+static const char *
+ShowNeonBranchId(void)
+{
+	return GetNeonBranchId();
+}
+
+static const char *
+ShowNeonEndpointId(void)
+{
+	return GetNeonEndpointId();
+}
+
+static void
+StoreNeonIdsInShmem(void)
+{
+	if (!PagestoreShmemIsValid() || IsUnderPostmaster)
+		return;
+
+	if (neon_tenant)
+		strlcpy(pagestore_shared->tenant_id, neon_tenant,
+				sizeof(pagestore_shared->tenant_id));
+	if (neon_timeline)
+		strlcpy(pagestore_shared->timeline_id, neon_timeline,
+				sizeof(pagestore_shared->timeline_id));
+	if (neon_project_id)
+		strlcpy(pagestore_shared->project_id, neon_project_id,
+				sizeof(pagestore_shared->project_id));
+	if (neon_branch_id)
+		strlcpy(pagestore_shared->branch_id, neon_branch_id,
+				sizeof(pagestore_shared->branch_id));
+	if (neon_endpoint_id)
+		strlcpy(pagestore_shared->endpoint_id, neon_endpoint_id,
+				sizeof(pagestore_shared->endpoint_id));
 }
 
 /*
@@ -696,6 +802,8 @@ pageserver_connect(shardno_t shard_no, int elevel)
 		int			ps_send_query_ret;
 		bool		connected = false;
 		int poll_result = PGRES_POLLING_WRITING;
+		const char *tenant_id;
+		const char *timeline_id;
 		neon_shard_log(shard_no, DEBUG5, "Connection state: Connecting_Startup");
 
 		do
@@ -807,14 +915,24 @@ pageserver_connect(shardno_t shard_no, int elevel)
 			shard->wes_read = NULL;
 		}
 
+		tenant_id = GetNeonTenantId();
+		timeline_id = GetNeonTimelineId();
+		if (tenant_id[0] == '\0' || timeline_id[0] == '\0')
+		{
+			CLEANUP_AND_DISCONNECT(shard);
+			neon_shard_log(shard_no, elevel,
+						   "missing neon tenant/timeline id for pageserver connection: tenant_id=\"%s\", timeline_id=\"%s\"",
+						   tenant_id, timeline_id);
+			return false;
+		}
 
 		switch (neon_protocol_version)
 		{
 		case 3:
-			pagestream_query = psprintf("pagestream_v3 %s %s", neon_tenant, neon_timeline);
+			pagestream_query = psprintf("pagestream_v3 %s %s", tenant_id, timeline_id);
 			break;
 		case 2:
-			pagestream_query = psprintf("pagestream_v2 %s %s", neon_tenant, neon_timeline);
+			pagestream_query = psprintf("pagestream_v2 %s %s", tenant_id, timeline_id);
 			break;
 		default:
 			elog(ERROR, "unexpected neon_protocol_version %d", neon_protocol_version);
@@ -1625,6 +1743,7 @@ PagestoreShmemInit(void)
 		memset(&pagestore_shared->shard_map, 0, sizeof(ShardMap));
 		AssignPageserverConnstring(page_server_connstring, NULL);
 	}
+	StoreNeonIdsInShmem();
 }
 
 void
@@ -1658,7 +1777,7 @@ pg_init_libpagestore(void)
 							   "",
 							   PGC_POSTMASTER,
 							   0,	/* no flags required */
-							   check_neon_id, NULL, NULL);
+							   check_neon_id, NULL, ShowNeonTimelineId);
 
 	DefineCustomStringVariable("neon.tenant_id",
 							   "Neon tenant_id the server is running on",
@@ -1667,7 +1786,7 @@ pg_init_libpagestore(void)
 							   "",
 							   PGC_POSTMASTER,
 							   0,	/* no flags required */
-							   check_neon_id, NULL, NULL);
+							   check_neon_id, NULL, ShowNeonTenantId);
 
 	DefineCustomStringVariable("neon.project_id",
 							   "Neon project_id the server is running on",
@@ -1676,7 +1795,7 @@ pg_init_libpagestore(void)
 							   "",
 							   PGC_POSTMASTER,
 							   0,	/* no flags required */
-							   NULL, NULL, NULL);
+							   NULL, NULL, ShowNeonProjectId);
 	DefineCustomStringVariable("neon.branch_id",
 							   "Neon branch_id the server is running on",
 							   NULL,
@@ -1684,7 +1803,7 @@ pg_init_libpagestore(void)
 							   "",
 							   PGC_POSTMASTER,
 							   0,	/* no flags required */
-							   NULL, NULL, NULL);
+							   NULL, NULL, ShowNeonBranchId);
 	DefineCustomStringVariable("neon.endpoint_id",
 							   "Neon endpoint_id the server is running on",
 							   NULL,
@@ -1692,7 +1811,7 @@ pg_init_libpagestore(void)
 							   "",
 							   PGC_POSTMASTER,
 							   0,	/* no flags required */
-							   NULL, NULL, NULL);
+							   NULL, NULL, ShowNeonEndpointId);
 
 	DefineCustomIntVariable("neon.stripe_size",
 							"sharding stripe size",

@@ -8,6 +8,8 @@
 #include "postgres.h"
 #include "fmgr.h"
 
+#include <pthread.h>
+
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "access/subtrans.h"
@@ -50,6 +52,8 @@ PG_MODULE_MAGIC;
 void		_PG_init(void);
 
 bool lakebase_mode = false;
+
+static pthread_mutex_t neon_pg_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int  running_xacts_overflow_policy;
 static bool monitor_query_exec_time = false;
@@ -461,16 +465,25 @@ _PG_init(void)
 	if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress)
 		return;
 
+	pthread_mutex_lock(&neon_pg_init_mutex);
+
 	/* LFC GUCs live in session context, so register them on each preload pass. */
 	lfc_init();
 	pg_init_libpagestore();
+	relsize_hash_init();
+	pg_init_walproposer();
+	lwlc_register_gucs();
+	pg_init_extension_server();
 
 	/*
 	 * Also load 'neon_rmgr'. This makes it unnecessary to list both 'neon'
 	 * and 'neon_rmgr' in shared_preload_libraries.
 	 */
 	if (g_instance.loadedNeonPlugin)
+	{
+		pthread_mutex_unlock(&neon_pg_init_mutex);
 		return;
+	}
 
 //	if (u_sess == NULL || u_sess->mcxt_group == NULL) {
 //		return;
@@ -519,8 +532,6 @@ _PG_init(void)
 	 */
 
 	/* Stage 1: Define GUCs, and other early intialization */
-	relsize_hash_init();
-	pg_init_walproposer();
 	/*
 	 * init_lwlsncache 只应该在 shared_preload_libraries 阶段调用，
 	 * 这里通过 process_shared_preload_libraries_in_progress 做一次保护，
@@ -539,7 +550,6 @@ _PG_init(void)
 	// InitLogicalReplicationMonitor();	//逻辑复制 忽略
 	// InitDDLHandler();	// DDL拦截（create database等） 先忽略
 
-	pg_init_extension_server();
 	// todo: 先忽略，备机replic hook，内核改动
 	// restore_running_xacts_callback = RestoreRunningXactsFromClog;
 
@@ -661,6 +671,8 @@ _PG_init(void)
 	ExecutorStart_hook = neon_ExecutorStart;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = neon_ExecutorEnd;
+
+	pthread_mutex_unlock(&neon_pg_init_mutex);
 }
 
 PG_FUNCTION_INFO_V1(pg_cluster_size);

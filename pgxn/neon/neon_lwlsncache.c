@@ -56,9 +56,14 @@ LwLsnCacheCtl* LwLsnCache;
 static int lwlsn_cache_size = (128 * 1024);
 
 
-static void
+void
 lwlc_register_gucs(void)
 {
+	static THR_LOCAL bool lwlc_gucs_initialized = false;
+
+	if (lwlc_gucs_initialized)
+		return;
+
 	DefineCustomIntVariable("neon.last_written_lsn_cache_size",
 							"Size of last written LSN cache used by Neon",
 							NULL,
@@ -67,6 +72,7 @@ lwlc_register_gucs(void)
 							PGC_POSTMASTER,
 							0, /* plain units */
 							NULL, NULL, NULL);
+	lwlc_gucs_initialized = true;
 }
 
 static XLogRecPtr SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
@@ -566,4 +572,3 @@ neon_set_lwlsn_db(XLogRecPtr lsn)
 	NRelFileInfo dummyNode = {InvalidOid, InvalidOid, InvalidOid};
 	return neon_set_lwlsn_block(lsn, dummyNode, MAIN_FORKNUM, 0);
 }
-

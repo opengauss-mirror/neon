@@ -68,11 +68,11 @@
 #define WAL_PROPOSER_SLOT_NAME "wal_proposer_slot"
 
 /* GUCs */
-char	   *wal_acceptors_list = "";
+THR_LOCAL char	   *wal_acceptors_list = "";
 int			wal_acceptor_reconnect_timeout = 1000;
 int			wal_acceptor_connection_timeout = 10000;
 int			safekeeper_proto_version = 3;
-char	   *safekeeper_conninfo_options = "";
+static THR_LOCAL char	   *safekeeper_conninfo_options = "";
 /* BEGIN_HADRON */
 int         databricks_max_wal_mb_per_second = -1;
 // during throttling, we will limit the effective WAL write rate to 10KB.
@@ -105,6 +105,10 @@ static uint64 hadron_backpressure_lag_impl(void);
 static uint64 startup_backpressure_wrap(void);
 static bool backpressure_throttling_impl(void);
 static void WalProposerMain_OpenGauss(const BgWorkerContext *bwc);
+const char *GetWalAcceptorsList(void);
+static const char *GetSafekeeperConninfoOptions(void);
+static void StoreWalproposerConfigInShmem(void);
+static void StoreWalproposerSafekeepersInShmem(const char *newval);
 
 static void walprop_pg_init_standalone_sync_safekeepers(void);
 static void walprop_pg_init_walsender(void);
@@ -130,6 +134,65 @@ static void CheckGracefulShutdown(WalProposer *wp);
 /* BEGIN_HADRON */
 shardno_t get_num_shards(void);
 
+const char *
+GetWalAcceptorsList(void)
+{
+	if (walprop_shared && walprop_shared->safekeepers_list[0])
+		return walprop_shared->safekeepers_list;
+
+	return wal_acceptors_list ? wal_acceptors_list : "";
+}
+
+static const char *
+GetSafekeeperConninfoOptions(void)
+{
+	if (walprop_shared && walprop_shared->safekeeper_conninfo_options[0])
+		return walprop_shared->safekeeper_conninfo_options;
+
+	return safekeeper_conninfo_options ? safekeeper_conninfo_options : "";
+}
+
+static const char *
+ShowWalAcceptorsList(void)
+{
+	return GetWalAcceptorsList();
+}
+
+static const char *
+ShowSafekeeperConninfoOptions(void)
+{
+	return GetSafekeeperConninfoOptions();
+}
+
+static void
+StoreWalproposerSafekeepersInShmem(const char *newval)
+{
+	if (!walprop_shared || !newval)
+		return;
+
+	SpinLockAcquire(&walprop_shared->mutex);
+	strlcpy(walprop_shared->safekeepers_list, newval,
+			sizeof(walprop_shared->safekeepers_list));
+	SpinLockRelease(&walprop_shared->mutex);
+}
+
+static void
+StoreWalproposerConfigInShmem(void)
+{
+	if (!walprop_shared)
+		return;
+
+	SpinLockAcquire(&walprop_shared->mutex);
+	if (wal_acceptors_list)
+		strlcpy(walprop_shared->safekeepers_list, wal_acceptors_list,
+				sizeof(walprop_shared->safekeepers_list));
+	if (safekeeper_conninfo_options)
+		strlcpy(walprop_shared->safekeeper_conninfo_options,
+				safekeeper_conninfo_options,
+				sizeof(walprop_shared->safekeeper_conninfo_options));
+	SpinLockRelease(&walprop_shared->mutex);
+}
+
 static int positive_mb_to_bytes(int mb)
 {
 	if (mb <= 0)
@@ -146,11 +209,11 @@ static int positive_mb_to_bytes(int mb)
 static void
 init_walprop_config(bool syncSafekeepers)
 {
-	walprop_config.neon_tenant = neon_tenant;
-	walprop_config.neon_timeline = neon_timeline;
+	walprop_config.neon_tenant = (char *) GetNeonTenantId();
+	walprop_config.neon_timeline = (char *) GetNeonTimelineId();
 	/* WalProposerCreate scribbles directly on it, so pstrdup */
-	walprop_config.safekeepers_list = pstrdup(wal_acceptors_list);
-	walprop_config.safekeeper_conninfo_options = pstrdup(safekeeper_conninfo_options);
+	walprop_config.safekeepers_list = pstrdup(GetWalAcceptorsList());
+	walprop_config.safekeeper_conninfo_options = pstrdup(GetSafekeeperConninfoOptions());
 	walprop_config.safekeeper_reconnect_timeout = wal_acceptor_reconnect_timeout;
 	walprop_config.safekeeper_connection_timeout = wal_acceptor_connection_timeout;
 	walprop_config.wal_segment_size = XLogSegSize;
@@ -218,7 +281,7 @@ nwp_register_gucs(void)
 							   PGC_SIGHUP,
 							   GUC_LIST_INPUT,	/* extensions can't use*
 												 * GUC_LIST_QUOTE */
-							   NULL, assign_neon_safekeepers, NULL);
+							   NULL, assign_neon_safekeepers, ShowWalAcceptorsList);
 
 	DefineCustomStringVariable(
 							   "neon.safekeeper_conninfo_options",
@@ -228,7 +291,7 @@ nwp_register_gucs(void)
 							   "",
 							   PGC_POSTMASTER,
 							   0,
-							   NULL, NULL, NULL);
+							   NULL, NULL, ShowSafekeeperConninfoOptions);
 
 	DefineCustomIntVariable(
 							"neon.safekeeper_reconnect_timeout",
@@ -387,11 +450,14 @@ assign_neon_safekeepers(const char *newval, void *extra)
 	char	   *newval_copy;
 	char	   *oldval;
 
+	if (!am_walproposer)
+	{
+		StoreWalproposerSafekeepersInShmem(newval);
+		return;
+	}
+
 	if (newval && *newval != '\0' && UsedShmemSegAddr && walprop_shared && RecoveryInProgress())
 		walprop_shared->replica_promote = true;
-
-	if (!am_walproposer)
-		return;
 
 	if (!newval)
 	{
@@ -401,7 +467,7 @@ assign_neon_safekeepers(const char *newval, void *extra)
 
 	/* Copy values because we will modify them in split_safekeepers_list() */
 	newval_copy = pstrdup(newval);
-	oldval = pstrdup(wal_acceptors_list);
+	oldval = pstrdup(GetWalAcceptorsList());
 
 	/*
 	 * TODO: restarting through FATAL is stupid and introduces 1s delay before
@@ -425,6 +491,7 @@ assign_neon_safekeepers(const char *newval, void *extra)
 					oldval, newval);
 		}
 	}
+	StoreWalproposerSafekeepersInShmem(newval);
 	pfree(newval_copy);
 	pfree(oldval);
 }
@@ -599,6 +666,7 @@ WalproposerShmemInit(void)
 		pg_atomic_init_u64(&walprop_shared->wal_rate_limiter.batch_end_time_us, 0);
 		/* END_HADRON */
 	}
+	StoreWalproposerConfigInShmem();
 }
 
 static void
@@ -616,6 +684,7 @@ WalproposerShmemInit_SyncSafekeeper(void)
 	pg_atomic_init_u64(&walprop_shared->wal_rate_limiter.batch_start_time_us, 0);
 	pg_atomic_init_u64(&walprop_shared->wal_rate_limiter.batch_end_time_us, 0);
 	/* END_HADRON */
+	StoreWalproposerConfigInShmem();
 }
 
 #define BACK_PRESSURE_DELAY 10000L // 0.01 sec
@@ -2512,8 +2581,9 @@ PGDLLEXPORT void
 WalProposerMain(Datum main_arg)
 {
 	WalProposer *wp;
+	const char *safekeepers = GetWalAcceptorsList();
 
-	if (*wal_acceptors_list == '\0') // safekeepers 地址通过guc配置
+	if (*safekeepers == '\0') // safekeepers 地址通过guc配置
 	{
 		wpg_log(WARNING, "Safekeepers list is empty");
 		return;
