@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
 /// Test postgres_backend_async with tokio_postgres
@@ -74,32 +73,32 @@ async fn simple_select() {
     }
 }
 
-static KEY: Lazy<rustls::pki_types::PrivateKeyDer<'static>> = Lazy::new(|| {
-    let mut cursor = Cursor::new(include_bytes!("key.pem"));
-    let key = rustls_pemfile::rsa_private_keys(&mut cursor)
-        .next()
-        .unwrap()
-        .unwrap();
-    rustls::pki_types::PrivateKeyDer::Pkcs1(key)
-});
+static TLS_CERTIFICATE: Lazy<(
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> = Lazy::new(|| {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("test certificate generation");
 
-static CERT: Lazy<rustls::pki_types::CertificateDer<'static>> = Lazy::new(|| {
-    let mut cursor = Cursor::new(include_bytes!("cert.pem"));
-
-    rustls_pemfile::certs(&mut cursor).next().unwrap().unwrap()
+    (
+        cert.der().clone(),
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into()),
+    )
 });
 
 // test that basic select with ssl works
 #[tokio::test]
 async fn simple_select_ssl() {
     let (client_sock, server_sock) = make_tcp_pair().await;
+    let (cert, key) = &*TLS_CERTIFICATE;
 
     let server_cfg =
         rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_safe_default_protocol_versions()
             .expect("aws_lc_rs should support the default protocol versions")
             .with_no_client_auth()
-            .with_single_cert(vec![CERT.clone()], KEY.clone_key())
+            .with_single_cert(vec![cert.clone()], key.clone_key())
             .unwrap();
     let tls_config = Some(Arc::new(server_cfg));
     let pgbackend =
@@ -116,7 +115,7 @@ async fn simple_select_ssl() {
             .expect("aws_lc_rs should support the default protocol versions")
             .with_root_certificates({
                 let mut store = rustls::RootCertStore::empty();
-                store.add(CERT.clone()).unwrap();
+                store.add(cert.clone()).unwrap();
                 store
             })
             .with_no_client_auth();
