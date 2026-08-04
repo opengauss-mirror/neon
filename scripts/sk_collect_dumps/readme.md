@@ -29,6 +29,9 @@ tsh ls | awk '{print $1}' | grep safekeeper | grep "neon.build" | grep us-east-2
 tsh ls | awk '{print $1}' | grep safekeeper | grep "neon.tech" | grep us-east-2 >> hosts
 ```
 
+If your local SSH config does not already include Teleport settings, generate a local `ssh.cfg`
+with `tsh config > ssh.cfg` and set `ANSIBLE_SSH_ARGS="-F ./ssh.cfg"` when running ansible.
+
 Test ansible connection:
 ```
 ansible all -m ping -v

@@ -19,6 +19,6 @@ pq_proto.workspace = true
 
 [dev-dependencies]
 once_cell.workspace = true
-rustls-pemfile.workspace = true
+rcgen.workspace = true
 tokio-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
