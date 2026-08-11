@@ -8,6 +8,13 @@ import os
 import subprocess
 import sys
 
+EXCLUDED_PATH_PREFIXES = (
+    "vendor/",
+    "target/",
+    "build/",
+    "og_install/",
+)
+
 
 @enum.unique
 class Color(enum.Enum):
@@ -29,42 +36,47 @@ def colorify(
     return f"{color.value}{s}{NC}"
 
 
-def cargo_fmt(fix_inplace: bool = False, no_color: bool = False) -> str:
-    cmd = "cargo fmt"
+def cargo_fmt(fix_inplace: bool = False, no_color: bool = False) -> list[str]:
+    cmd = ["cargo", "fmt"]
     if not fix_inplace:
-        cmd += " --check"
+        cmd.append("--check")
     if no_color:
-        cmd += " -- --color=never"
+        cmd.extend(["--", "--color=never"])
     return cmd
 
 
-def ruff_check(fix_inplace: bool) -> str:
-    cmd = "poetry run ruff check"
+def ruff_check(fix_inplace: bool) -> list[str]:
+    cmd = ["poetry", "run", "ruff", "check"]
     if fix_inplace:
-        cmd += " --fix"
+        cmd.append("--fix")
     return cmd
 
 
-def ruff_format(fix_inplace: bool) -> str:
-    cmd = "poetry run ruff format"
+def ruff_format(fix_inplace: bool) -> list[str]:
+    cmd = ["poetry", "run", "ruff", "format"]
     if not fix_inplace:
-        cmd += " --diff --check"
+        cmd.extend(["--diff", "--check"])
     return cmd
 
 
-def mypy() -> str:
-    return "poetry run mypy"
+def mypy() -> list[str]:
+    return ["poetry", "run", "mypy"]
+
+
+def is_excluded(fname: str) -> bool:
+    normalized = fname.strip().lstrip("./")
+    return normalized.startswith(EXCLUDED_PATH_PREFIXES)
 
 
 def get_commit_files() -> list[str]:
     files = subprocess.check_output("git diff --cached --name-only --diff-filter=ACM".split())
-    return files.decode().splitlines()
+    return [fname for fname in files.decode().splitlines() if not is_excluded(fname)]
 
 
 def check(
     name: str,
     suffix: str,
-    cmd: str,
+    cmd: list[str],
     changed_files: list[str],
     no_color: bool = False,
     append_files_to_cmd: bool = True,
@@ -76,9 +88,9 @@ def check(
         return
 
     if append_files_to_cmd:
-        cmd = f"{cmd} {' '.join(applicable_files)}"
+        cmd = [*cmd, *applicable_files]
 
-    res = subprocess.run(cmd.split(), capture_output=True)
+    res = subprocess.run(cmd, capture_output=True)
     if res.returncode != 0:
         print(colorify("[FAILED]", Color.RED, no_color))
         if name == "mypy":
@@ -92,6 +104,7 @@ def check(
             )
         print()
         print(res.stdout.decode())
+        print(res.stderr.decode(), file=sys.stderr)
         sys.exit(1)
 
     print(colorify("[OK]", Color.GREEN, no_color))
