@@ -439,7 +439,9 @@ impl Storage for PhysicalStorage {
         if !buf.is_empty() {
             trace!(
                 "wal_storage::write_wal: startpos={}, buf_len={}, write_lsn={}",
-                startpos, buf.len(), self.write_lsn
+                startpos,
+                buf.len(),
+                self.write_lsn
             );
             // Print first 64 bytes
             trace!(
@@ -450,11 +452,11 @@ impl Storage for PhysicalStorage {
             if buf.len() > 128 {
                 trace!(
                     "wal_storage::write_wal: last_64_bytes={:02x?}",
-                    &buf[buf.len()-64..]
+                    &buf[buf.len() - 64..]
                 );
             }
         }
-        
+
         // Disallow any non-sequential writes, which can result in gaps or overwrites.
         // If we need to move the pointer, use truncate_wal() instead.
         if self.write_lsn > startpos {

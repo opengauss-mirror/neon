@@ -1712,3 +1712,693 @@ oggit_update_worker_status(const char *status, const char *last_error)
 }
 
 static void
+oggit_update_required_lsn(XLogRecPtr required_lsn)
+{
+	char	   *required_lsn_str;
+	Oid			argtypes[1];
+	Datum		values[1];
+	char		nulls[1] = {' '};
+
+	if (XLByteEQ(required_lsn, InvalidXLogRecPtr))
+		return;
+
+	required_lsn_str = oggit_lsn_to_string(required_lsn);
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "oggit: SPI_connect failed while updating required_lsn");
+
+	argtypes[0] = TEXTOID;
+	values[0] = CStringGetTextDatum(required_lsn_str);
+	oggit_spi_exec_args("UPDATE oggit.state "
+						"SET required_lsn = $1, updated_at = now() WHERE id = true",
+						1, argtypes, values, nulls);
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	oggit_report_required_lsn_to_safekeepers(required_lsn_str);
+	pfree(required_lsn_str);
+}
+
+static Datum
+oggit_text_or_null(const char *s, char *nullflag)
+{
+	if (s == NULL)
+	{
+		*nullflag = 'n';
+		return (Datum) 0;
+	}
+	*nullflag = ' ';
+	return CStringGetTextDatum(s);
+}
+
+/*
+ * Persist a single decoded neon_oggit event. Mirrors the semantics of the
+ * former Rust oggit_record_event(): "change" -> oggit.change_log,
+ * "truncate"/"ddl"/other -> oggit.object_change, "commit" -> advance state.
+ */
+static void
+oggit_record_event_json(const char *json, int ordinal)
+{
+	cJSON	   *event = cJSON_Parse(json);
+	const char *event_kind;
+	const char *commit_lsn;
+
+	if (event == NULL)
+	{
+		elog(WARNING, "oggit: failed to parse neon_oggit event json");
+		return;
+	}
+
+	event_kind = oggit_json_str(event, "event");
+	commit_lsn = oggit_event_lsn(event);
+
+	if (event_kind != NULL && strcmp(event_kind, "change") == 0)
+	{
+		const char *schema = oggit_json_str(event, "schema");
+		const char *table = oggit_json_str(event, "table");
+		const char *op = oggit_json_str(event, "op");
+		cJSON	   *key_flat;
+		cJSON	   *old_flat;
+		cJSON	   *new_flat;
+		cJSON	   *changed_cols;
+		const char *identity;
+		const char *event_identity;
+		char	   *key_text = NULL;
+		char	   *old_text = NULL;
+		char	   *new_text = NULL;
+		char	   *changed_text = NULL;
+		const char *unsupported_reason = NULL;
+		const char *relid = oggit_json_str(event, "relid");
+		const char *xid = oggit_json_str(event, "xid");
+		const char *merge_id = oggit_json_str(event, "merge_id");
+		const char *record_lsn = oggit_json_str(event, "change_lsn");
+		StringInfoData sql;
+		Oid			argtypes[15];
+		Datum		values[15];
+		char		nulls[15];
+		int			i;
+
+		if (oggit_is_internal_schema(schema))
+		{
+			cJSON_Delete(event);
+			return;
+		}
+
+		key_flat = oggit_tuple_payload_to_flat(cJSON_GetObjectItemCaseSensitive(event, "key"));
+		old_flat = oggit_tuple_payload_to_flat(cJSON_GetObjectItemCaseSensitive(event, "old_row"));
+		new_flat = oggit_tuple_payload_to_flat(cJSON_GetObjectItemCaseSensitive(event, "new_row"));
+
+		/* Prefer the output plugin's relation identity; infer only for legacy events. */
+		event_identity = oggit_json_str(event, "identity_kind");
+		if (event_identity != NULL &&
+			(strcmp(event_identity, "primary_key") == 0 ||
+			 strcmp(event_identity, "unique_key") == 0 ||
+			 strcmp(event_identity, "replica_identity_full") == 0 ||
+			 strcmp(event_identity, "unsupported") == 0))
+			identity = event_identity;
+		else if (key_flat != NULL && cJSON_GetArraySize(key_flat) > 0)
+			identity = oggit_relation_has_primary_key(schema, table) ? "primary_key" : "unique_key";
+		else if (old_flat != NULL || new_flat != NULL)
+			identity = "replica_identity_full";
+		else
+			identity = "unsupported";
+
+		if (strcmp(identity, "unsupported") == 0)
+			unsupported_reason = "no usable row identity in decoded event";
+
+		/* changed_cols: for INSERT, non-key columns of new_row; else event.changed_cols. */
+		if (op != NULL && strcmp(op, "INSERT") == 0)
+			changed_cols = oggit_tuple_nonkey_cols(cJSON_GetObjectItemCaseSensitive(event, "new_row"));
+		else
+		{
+			cJSON	   *src = cJSON_GetObjectItemCaseSensitive(event, "changed_cols");
+
+			changed_cols = (src != NULL) ? cJSON_Duplicate(src, true) : cJSON_CreateArray();
+		}
+
+		/*
+		 * Keyed UPDATEs store only changed columns. FULL identity must retain the
+		 * complete before/after tuples because the old row is the row locator.
+		 */
+		if (op != NULL && strcmp(op, "UPDATE") == 0 &&
+			strcmp(identity, "replica_identity_full") != 0)
+		{
+			cJSON	   *projected_old = oggit_flat_project_cols(old_flat, changed_cols);
+			cJSON	   *projected_new = oggit_flat_project_cols(new_flat, changed_cols);
+
+			if (old_flat)
+				cJSON_Delete(old_flat);
+			if (new_flat)
+				cJSON_Delete(new_flat);
+			old_flat = projected_old;
+			new_flat = projected_new;
+		}
+
+		/* key_json is NULL when empty. */
+		if (key_flat != NULL && cJSON_GetArraySize(key_flat) > 0)
+			key_text = cJSON_PrintUnformatted(key_flat);
+		if (old_flat != NULL && cJSON_GetArraySize(old_flat) > 0)
+			old_text = cJSON_PrintUnformatted(old_flat);
+		if (new_flat != NULL && cJSON_GetArraySize(new_flat) > 0)
+			new_text = cJSON_PrintUnformatted(new_flat);
+		changed_text = cJSON_PrintUnformatted(changed_cols);
+
+		initStringInfo(&sql);
+		appendStringInfoString(&sql,
+							   "INSERT INTO oggit.change_log ("
+							   " commit_lsn, record_lsn, xid, merge_id, ordinal, op, schema_name, table_name,"
+							   " relid, identity_kind, key_json, old_row, new_row, changed_cols,"
+							   " unsupported_reason) SELECT "
+							   " $1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, $10,"
+							   " $11::jsonb, $12::jsonb, $13::jsonb,"
+							   " (SELECT COALESCE(array_agg(value::text), ARRAY[]::text[])"
+							   "    FROM json_array_elements_text($14::json)), $15"
+							   " WHERE NOT EXISTS ("
+							   "   SELECT 1 FROM oggit.change_log"
+							   "    WHERE commit_lsn = $1"
+							   "      AND ordinal = $5"
+							   "      AND op = $6"
+							   "      AND COALESCE(schema_name, '') = COALESCE($7, '')"
+							   "      AND COALESCE(table_name, '') = COALESCE($8, '')"
+							   "      AND COALESCE(key_json::text, '') = COALESCE(($11::jsonb)::text, '')"
+							   "      AND COALESCE(old_row::text, '') = COALESCE(($12::jsonb)::text, '')"
+							   "      AND COALESCE(new_row::text, '') = COALESCE(($13::jsonb)::text, '')"
+							   " )");
+
+		for (i = 0; i < 15; i++)
+			argtypes[i] = TEXTOID;
+		argtypes[4] = INT4OID;	/* ordinal */
+		argtypes[8] = OIDOID;	/* relid */
+
+		values[0] = CStringGetTextDatum(commit_lsn);
+		nulls[0] = ' ';
+		values[1] = oggit_text_or_null(record_lsn, &nulls[1]);
+		values[2] = oggit_text_or_null(xid, &nulls[2]);
+		values[3] = oggit_text_or_null(merge_id, &nulls[3]);
+		values[4] = Int32GetDatum(ordinal);
+		nulls[4] = ' ';
+		values[5] = CStringGetTextDatum(op != NULL ? op : "UNSUPPORTED");
+		nulls[5] = ' ';
+		values[6] = oggit_text_or_null(schema, &nulls[6]);
+		values[7] = oggit_text_or_null(table, &nulls[7]);
+		if (relid != NULL && relid[0] != '\0')
+		{
+			values[8] = ObjectIdGetDatum((Oid) strtoul(relid, NULL, 10));
+			nulls[8] = ' ';
+		}
+		else
+		{
+			values[8] = (Datum) 0;
+			nulls[8] = 'n';
+		}
+		values[9] = CStringGetTextDatum(identity);
+		nulls[9] = ' ';
+		values[10] = oggit_text_or_null(key_text, &nulls[10]);
+		values[11] = oggit_text_or_null(old_text, &nulls[11]);
+		values[12] = oggit_text_or_null(new_text, &nulls[12]);
+		values[13] = CStringGetTextDatum(changed_text);
+		nulls[13] = ' ';
+		values[14] = oggit_text_or_null(unsupported_reason, &nulls[14]);
+
+		oggit_spi_exec_args(sql.data, 15, argtypes, values, nulls);
+
+		pfree(sql.data);
+		if (key_text)
+			cJSON_free(key_text);
+		if (old_text)
+			cJSON_free(old_text);
+		if (new_text)
+			cJSON_free(new_text);
+		if (changed_text)
+			cJSON_free(changed_text);
+		if (key_flat)
+			cJSON_Delete(key_flat);
+		if (old_flat)
+			cJSON_Delete(old_flat);
+		if (new_flat)
+			cJSON_Delete(new_flat);
+		cJSON_Delete(changed_cols);
+	}
+	else if (event_kind != NULL && strcmp(event_kind, "truncate") == 0)
+	{
+		const char *rel_schema = NULL;
+		const char *rel_table = NULL;
+		const char *merge_id = oggit_json_str(event, "merge_id");
+		char	   *replay_sql = oggit_truncate_replay_sql(event, &rel_schema, &rel_table);
+		char	   *change_json = NULL;
+		StringInfoData sql;
+		Oid			argtypes[6];
+		Datum		values[6];
+		char		nulls[6];
+
+		if (replay_sql == NULL)
+		{
+			cJSON_Delete(event);
+			return;
+		}
+		const char *existing_sql = oggit_json_str(event, "sql");
+
+		if (existing_sql == NULL)
+			cJSON_AddStringToObject(event, "sql", replay_sql);
+		else if (existing_sql[0] == '\0')
+			cJSON_ReplaceItemInObjectCaseSensitive(event, "sql",
+												   cJSON_CreateString(replay_sql));
+		if (cJSON_GetObjectItemCaseSensitive(event, "cascade") == NULL)
+			cJSON_AddFalseToObject(event, "cascade");
+		if (cJSON_GetObjectItemCaseSensitive(event, "restart_seqs") == NULL)
+			cJSON_AddFalseToObject(event, "restart_seqs");
+		change_json = cJSON_PrintUnformatted(event);
+
+		initStringInfo(&sql);
+		appendStringInfoString(&sql,
+							   "INSERT INTO oggit.object_change ("
+							   " commit_lsn, merge_id, ordinal, object_type, schema_name, object_name,"
+							   " action, change_json, safety_class) SELECT "
+							   " $1, $2::uuid, $3, 'TRUNCATE', $4, $5, 'TRUNCATE', $6::jsonb, 'destructive'"
+							   " WHERE NOT EXISTS ("
+							   "   SELECT 1 FROM oggit.object_change"
+							   "    WHERE commit_lsn = $1"
+							   "      AND ordinal = $3"
+							   "      AND action = 'TRUNCATE'"
+							   "      AND COALESCE(change_json::text, '') = COALESCE(($6::jsonb)::text, '')"
+							   " )");
+		argtypes[0] = TEXTOID;
+		argtypes[1] = TEXTOID;
+		argtypes[2] = INT4OID;
+		argtypes[3] = TEXTOID;
+		argtypes[4] = TEXTOID;
+		argtypes[5] = TEXTOID;
+		values[0] = CStringGetTextDatum(commit_lsn);
+		nulls[0] = ' ';
+		values[1] = oggit_text_or_null(merge_id, &nulls[1]);
+		values[2] = Int32GetDatum(ordinal);
+		nulls[2] = ' ';
+		values[3] = oggit_text_or_null(rel_schema, &nulls[3]);
+		values[4] = oggit_text_or_null(rel_table, &nulls[4]);
+		values[5] = CStringGetTextDatum(change_json);
+		nulls[5] = ' ';
+
+		oggit_spi_exec_args(sql.data, 6, argtypes, values, nulls);
+		pfree(sql.data);
+		pfree(replay_sql);
+		if (change_json)
+			cJSON_free(change_json);
+	}
+		else if (event_kind != NULL && strcmp(event_kind, "ddl") == 0)
+		{
+			 /*
+			 * DDL classification mirrors the Rust worker: derive object_type and
+			 * safety_class from cmdtype + message text.
+			 */
+			const char *message = oggit_json_str(event, "message");
+			const char *cmdtype = oggit_json_str(event, "cmdtype");
+			const char *merge_id = oggit_json_str(event, "merge_id");
+			cJSON	   *ddl_payload = NULL;
+			const char *raw_type = NULL;
+			const char *object_type;
+			const char *object_schema = NULL;
+			const char *object_name = NULL;
+			const char *objidentity = NULL;
+			const char *safety_class;
+			const char *unsupported_reason = NULL;
+			char	   *message_copy = NULL;
+			char	   *replay_sql = NULL;
+			char	   *owner = NULL;
+			char	   *change_json;
+			char	   *upper_sql;
+			char	   *upper_cmdtype;
+			char	   *objidentity_copy = NULL;
+			char	   *parsed_object_copy = NULL;
+			int			mi;
+			StringInfoData sql;
+			Oid			argtypes[10];
+			Datum		values[10];
+			char		nulls[10];
+
+			if (message == NULL)
+				message = "";
+			if (cmdtype == NULL)
+				cmdtype = "DDL";
+
+			if (message[0] != '\0')
+			{
+				message_copy = pstrdup(message);
+				ddl_payload = cJSON_Parse(message);
+				if (ddl_payload != NULL && cJSON_IsObject(ddl_payload))
+				{
+					replay_sql = oggit_deparse_ddl_json_to_string(message_copy, &owner);
+					if (replay_sql != NULL && replay_sql[0] != '\0')
+						cJSON_AddStringToObject(event, "sql", replay_sql);
+				}
+			}
+
+			if (ddl_payload == NULL &&
+				(strcmp(cmdtype, "table_drop_start") == 0 ||
+				 strcmp(cmdtype, "type_drop_start") == 0))
+			{
+				if (message_copy)
+					pfree(message_copy);
+				cJSON_Delete(event);
+				return;
+			}
+
+			if (ddl_payload != NULL && cJSON_IsObject(ddl_payload))
+			{
+				raw_type = oggit_json_str(ddl_payload, "objtype");
+				object_schema = oggit_json_nested_str(ddl_payload, "identity", "schemaname");
+				object_name = oggit_json_nested_str(ddl_payload, "identity", "objname");
+				objidentity = oggit_json_str(ddl_payload, "objidentity");
+				if (object_name == NULL && objidentity != NULL)
+				{
+					char	   *dot;
+
+					objidentity_copy = pstrdup(objidentity);
+					dot = strchr(objidentity_copy, '.');
+					if (dot != NULL)
+					{
+						*dot = '\0';
+						object_schema = objidentity_copy;
+						object_name = dot + 1;
+					}
+					else
+						object_name = objidentity_copy;
+				}
+				if (object_name == NULL)
+					object_name = oggit_json_str(ddl_payload, "name");
+			}
+
+				if (oggit_is_internal_schema(object_schema) ||
+					(object_schema == NULL && oggit_is_internal_schema(object_name)) ||
+					oggit_json_mentions_internal_schema(ddl_payload) ||
+					oggit_json_mentions_merge_barrier(ddl_payload) ||
+					oggit_sql_mentions_internal_schema_ddl(replay_sql) ||
+					oggit_sql_mentions_internal_schema_ddl(message) ||
+					oggit_string_mentions_merge_barrier(replay_sql) ||
+					oggit_string_mentions_merge_barrier(message))
+				{
+					if (ddl_payload)
+						cJSON_Delete(ddl_payload);
+					if (message_copy)
+					pfree(message_copy);
+				if (replay_sql)
+					pfree(replay_sql);
+				if (owner)
+					pfree(owner);
+				if (objidentity_copy)
+					pfree(objidentity_copy);
+				if (parsed_object_copy)
+					pfree(parsed_object_copy);
+				cJSON_Delete(event);
+				return;
+			}
+
+			upper_sql = pstrdup((replay_sql != NULL && replay_sql[0] != '\0') ? replay_sql : message);
+			for (mi = 0; upper_sql[mi]; mi++)
+				upper_sql[mi] = pg_toupper((unsigned char) upper_sql[mi]);
+
+			upper_cmdtype = pstrdup(cmdtype);
+			for (mi = 0; upper_cmdtype[mi]; mi++)
+				upper_cmdtype[mi] = pg_toupper((unsigned char) upper_cmdtype[mi]);
+
+			object_type = oggit_ddl_object_type(raw_type, upper_sql);
+			if (strcmp(object_type, "TRIGGER") == 0 &&
+				object_schema == NULL && ddl_payload != NULL)
+				object_schema = oggit_json_nested_str(ddl_payload, "relation", "schemaname");
+			if (object_name == NULL &&
+				(strcmp(object_type, "TRIGGER") == 0 ||
+				 strcmp(object_type, "FUNCTION") == 0 ||
+				 strcmp(object_type, "VIEW") == 0))
+			{
+				char	   *dot;
+
+				if (oggit_ddl_identity_from_sql(replay_sql, object_type,
+											&parsed_object_copy))
+				{
+					dot = strrchr(parsed_object_copy, '.');
+					if (dot != NULL)
+					{
+						*dot = '\0';
+						object_schema = parsed_object_copy;
+						object_name = dot + 1;
+					}
+					else
+						object_name = parsed_object_copy;
+				}
+			}
+			if (strcmp(object_type, "COLUMN") == 0 && ddl_payload != NULL)
+			{
+				const char *column_name = oggit_json_str(ddl_payload, "colname");
+
+				if (column_name != NULL)
+					object_name = column_name;
+			}
+			if (strcmp(object_type, "RULE") == 0)
+			{
+				char	   *rule_target = NULL;
+
+				if ((replay_sql != NULL &&
+					 oggit_rule_target_from_text(replay_sql, &rule_target)) ||
+					oggit_rule_target_from_text(message, &rule_target) ||
+					oggit_rule_target_from_text(objidentity, &rule_target))
+				{
+					char	   *dot;
+
+					parsed_object_copy = rule_target;
+					dot = strrchr(parsed_object_copy, '.');
+					if (dot != NULL)
+					{
+						*dot = '\0';
+						object_schema = parsed_object_copy;
+						object_name = dot + 1;
+					}
+					else
+						object_name = parsed_object_copy;
+				}
+			}
+
+			if (strstr(upper_cmdtype, "DROP") != NULL ||
+				strstr(upper_sql, "DROP ") != NULL)
+				safety_class = "destructive";
+			else if ((strcmp(cmdtype, "table_alter") == 0 ||
+					  strstr(upper_sql, "ALTER TABLE") != NULL) &&
+					 (strstr(upper_sql, "ADD CONSTRAINT") != NULL ||
+					  strstr(upper_sql, "CHECK") != NULL ||
+					  strstr(upper_sql, "FOREIGN KEY") != NULL ||
+					  strstr(upper_sql, "SET NOT NULL") != NULL))
+				safety_class = "requires_validation";
+			else if ((strcmp(cmdtype, "table_alter") == 0 ||
+					  strstr(upper_sql, "ALTER TABLE") != NULL) &&
+					 (strstr(upper_sql, "RENAME COLUMN") != NULL ||
+					  strstr(upper_sql, " RENAME TO ") != NULL ||
+					  (strstr(upper_sql, "ALTER COLUMN") != NULL &&
+					   (strstr(upper_sql, " TYPE ") != NULL ||
+						strstr(upper_sql, "SET DATA TYPE") != NULL))))
+				safety_class = "semantic";
+			else if (((strcmp(object_type, "COLUMN") == 0 ||
+					   (strcmp(object_type, "TABLE") == 0 &&
+						strstr(upper_sql, "ADD COLUMN") != NULL)) &&
+					  strcmp(cmdtype, "table_alter") == 0 &&
+					  strstr(upper_sql, "NOT NULL") == NULL &&
+					  strstr(upper_sql, "UNIQUE") == NULL &&
+					  strstr(upper_sql, "CHECK") == NULL &&
+					  strstr(upper_sql, "FOREIGN KEY") == NULL) ||
+					 (strcmp(object_type, "INDEX") == 0 &&
+					  strstr(upper_sql, "CREATE") != NULL &&
+					  strstr(upper_sql, "INDEX") != NULL &&
+					  strstr(upper_sql, "UNIQUE") == NULL) ||
+					 (strstr(upper_sql, "COMMENT ON ") != NULL) ||
+					 (strcmp(object_type, "TABLE") == 0 &&
+					  strstr(upper_sql, "CREATE") != NULL &&
+					  strstr(upper_sql, "TABLE") != NULL) ||
+					 (strcmp(object_type, "SCHEMA") == 0 &&
+					  strstr(upper_sql, "CREATE") != NULL &&
+					  strstr(upper_sql, "SCHEMA") != NULL))
+				safety_class = "safe_additive";
+			else if (strcmp(object_type, "SEQUENCE") == 0 ||
+					 strcmp(object_type, "TRIGGER") == 0 ||
+					 strcmp(object_type, "FUNCTION") == 0 ||
+					 strcmp(object_type, "VIEW") == 0)
+				safety_class = "semantic";
+			else if (strcmp(object_type, "CONSTRAINT") == 0)
+				safety_class = "requires_validation";
+			else
+				safety_class = "unsupported";
+
+			if (strcmp(safety_class, "unsupported") == 0)
+				unsupported_reason = "DDL is not supported by object-level merge";
+
+			change_json = cJSON_PrintUnformatted(event);
+
+			initStringInfo(&sql);
+			appendStringInfoString(&sql,
+								   "INSERT INTO oggit.object_change ("
+								   " commit_lsn, merge_id, ordinal, object_type, schema_name, object_name,"
+								   " action, change_json, safety_class, unsupported_reason) SELECT "
+								   " $1, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb, $9, $10"
+								   " WHERE NOT EXISTS ("
+								   "   SELECT 1 FROM oggit.object_change"
+								   "    WHERE commit_lsn = $1"
+								   "      AND ordinal = $3"
+								   "      AND action = $7"
+								   "      AND COALESCE(change_json::text, '') = COALESCE(($8::jsonb)::text, '')"
+								   " )");
+			for (mi = 0; mi < 10; mi++)
+				argtypes[mi] = TEXTOID;
+			argtypes[2] = INT4OID;
+			values[0] = CStringGetTextDatum(commit_lsn);
+			nulls[0] = ' ';
+			values[1] = oggit_text_or_null(merge_id, &nulls[1]);
+			values[2] = Int32GetDatum(ordinal);
+			nulls[2] = ' ';
+			values[3] = CStringGetTextDatum(object_type);
+			nulls[3] = ' ';
+			values[4] = oggit_text_or_null(object_schema, &nulls[4]);
+			values[5] = oggit_text_or_null(object_name, &nulls[5]);
+			values[6] = CStringGetTextDatum(cmdtype);
+			nulls[6] = ' ';
+			values[7] = CStringGetTextDatum(change_json);
+			nulls[7] = ' ';
+			values[8] = CStringGetTextDatum(safety_class);
+			nulls[8] = ' ';
+			values[9] = oggit_text_or_null(unsupported_reason, &nulls[9]);
+
+			oggit_spi_exec_args(sql.data, 10, argtypes, values, nulls);
+			pfree(sql.data);
+			pfree(upper_sql);
+			pfree(upper_cmdtype);
+			if (ddl_payload)
+				cJSON_Delete(ddl_payload);
+			if (message_copy)
+				pfree(message_copy);
+			if (replay_sql)
+				pfree(replay_sql);
+			if (owner)
+				pfree(owner);
+			if (objidentity_copy)
+				pfree(objidentity_copy);
+			if (parsed_object_copy)
+				pfree(parsed_object_copy);
+			if (change_json)
+				cJSON_free(change_json);
+		}
+	else if (event_kind != NULL && strcmp(event_kind, "commit") == 0)
+	{
+		const char *confirmed = oggit_json_str(event, "callback_commit_lsn");
+
+		if (confirmed == NULL)
+			confirmed = commit_lsn;
+
+		/*
+		 * Defer decode_lsn/confirmed_lsn updates to oggit_persist_batch().
+		 * Per-commit UPDATEs against oggit.state were a hot path under TPC-C
+		 * and interacted badly with anomalous duplicate id=true rows.
+		 */
+		oggit_note_batch_commit_lsn(commit_lsn, confirmed);
+	}
+		else
+		{
+			/* Unknown event kind: record as unsupported object_change. */
+			const char *merge_id = oggit_json_str(event, "merge_id");
+			char	   *change_json = cJSON_PrintUnformatted(event);
+			StringInfoData sql;
+			Oid			argtypes[5];
+			Datum		values[5];
+			char		nulls[5];
+
+			if (oggit_json_mentions_internal_schema(event) ||
+				oggit_json_mentions_merge_barrier(event))
+			{
+				if (change_json)
+					cJSON_free(change_json);
+				cJSON_Delete(event);
+				return;
+			}
+
+			initStringInfo(&sql);
+			appendStringInfoString(&sql,
+								   "INSERT INTO oggit.object_change ("
+								   " commit_lsn, merge_id, ordinal, object_type, action, change_json,"
+								   " safety_class, unsupported_reason) SELECT "
+								   " $1, $2::uuid, $3, 'OTHER', $4, $5::jsonb, 'unsupported',"
+								   " 'unknown neon_oggit event'"
+								   " WHERE NOT EXISTS ("
+								   "   SELECT 1 FROM oggit.object_change"
+								   "    WHERE commit_lsn = $1"
+								   "      AND ordinal = $3"
+								   "      AND action = $4"
+								   "      AND COALESCE(change_json::text, '') = COALESCE(($5::jsonb)::text, '')"
+								   " )");
+			argtypes[0] = TEXTOID;
+			argtypes[1] = TEXTOID;
+			argtypes[2] = INT4OID;
+			argtypes[3] = TEXTOID;
+			argtypes[4] = TEXTOID;
+			values[0] = CStringGetTextDatum(commit_lsn);
+			nulls[0] = ' ';
+			values[1] = oggit_text_or_null(merge_id, &nulls[1]);
+			values[2] = Int32GetDatum(ordinal);
+			nulls[2] = ' ';
+			values[3] = CStringGetTextDatum(event_kind != NULL ? event_kind : "unknown");
+			nulls[3] = ' ';
+			values[4] = CStringGetTextDatum(change_json);
+			nulls[4] = ' ';
+			oggit_spi_exec_args(sql.data, 5, argtypes, values, nulls);
+		pfree(sql.data);
+		if (change_json)
+			cJSON_free(change_json);
+	}
+
+	cJSON_Delete(event);
+}
+
+/* ------------------------------------------------------------------------
+ * Worker main
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Bootstrap: ensure the logical slot, then seed metadata. Slot creation must
+ * run in a transaction that has not performed writes.
+ */
+static void
+oggit_bootstrap(void)
+{
+	elog(LOG, "oggit worker: bootstrap begin");
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "oggit: SPI_connect failed during bootstrap");
+
+	elog(LOG, "oggit worker: ensure slot");
+	oggit_ensure_slot();
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "oggit: SPI_connect failed during bootstrap");
+
+	elog(LOG, "oggit worker: bootstrap state");
+	oggit_bootstrap_state();
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	elog(LOG, "oggit worker: bootstrap done");
+}
+
+/*
+ * Persist all buffered events of the current batch through SPI, then advance
+ * the slot to end_lsn. Runs in its own transaction, after the decoding
+ * context has been torn down (so no historic catalog snapshot is active).
+ */
+static int

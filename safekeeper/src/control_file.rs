@@ -21,7 +21,7 @@ use crate::metrics::WAL_DISK_IO_ERRORS;
 use crate::state::{EvictionState, TimelinePersistentState};
 
 pub const SK_MAGIC: u32 = 0xcafeceefu32;
-pub const SK_FORMAT_VERSION: u32 = 10;
+pub const SK_FORMAT_VERSION: u32 = 11;
 
 // contains persistent metadata for safekeeper
 pub const CONTROL_FILE_NAME: &str = "safekeeper.control";
