@@ -74,6 +74,26 @@ pub static BUILD_TAG: Lazy<String> = Lazy::new(|| {
 });
 const DEFAULT_INSTALLED_EXTENSIONS_COLLECTION_INTERVAL: u64 = 3600;
 
+fn compute_spec_setting(spec: &ComputeSpec, name: &str) -> Option<String> {
+    spec.cluster.settings.find(name).or_else(|| {
+        spec.cluster.postgresql_conf.as_deref().and_then(|config| {
+            config.lines().find_map(|line| {
+                let (setting_name, setting_value) = line.split_once('=')?;
+                if setting_name.trim() != name {
+                    return None;
+                }
+                Some(
+                    setting_value
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .to_string(),
+                )
+            })
+        })
+    })
+}
+
 /// Static configuration params that don't change after startup. These mostly
 /// come from the CLI args, or are derived from them.
 #[derive(Clone, Debug)]
@@ -916,7 +936,6 @@ impl ComputeNode {
         }
         info!("configure local_proxy succeed..");
 
-
         // Configure and start rsyslog for compliance audit logging
         match pspec.spec.audit_log_level {
             ComputeAudit::Hipaa | ComputeAudit::Extended | ComputeAudit::Full => {
@@ -983,6 +1002,7 @@ impl ComputeNode {
         let config_time = Utc::now();
         if pspec.spec.mode == ComputeMode::Primary {
             self.configure_as_primary(&compute_state)?;
+            self.start_oggit_worker(&pspec.spec)?;
 
             let conf = self.get_tokio_conn_conf(None);
             tokio::task::spawn(async {
@@ -1245,21 +1265,22 @@ impl ComputeNode {
     /// instead of just the major version (e.g., "14").
     fn fix_pg_version_for_opengauss(&self) -> Result<()> {
         let pgbin_path = Path::new(&self.params.pgbin);
-        let pgbin_name = pgbin_path.file_name()
+        let pgbin_name = pgbin_path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
         // Check if we're using openGauss (gaussdb binary)
-        let is_opengauss = pgbin_name.contains("gaussdb") || 
-                          pgbin_path.to_string_lossy().contains("gaussdb") ||
-                          pgbin_path.to_string_lossy().contains("openGauss");
+        let is_opengauss = pgbin_name.contains("gaussdb")
+            || pgbin_path.to_string_lossy().contains("gaussdb")
+            || pgbin_path.to_string_lossy().contains("openGauss");
 
         if !is_opengauss {
             return Ok(());
         }
 
         let pg_version_path = Path::new(&self.params.pgdata).join("PG_VERSION");
-        
+
         if !pg_version_path.exists() {
             // PG_VERSION should exist after basebackup extraction
             // If it doesn't, something went wrong, but we'll let it fail later
@@ -1269,9 +1290,9 @@ impl ComputeNode {
         // Read current PG_VERSION content
         let current_content = fs::read_to_string(&pg_version_path)
             .with_context(|| format!("Failed to read PG_VERSION from {:?}", pg_version_path))?;
-        
+
         let trimmed = current_content.trim();
-        
+
         // If it's already in "major.minor" format, don't change it
         if trimmed.contains('.') {
             return Ok(());
@@ -1282,7 +1303,10 @@ impl ComputeNode {
         let opengauss_version = match trimmed {
             "14" | "15" | "16" | "17" => "9.2",
             _ => {
-                warn!("Unknown PostgreSQL version '{}' in PG_VERSION, using 9.2 for openGauss", trimmed);
+                warn!(
+                    "Unknown PostgreSQL version '{}' in PG_VERSION, using 9.2 for openGauss",
+                    trimmed
+                );
                 "9.2"
             }
         };
@@ -1291,7 +1315,10 @@ impl ComputeNode {
         fs::write(&pg_version_path, format!("{}\n", opengauss_version))
             .with_context(|| format!("Failed to write PG_VERSION to {:?}", pg_version_path))?;
 
-        info!("Fixed PG_VERSION from '{}' to '{}' for openGauss compatibility", trimmed, opengauss_version);
+        info!(
+            "Fixed PG_VERSION from '{}' to '{}' for openGauss compatibility",
+            trimmed, opengauss_version
+        );
 
         Ok(())
     }
@@ -1714,40 +1741,41 @@ impl ComputeNode {
             ComputeMode::Replica | ComputeMode::Static(..) => {
                 // Check if we're using openGauss
                 let pgbin_path = Path::new(&self.params.pgbin);
-                let is_opengauss = pgbin_path.to_string_lossy().contains("gaussdb") ||
-                                  pgbin_path.to_string_lossy().contains("openGauss");
-                
+                let is_opengauss = pgbin_path.to_string_lossy().contains("gaussdb")
+                    || pgbin_path.to_string_lossy().contains("openGauss");
+
                 // For openGauss Replica mode, we need primary_conninfo and primary_slotname from the spec
                 // These are set in postgresql.conf, but openGauss needs them in recovery.conf
-                let (primary_conninfo, primary_slotname) = if is_opengauss && matches!(spec.mode, ComputeMode::Replica) {
-                    // Extract primary_conninfo - use splitn(2, '=') to only split at the first '='
-                    // Format: primary_conninfo = 'host=xxx port=xxx ...'
-                    let conninfo = spec.cluster.postgresql_conf.as_ref().and_then(|conf| {
-                        conf.lines()
-                            .find(|line| line.trim().starts_with("primary_conninfo"))
-                            .and_then(|line| {
-                                line.splitn(2, '=')
-                                    .nth(1)
-                                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
-                            })
-                    });
-                    
-                    // openGauss uses 'primary_slotname' instead of 'primary_slot_name'
-                    let slotname = spec.cluster.postgresql_conf.as_ref().and_then(|conf| {
-                        conf.lines()
-                            .find(|line| line.trim().starts_with("primary_slot_name"))
-                            .and_then(|line| {
-                                line.splitn(2, '=')
-                                    .nth(1)
-                                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
-                            })
-                    });
-                    
-                    (conninfo, slotname)
-                } else {
-                    (None, None)
-                };
-                
+                let (primary_conninfo, primary_slotname) =
+                    if is_opengauss && matches!(spec.mode, ComputeMode::Replica) {
+                        // Extract primary_conninfo - use splitn(2, '=') to only split at the first '='
+                        // Format: primary_conninfo = 'host=xxx port=xxx ...'
+                        let conninfo = spec.cluster.postgresql_conf.as_ref().and_then(|conf| {
+                            conf.lines()
+                                .find(|line| line.trim().starts_with("primary_conninfo"))
+                                .and_then(|line| {
+                                    line.splitn(2, '=').nth(1).map(|v| {
+                                        v.trim().trim_matches('\'').trim_matches('"').to_string()
+                                    })
+                                })
+                        });
+
+                        // openGauss uses 'primary_slotname' instead of 'primary_slot_name'
+                        let slotname = spec.cluster.postgresql_conf.as_ref().and_then(|conf| {
+                            conf.lines()
+                                .find(|line| line.trim().starts_with("primary_slot_name"))
+                                .and_then(|line| {
+                                    line.splitn(2, '=').nth(1).map(|v| {
+                                        v.trim().trim_matches('\'').trim_matches('"').to_string()
+                                    })
+                                })
+                        });
+
+                        (conninfo, slotname)
+                    } else {
+                        (None, None)
+                    };
+
                 add_standby_signal_ext(
                     pgdata_path,
                     is_opengauss,
@@ -1819,8 +1847,8 @@ impl ComputeNode {
     pub fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
         let pgdata_path = Path::new(&self.params.pgdata);
         info!("testneon start_postgres...");
-        let is_opengauss = self.params.pgbin.contains("gaussdb")
-            || self.params.pgbin.contains("openGauss");
+        let is_opengauss =
+            self.params.pgbin.contains("gaussdb") || self.params.pgbin.contains("openGauss");
 
         // Run postgres as a child process.
         let env_vars: Vec<(&str, &str)> = if let Some(storage_auth_token) = &storage_auth_token {
@@ -1828,15 +1856,18 @@ impl ComputeNode {
         } else {
             vec![]
         };
-        
+
         // Log the full command for debugging
         let is_cgexec = env::var_os("AUTOSCALING").is_some();
         let cmd_str = if is_cgexec {
-            format!("cgexec -g memory:neon-postgres {} -D {}", self.params.pgbin, self.params.pgdata)
+            format!(
+                "cgexec -g memory:neon-postgres {} -D {}",
+                self.params.pgbin, self.params.pgdata
+            )
         } else {
             format!("{} -D {}", self.params.pgbin, self.params.pgdata)
         };
-        
+
         info!(
             pgbin = %self.params.pgbin,
             pgdata = %self.params.pgdata,
@@ -1844,7 +1875,8 @@ impl ComputeNode {
         );
         info!("Startup command: {}", cmd_str);
         if !env_vars.is_empty() {
-            let env_str = env_vars.iter()
+            let env_str = env_vars
+                .iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -1856,14 +1888,15 @@ impl ComputeNode {
                 cleanup_stale_opengauss_ipc(pg_port);
             }
         }
-        
+
         let mut cmd = maybe_cgexec(&self.params.pgbin);
         cmd.args(["-D", &self.params.pgdata]);
         cmd.envs(env_vars.iter().map(|(k, v)| (*k, *v)));
         cmd.stderr(Stdio::piped());
-        
+
         info!("About to spawn postgres process");
-        let mut pg = cmd.spawn()
+        let mut pg = cmd
+            .spawn()
             .with_context(|| format!("Failed to spawn postgres process. Command: {}", cmd_str))?;
         info!(pid = %pg.id(), "Successfully spawned postgres process");
         PG_PID.store(pg.id(), Ordering::SeqCst);
@@ -1871,9 +1904,7 @@ impl ComputeNode {
         // Start a task to collect logs from stderr.
         let stderr = pg.stderr.take().expect("stderr should be captured");
         // Create log file path in the same directory as compute.log (parent of pgdata)
-        let log_file_path = pgdata_path
-            .parent()
-            .map(|p| p.join("postgres_startup.log"));
+        let log_file_path = pgdata_path.parent().map(|p| p.join("postgres_startup.log"));
         let logs_handle = handle_postgres_logs_with_file(stderr, log_file_path);
 
         wait_for_postgres(&mut pg, pgdata_path)?;
@@ -1946,6 +1977,107 @@ impl ComputeNode {
             conf.application_name(application_name);
         }
         conf
+    }
+
+    fn install_oggit_target_extension(&self, spec: &ComputeSpec) -> Result<()> {
+        let oggit_enabled = compute_spec_setting(spec, "neon.oggit_enabled").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            )
+        });
+        if !oggit_enabled {
+            return Ok(());
+        }
+
+        let database = compute_spec_setting(spec, "neon.oggit_database")
+            .unwrap_or_else(|| "postgres".to_string());
+        let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:install_oggit_extension"));
+        conf.dbname(&database);
+        let is_opengauss = is_opengauss_pgbin(&self.params.pgbin);
+
+        tokio::runtime::Handle::current().block_on(async move {
+            let (mut client, connection) = conf
+                .connect(NoTls)
+                .await
+                .with_context(|| format!("failed to connect to oggit database {database}"))?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    error!(%error, "oggit extension database connection failed");
+                }
+            });
+
+            client
+                .simple_query("CREATE SCHEMA IF NOT EXISTS neon")
+                .await
+                .with_context(|| format!("failed to create neon schema in database {database}"))?;
+            client
+                .simple_query("CREATE EXTENSION IF NOT EXISTS neon WITH SCHEMA neon")
+                .await
+                .with_context(|| {
+                    format!("failed to install neon extension in database {database}")
+                })?;
+            handle_neon_extension_upgrade(&mut client, is_opengauss)
+                .await
+                .with_context(|| {
+                    format!("failed to refresh neon extension in database {database}")
+                })?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    fn start_oggit_worker(&self, spec: &ComputeSpec) -> Result<()> {
+        let oggit_enabled = compute_spec_setting(spec, "neon.oggit_enabled").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            )
+        });
+        if !oggit_enabled || !is_opengauss_pgbin(&self.params.pgbin) {
+            return Ok(());
+        }
+
+        let database = compute_spec_setting(spec, "neon.oggit_database")
+            .unwrap_or_else(|| "postgres".to_string());
+        let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:start_oggit_worker"));
+        conf.dbname(&database);
+        conf.connect_timeout(Duration::from_secs(5));
+
+        tokio::runtime::Handle::current().block_on(async move {
+            let (client, connection) = conf
+                .connect(NoTls)
+                .await
+                .with_context(|| format!("failed to connect to oggit database {database}"))?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    error!(%error, "oggit worker control connection failed");
+                }
+            });
+
+            let requested: bool = client
+                .query_one("SELECT neon.neon_start_oggit_worker()", &[])
+                .await
+                .context("failed to request oggit worker startup")?
+                .get(0);
+            anyhow::ensure!(requested, "oggit worker startup request was rejected");
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let ready: bool = client
+                    .query_one("SELECT neon.neon_oggit_worker_is_ready()", &[])
+                    .await
+                    .context("failed to query oggit worker readiness")?
+                    .get(0);
+                if ready {
+                    info!(database, "oggit worker is ready");
+                    return Ok::<(), anyhow::Error>(());
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting 30s for oggit worker in database {database}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
     }
 
     pub async fn get_maintenance_client(
@@ -2322,28 +2454,39 @@ impl ComputeNode {
         assert!(pspec.spec.mode == ComputeMode::Primary);
         if !pspec.spec.skip_pg_catalog_updates {
             let pgdata_path = Path::new(&self.params.pgdata);
-            // temporarily reset max_cluster_size in config
-            // to avoid the possibility of hitting the limit, while we are applying config:
-            // creating new extensions, roles, etc...
-            config::with_compute_ctl_tmp_override(pgdata_path, "neon.max_cluster_size=-1", || {
-                self.pg_reload_conf()?;
-
+            if is_opengauss_pgbin(&self.params.pgbin) {
+                // openGauss currently crashes when WLMmonitor reloads Neon string
+                // GUCs such as neon.pageserver_connstring during startup.
                 self.apply_config(compute_state)?;
+            } else {
+                // temporarily reset max_cluster_size in config
+                // to avoid the possibility of hitting the limit, while we are applying config:
+                // creating new extensions, roles, etc...
+                config::with_compute_ctl_tmp_override(
+                    pgdata_path,
+                    "neon.max_cluster_size=-1",
+                    || {
+                        self.pg_reload_conf()?;
 
-                Ok(())
-            })?;
+                        self.apply_config(compute_state)?;
 
-            let postgresql_conf_path = pgdata_path.join("postgresql.conf");
-            if config::line_in_file(
-                &postgresql_conf_path,
-                "neon.disable_logical_replication_subscribers=false",
-            )? {
-                info!(
-                    "updated postgresql.conf to set neon.disable_logical_replication_subscribers=false"
-                );
+                        Ok(())
+                    },
+                )?;
+
+                let postgresql_conf_path = pgdata_path.join("postgresql.conf");
+                if config::line_in_file(
+                    &postgresql_conf_path,
+                    "neon.disable_logical_replication_subscribers=false",
+                )? {
+                    info!(
+                        "updated postgresql.conf to set neon.disable_logical_replication_subscribers=false"
+                    );
+                }
+                self.pg_reload_conf()?;
             }
-            self.pg_reload_conf()?;
         }
+        self.install_oggit_target_extension(&pspec.spec)?;
         self.post_apply_config()?;
 
         Ok(())
@@ -2507,9 +2650,18 @@ impl ComputeNode {
                 eprintln!("connection error: {e}");
             }
         });
-        let result = client
-            .simple_query(
-                "SELECT
+        let query = if is_opengauss_pgbin(&self.params.pgbin) {
+            "SELECT
+    row_to_json(pg_stat_statements)
+FROM
+    pg_stat_statements
+WHERE
+    userid != (SELECT oid FROM pg_roles WHERE rolname = 'cloud_admin')
+ORDER BY
+    (mean_exec_time + mean_plan_time) DESC
+LIMIT 100"
+        } else {
+            "SELECT
     row_to_json(pg_stat_statements)
 FROM
     pg_stat_statements
@@ -2517,9 +2669,9 @@ WHERE
     userid != 'cloud_admin'::regrole::oid
 ORDER BY
     (mean_exec_time + mean_plan_time) DESC
-LIMIT 100",
-            )
-            .await;
+LIMIT 100"
+        };
+        let result = client.simple_query(query).await;
 
         if let Ok(raw_rows) = result {
             for message in raw_rows.iter() {
@@ -3096,5 +3248,38 @@ mod tests {
             Ok(_p) => panic!("Failed to detect duplicate entry"),
             Err(e) => assert!(e.starts_with("duplicate entry in safekeeper_connstrings:")),
         };
+    }
+
+    #[test]
+    fn compute_spec_setting_reads_generic_settings() {
+        let file = File::open("tests/cluster_spec.json").unwrap();
+        let mut spec: ComputeSpec = serde_json::from_reader(file).unwrap();
+        spec.cluster
+            .settings
+            .get_or_insert_with(Vec::new)
+            .push(compute_api::spec::GenericOption {
+                name: "neon.oggit_database".to_string(),
+                value: Some("test".to_string()),
+                vartype: "string".to_string(),
+            });
+
+        assert_eq!(
+            compute_spec_setting(&spec, "neon.oggit_database").as_deref(),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn compute_spec_setting_reads_postgresql_conf() {
+        let file = File::open("tests/cluster_spec.json").unwrap();
+        let mut spec: ComputeSpec = serde_json::from_reader(file).unwrap();
+        spec.cluster.settings = None;
+        spec.cluster.postgresql_conf =
+            Some("neon.oggit_enabled = on\nneon.oggit_database = 'test'\n".to_string());
+
+        assert_eq!(
+            compute_spec_setting(&spec, "neon.oggit_database").as_deref(),
+            Some("test")
+        );
     }
 }

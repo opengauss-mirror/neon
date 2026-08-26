@@ -62,14 +62,14 @@ pub fn write_postgres_conf(
                 .lines()
                 .filter(|line| {
                     let trimmed = line.trim();
-                    !trimmed.starts_with("primary_conninfo") &&
-                    !trimmed.starts_with("primary_slot_name")
+                    !trimmed.starts_with("primary_conninfo")
+                        && !trimmed.starts_with("primary_slot_name")
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             writeln!(file, "{}", filtered_conf)?;
         } else {
-        writeln!(file, "{conf}")?;
+            writeln!(file, "{conf}")?;
         }
     }
 
@@ -102,7 +102,10 @@ pub fn write_postgres_conf(
     writeln!(file, "log_min_error_statement = error")?;
     writeln!(file, "log_min_duration_statement = -1")?;
     writeln!(file, "log_statement = 'none'")?;
-    writeln!(file, "log_line_prefix = '%m [%p] [%c] [%l] [%d] [%u] [%r] '")?;
+    writeln!(
+        file,
+        "log_line_prefix = '%m [%p] [%c] [%l] [%d] [%u] [%r] '"
+    )?;
 
     // Stripe size GUC should be defined prior to connection string
     if let Some(stripe_size) = spec.shard_stripe_size {
@@ -223,8 +226,7 @@ pub fn write_postgres_conf(
     if let Some(settings) = &spec.cluster.settings {
         writeln!(file, "# Managed by compute_ctl: begin")?;
         for setting in settings {
-            if spec.pageserver_connstring.is_some()
-                && setting.name == "neon.pageserver_connstring"
+            if spec.pageserver_connstring.is_some() && setting.name == "neon.pageserver_connstring"
             {
                 continue;
             }

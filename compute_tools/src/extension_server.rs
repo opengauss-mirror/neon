@@ -96,7 +96,7 @@ fn get_pg_config(argument: &str, pgbin: &str) -> String {
     // gives the result of `pg_config [argument]` or `gs_config [argument]` for openGauss
     // where argument is a flag like `--version` or `--sharedir`
     let pg_bin_path = pg_bin_dir(pgbin);
-    
+
     // Try pg_config first (for PostgreSQL)
     let pgconfig = pg_bin_path.join("pg_config");
     if pgconfig.exists() {
@@ -109,7 +109,7 @@ fn get_pg_config(argument: &str, pgbin: &str) -> String {
             .trim()
             .to_string();
     }
-    
+
     // Try gs_config for openGauss
     let gsconfig = pg_bin_path.join("gs_config");
     if gsconfig.exists() {
@@ -122,12 +122,15 @@ fn get_pg_config(argument: &str, pgbin: &str) -> String {
             .trim()
             .to_string();
     }
-    
+
     // If neither exists, return a default for openGauss version
     if argument == "--version" {
         "openGauss 7.0.2".to_string()
     } else {
-        panic!("Neither pg_config nor gs_config found in {}", pg_bin_path.display());
+        panic!(
+            "Neither pg_config nor gs_config found in {}",
+            pg_bin_path.display()
+        );
     }
 }
 

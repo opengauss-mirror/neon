@@ -50,6 +50,7 @@ impl ComputeNode {
             let client = Self::get_maintenance_client(&conf).await?;
             let spec = spec.clone();
             let params = Arc::new(self.params.clone());
+            configure_apply_client(&client, &params).await?;
 
             let databases = get_existing_dbs_async(&client).await?;
             let roles = get_existing_roles_async(&client)
@@ -350,6 +351,7 @@ impl ComputeNode {
                 || async {
                     if client_conn.is_none() {
                         let db_client = Self::get_maintenance_client(&conf).await?;
+                        configure_apply_client(&db_client, &params).await?;
                         client_conn.replace(db_client);
                     }
                     let client = client_conn.as_ref().unwrap();
@@ -432,6 +434,14 @@ impl ComputeNode {
                 .unwrap_or(3)
         }
     }
+}
+
+async fn configure_apply_client(client: &Client, params: &ComputeNodeParams) -> Result<()> {
+    if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+        client.simple_query("SET synchronous_commit=off").await?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -605,13 +615,36 @@ async fn get_operations<'a>(
     apply_spec_phase: &'a ApplySpecPhase,
 ) -> Result<Box<dyn Iterator<Item = Operation> + 'a + Send>> {
     match apply_spec_phase {
-        ApplySpecPhase::CreatePrivilegedRole => Ok(Box::new(once(Operation {
-            query: format!(
-                include_str!("sql/create_privileged_role.sql"),
-                privileged_role_name = params.privileged_role_name
-            ),
-            comment: None,
-        }))),
+        ApplySpecPhase::CreatePrivilegedRole => {
+            if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                // On openGauss, `cloud_admin` already exists as the bootstrap
+                // superuser, so there is nothing to create. For any other
+                // privileged role name we must use an openGauss-compatible
+                // statement: the vanilla template uses BYPASSRLS and the
+                // predefined pg_read_all_data / pg_write_all_data roles, none of
+                // which openGauss supports (they raise `unrecognized role
+                // option "bypassrls"` / missing-role errors and abort spec apply).
+                if params.privileged_role_name == "cloud_admin" {
+                    Ok(Box::new(empty()))
+                } else {
+                    Ok(Box::new(once(Operation {
+                        query: format!(
+                            include_str!("sql/create_privileged_role_opengauss.sql"),
+                            privileged_role_name = params.privileged_role_name
+                        ),
+                        comment: None,
+                    })))
+                }
+            } else {
+                Ok(Box::new(once(Operation {
+                    query: format!(
+                        include_str!("sql/create_privileged_role.sql"),
+                        privileged_role_name = params.privileged_role_name
+                    ),
+                    comment: None,
+                })))
+            }
+        }
         ApplySpecPhase::DropInvalidDatabases => {
             let mut ctx = ctx.write().await;
             let databases = &mut ctx.dbs;
@@ -680,12 +713,18 @@ async fn get_operations<'a>(
         }
         ApplySpecPhase::CreateAndAlterRoles => {
             let mut ctx = ctx.write().await;
+            let is_opengauss = crate::spec::is_opengauss_pgbin(&params.pgbin);
 
             let operations = spec.cluster.roles
                 .iter()
                 .filter_map(move |role| {
                     let roles = &mut ctx.roles;
                     let db_role = roles.get(&role.name);
+                    let role_options = if is_opengauss {
+                        role.to_opengauss_options()
+                    } else {
+                        role.to_pg_options()
+                    };
 
                     match db_role {
                         Some(db_role) => {
@@ -700,7 +739,7 @@ async fn get_operations<'a>(
                                     query: format!(
                                         "ALTER ROLE {} {}",
                                         role.name.pg_quote(),
-                                        role.to_pg_options(),
+                                        role_options,
                                     ),
                                     comment: None,
                                 })
@@ -710,17 +749,26 @@ async fn get_operations<'a>(
                         }
                         None => {
                             let query = if !jwks_roles.contains(role.name.as_str()) {
-                                format!(
-                                    "CREATE ROLE {} INHERIT CREATEROLE CREATEDB BYPASSRLS REPLICATION IN ROLE {} {}",
-                                    role.name.pg_quote(),
-                                    params.privileged_role_name,
-                                    role.to_pg_options(),
-                                )
+                                if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                                    format!(
+                                        "CREATE ROLE {} INHERIT CREATEROLE CREATEDB REPLICATION IN ROLE {} {}",
+                                        role.name.pg_quote(),
+                                        params.privileged_role_name,
+                                        role_options,
+                                    )
+                                } else {
+                                    format!(
+                                        "CREATE ROLE {} INHERIT CREATEROLE CREATEDB BYPASSRLS REPLICATION IN ROLE {} {}",
+                                        role.name.pg_quote(),
+                                        params.privileged_role_name,
+                                        role_options,
+                                    )
+                                }
                             } else {
                                 format!(
                                     "CREATE ROLE {} {}",
                                     role.name.pg_quote(),
-                                    role.to_pg_options(),
+                                    role_options,
                                 )
                             };
                             Some(Operation {
@@ -1009,15 +1057,31 @@ async fn get_operations<'a>(
 
                     let operations = vec![
                         Operation {
-                            query: format!(
-                                include_str!("sql/set_public_schema_owner.sql"),
-                                db_owner = db_owner,
-                                outer_tag = outer_tag,
-                            ),
+                            query: if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                                format!(
+                                    include_str!("sql/set_public_schema_owner_opengauss.sql"),
+                                    db_owner = db_owner,
+                                    outer_tag = outer_tag,
+                                )
+                            } else {
+                                format!(
+                                    include_str!("sql/set_public_schema_owner.sql"),
+                                    db_owner = db_owner,
+                                    outer_tag = outer_tag,
+                                )
+                            },
                             comment: None,
                         },
                         Operation {
-                            query: String::from(include_str!("sql/default_grants.sql")),
+                            query: if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                                format!(
+                                    include_str!("sql/default_grants_opengauss.sql"),
+                                    privileged_role_name = params.privileged_role_name.pg_quote(),
+                                    outer_tag = outer_tag,
+                                )
+                            } else {
+                                String::from(include_str!("sql/default_grants.sql"))
+                            },
                             comment: None,
                         },
                     ]
@@ -1096,10 +1160,21 @@ async fn get_operations<'a>(
 
             Ok(Box::new(operations.into_iter()))
         }
-        ApplySpecPhase::CreateAvailabilityCheck => Ok(Box::new(once(Operation {
-            query: String::from(include_str!("sql/add_availabilitycheck_tables.sql")),
-            comment: None,
-        }))),
+        ApplySpecPhase::CreateAvailabilityCheck => {
+            // openGauss does not support PostgreSQL's INSERT ... ON CONFLICT
+            // syntax, so use an openGauss-native variant there.
+            let query = if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                String::from(include_str!(
+                    "sql/add_availabilitycheck_tables_opengauss.sql"
+                ))
+            } else {
+                String::from(include_str!("sql/add_availabilitycheck_tables.sql"))
+            };
+            Ok(Box::new(once(Operation {
+                query,
+                comment: None,
+            })))
+        }
         ApplySpecPhase::DropRoles => {
             let operations = spec
                 .delta_operations
@@ -1113,9 +1188,20 @@ async fn get_operations<'a>(
 
             Ok(Box::new(operations))
         }
-        ApplySpecPhase::FinalizeDropLogicalSubscriptions => Ok(Box::new(once(Operation {
-            query: String::from(include_str!("sql/finalize_drop_subscriptions.sql")),
-            comment: None,
-        }))),
+        ApplySpecPhase::FinalizeDropLogicalSubscriptions => {
+            // openGauss does not support PostgreSQL's INSERT ... ON CONFLICT
+            // syntax, so use an openGauss-native variant there.
+            let query = if crate::spec::is_opengauss_pgbin(&params.pgbin) {
+                String::from(include_str!(
+                    "sql/finalize_drop_subscriptions_opengauss.sql"
+                ))
+            } else {
+                String::from(include_str!("sql/finalize_drop_subscriptions.sql"))
+            };
+            Ok(Box::new(once(Operation {
+                query,
+                comment: None,
+            })))
+        }
     }
 }

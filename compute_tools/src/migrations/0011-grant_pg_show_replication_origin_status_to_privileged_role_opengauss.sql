@@ -1,0 +1,2 @@
+-- SKIP: openGauss does not support granting privileges on this built-in
+--       replication origin status function.

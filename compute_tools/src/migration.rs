@@ -10,11 +10,17 @@ pub(crate) struct MigrationRunner<'m> {
     client: &'m mut Client,
     migrations: &'m [&'m str],
     lakebase_mode: bool,
+    is_opengauss: bool,
 }
 
 impl<'m> MigrationRunner<'m> {
     /// Create a new migration runner
-    pub fn new(client: &'m mut Client, migrations: &'m [&'m str], lakebase_mode: bool) -> Self {
+    pub fn new(
+        client: &'m mut Client,
+        migrations: &'m [&'m str],
+        lakebase_mode: bool,
+        is_opengauss: bool,
+    ) -> Self {
         // The neon_migration.migration_id::id column is a bigint, which is equivalent to an i64
         assert!(migrations.len() + 1 < i64::MAX as usize);
 
@@ -22,6 +28,7 @@ impl<'m> MigrationRunner<'m> {
             client,
             migrations,
             lakebase_mode,
+            is_opengauss,
         }
     }
 
@@ -77,11 +84,15 @@ impl<'m> MigrationRunner<'m> {
             .simple_query("CREATE SCHEMA IF NOT EXISTS neon_migration")
             .await?;
         self.client.simple_query("CREATE TABLE IF NOT EXISTS neon_migration.migration_id (key INT NOT NULL PRIMARY KEY, id bigint NOT NULL DEFAULT 0)").await?;
-        self.client
-            .simple_query(
-                "INSERT INTO neon_migration.migration_id VALUES (0, 0) ON CONFLICT DO NOTHING",
-            )
-            .await?;
+        // openGauss does not support PostgreSQL's INSERT ... ON CONFLICT syntax;
+        // ON DUPLICATE KEY UPDATE NOTHING is the openGauss-native equivalent of
+        // ON CONFLICT DO NOTHING. PostgreSQL keeps the original form.
+        let seed_migration_id = if self.is_opengauss {
+            "INSERT INTO neon_migration.migration_id VALUES (0, 0) ON DUPLICATE KEY UPDATE NOTHING"
+        } else {
+            "INSERT INTO neon_migration.migration_id VALUES (0, 0) ON CONFLICT DO NOTHING"
+        };
+        self.client.simple_query(seed_migration_id).await?;
         self.client
             .simple_query("ALTER SCHEMA neon_migration OWNER TO cloud_admin")
             .await?;

@@ -138,33 +138,59 @@ impl GenericOptionsSearch for GenericOptions {
 
 pub trait RoleExt {
     fn to_pg_options(&self) -> String;
+    fn to_opengauss_options(&self) -> String;
 }
 
 impl RoleExt for Role {
     /// Serialize a list of role parameters into a Postgres-acceptable
     /// string of arguments.
     fn to_pg_options(&self) -> String {
-        // XXX: consider putting LOGIN as a default option somewhere higher, e.g. in control-plane.
-        let mut params: String = self.options.as_pg_options();
-        params.push_str(" LOGIN");
-
-        if let Some(pass) = &self.encrypted_password {
-            // Some time ago we supported only md5 and treated all encrypted_password as md5.
-            // Now we also support SCRAM-SHA-256 and to preserve compatibility
-            // we treat all encrypted_password as md5 unless they starts with SCRAM-SHA-256.
-            if pass.starts_with("SCRAM-SHA-256") {
-                write!(params, " PASSWORD '{pass}'")
-                    .expect("String is documented to not to error during write operations");
-            } else {
-                write!(params, " PASSWORD 'md5{pass}'")
-                    .expect("String is documented to not to error during write operations");
-            }
-        } else {
-            params.push_str(" PASSWORD NULL");
-        }
-
-        params
+        role_to_options(self, false)
     }
+
+    /// Serialize role parameters into openGauss-compatible arguments.
+    fn to_opengauss_options(&self) -> String {
+        role_to_options(self, true)
+    }
+}
+
+fn role_to_options(role: &Role, is_opengauss: bool) -> String {
+    let mut params = if is_opengauss {
+        let options = role.options.as_ref().map(|ops| {
+            ops.iter()
+                .filter(|op| {
+                    let name = op.name.to_ascii_uppercase();
+                    name != "BYPASSRLS" && name != "NOBYPASSRLS"
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        options.as_pg_options()
+    } else {
+        role.options.as_pg_options()
+    };
+
+    // XXX: consider putting LOGIN as a default option somewhere higher, e.g. in control-plane.
+    params.push_str(" LOGIN");
+
+    if let Some(pass) = &role.encrypted_password {
+        // Some time ago we supported only md5 and treated all encrypted_password as md5.
+        // Now we also support SCRAM-SHA-256 and to preserve compatibility
+        // we treat all encrypted_password as md5 unless they starts with SCRAM-SHA-256.
+        if pass.starts_with("SCRAM-SHA-256") {
+            write!(params, " PASSWORD '{pass}'")
+                .expect("String is documented to not to error during write operations");
+        } else {
+            write!(params, " PASSWORD 'md5{pass}'")
+                .expect("String is documented to not to error during write operations");
+        }
+    } else if is_opengauss {
+        params.push_str(" PASSWORD DISABLE");
+    } else {
+        params.push_str(" PASSWORD NULL");
+    }
+
+    params
 }
 
 pub trait DatabaseExt {
@@ -628,7 +654,7 @@ async fn handle_postgres_logs_async(
         if !buf.is_empty() && should_flush_buf {
             // Save buf content before clearing
             let buf_content = buf.clone();
-            
+
             // join multiline message into a single line, separated by unicode Zero Width Space.
             // "PG:" suffix is used to distinguish postgres logs from other logs.
             let combined = format!("PG:{}\n", buf_content.join("\u{200B}"));
@@ -645,7 +671,9 @@ async fn handle_postgres_logs_async(
             if let Some(ref mut file) = log_file {
                 // Write raw lines (without "PG:" prefix) to the log file
                 let raw_combined = format!("{}\n", buf_content.join("\n"));
-                if let Err(e) = tokio::io::AsyncWriteExt::write_all(file, raw_combined.as_bytes()).await {
+                if let Err(e) =
+                    tokio::io::AsyncWriteExt::write_all(file, raw_combined.as_bytes()).await
+                {
                     tracing::error!("error while writing to log file: {}", e);
                 }
             }
