@@ -6,7 +6,7 @@
 //! rely on `neon_local` to set up the environment for each test.
 //!
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::exit;
@@ -28,6 +28,19 @@ use control_plane::local_env::{
     EndpointStorageConf, InitForceMode, LocalEnv, NeonBroker, NeonLocalInitConf,
     NeonLocalInitPageserverConf, SafekeeperConf,
 };
+use control_plane::merge_oggit::{OggitGcParentRequest, OggitGcParentResult, oggit_gc_parent};
+use control_plane::ops::endpoint::compute_mode_from_options;
+use control_plane::ops::tenant::{TenantCreateOptions, create_tenant};
+use control_plane::ops::timeline::{
+    TimelineBranchOptions, TimelineCreateOptions, branch_timeline, create_timeline,
+};
+use control_plane::ops::{
+    branch as branch_ops,
+    branch::{
+        BranchCommandOutput, BranchDiffOptions, BranchMergeOptions, BranchResolveOptions,
+        BranchTargetOptions,
+    },
+};
 use control_plane::pageserver::PageServerNode;
 use control_plane::safekeeper::SafekeeperNode;
 use control_plane::storage_controller::{
@@ -39,13 +52,9 @@ use pageserver_api::config::{
     DEFAULT_HTTP_LISTEN_PORT as DEFAULT_PAGESERVER_HTTP_PORT,
     DEFAULT_PG_LISTEN_PORT as DEFAULT_PAGESERVER_PG_PORT,
 };
-use pageserver_api::controller_api::{
-    NodeAvailabilityWrapper, PlacementPolicy, TenantCreateRequest,
-};
-use pageserver_api::models::{
-    ShardParameters, TenantConfigRequest, TenantWaitLsnRequest, TimelineCreateRequest, TimelineInfo,
-};
-use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardStripeSize, TenantShardId};
+use pageserver_api::controller_api::{NodeAvailabilityWrapper, PlacementPolicy};
+use pageserver_api::models::{TenantConfigRequest, TenantWaitLsnRequest, TimelineInfo};
+use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, TenantShardId};
 use postgres_backend::AuthType;
 use postgres_connection::parse_host_port;
 use safekeeper_api::membership::{SafekeeperGeneration, SafekeeperId};
@@ -56,25 +65,16 @@ use safekeeper_api::{
 use storage_broker::DEFAULT_LISTEN_ADDR as DEFAULT_BROKER_ADDR;
 use tokio::task::JoinSet;
 use tokio_opengauss::NoTls;
-use url::{Host, Url};
+use url::Host;
 use utils::auth::{Claims, Scope};
 use utils::id::{NodeId, TenantId, TenantTimelineId, TimelineId};
 use utils::lsn::Lsn;
 use utils::project_git_version;
 
-mod merge_oggit;
-use merge_oggit::{
-    oggit_abort_merge, oggit_continue_merge, oggit_diff_from_meta, oggit_finalize_merge_commit_lsn,
-    oggit_freeze_metadata_lsn, oggit_json_text, oggit_merge_from_meta, oggit_merge_status,
-    oggit_read_conflicts, oggit_resolve_conflict, oggit_resolve_conflict_sql,
-};
-
 // Default id of a safekeeper node, if not specified on the command line.
 const DEFAULT_SAFEKEEPER_ID: NodeId = NodeId(1);
 const DEFAULT_PAGESERVER_ID: NodeId = NodeId(1);
 const DEFAULT_BRANCH_NAME: &str = "main";
-const OGGIT_FDW_SCHEMA: &str = "oggit_fdw";
-const OGGIT_FDW_LOCK_NAME: &str = "neon_local:branch:oggit_fdw";
 project_git_version!(GIT_VERSION);
 
 #[allow(dead_code)]
@@ -116,6 +116,8 @@ enum NeonLocalCmd {
     Mappings(MappingsCmd),
     #[command(subcommand)]
     Branch(BranchCmd),
+    #[command(subcommand)]
+    Oggit(OggitCmd),
 
     Start(StartCmdArgs),
     Stop(StopCmdArgs),
@@ -255,6 +257,29 @@ enum TimelineCmd {
 }
 
 #[derive(clap::Subcommand)]
+#[clap(about = "Manage oggit metadata")]
+enum OggitCmd {
+    Gc(OggitGcCmdArgs),
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Garbage collect old oggit change_log/object_change rows on root parent timelines")]
+struct OggitGcCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(
+        long,
+        default_value_t = 16 * 1024 * 1024,
+        help = "LSN bytes retained on root parents without live direct children"
+    )]
+    retention_lsn_distance: u64,
+}
+
+#[derive(clap::Subcommand)]
 #[clap(about = "Diff and merge local Neon branches through running endpoints")]
 enum BranchCmd {
     Diff(BranchDiffCmdArgs),
@@ -319,11 +344,7 @@ struct BranchDiffCmdArgs {
     #[clap(long, default_value = "public", help = "Target schema to compare")]
     target_schema: String,
 
-    #[clap(
-        long,
-        default_value = "postgres",
-        help = "Database name on both endpoints"
-    )]
+    #[clap(long, help = "Database name on both endpoints")]
     database: String,
 
     #[clap(
@@ -359,17 +380,6 @@ pub(crate) enum BranchMergeStrategy {
     Ours,
     Theirs,
     Manual,
-}
-
-impl BranchMergeStrategy {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            BranchMergeStrategy::Fail => "fail",
-            BranchMergeStrategy::Ours => "ours",
-            BranchMergeStrategy::Theirs => "theirs",
-            BranchMergeStrategy::Manual => "manual",
-        }
-    }
 }
 
 #[derive(clap::Args)]
@@ -409,11 +419,7 @@ struct BranchMergeCmdArgs {
     #[clap(long, default_value = "public", help = "Target schema to merge into")]
     target_schema: String,
 
-    #[clap(
-        long,
-        default_value = "postgres",
-        help = "Database name on both endpoints"
-    )]
+    #[clap(long, help = "Database name on both endpoints")]
     database: String,
 
     #[clap(
@@ -475,7 +481,7 @@ struct BranchMergeStatusCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -503,7 +509,7 @@ struct BranchConflictsCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -515,16 +521,6 @@ enum BranchConflictResolution {
     Ours,
     Theirs,
     Skip,
-}
-
-impl BranchConflictResolution {
-    fn as_str(self) -> &'static str {
-        match self {
-            BranchConflictResolution::Ours => "ours",
-            BranchConflictResolution::Theirs => "theirs",
-            BranchConflictResolution::Skip => "skip",
-        }
-    }
 }
 
 #[derive(clap::Args)]
@@ -561,7 +557,7 @@ struct BranchResolveCmdArgs {
     )]
     custom_sql: Option<String>,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -589,7 +585,7 @@ struct BranchContinueCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -617,7 +613,7 @@ struct BranchAbortCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -1084,6 +1080,19 @@ struct EndpointStartCmdArgs {
 
     #[clap(
         long,
+        help = "Enable the compute-side oggit logical decoding worker for this endpoint"
+    )]
+    enable_oggit: bool,
+
+    #[clap(
+        long,
+        requires = "enable_oggit",
+        help = "Database monitored by the oggit worker; defaults to the endpoint's previous selection or postgres"
+    )]
+    oggit_database: Option<String>,
+
+    #[clap(
+        long,
         help = "Run in development mode, skipping VM-specific operations like process termination",
         action = clap::ArgAction::SetTrue
     )]
@@ -1258,6 +1267,7 @@ fn main() -> Result<()> {
             NeonLocalCmd::Endpoint(subcmd) => rt.block_on(handle_endpoint(&subcmd, env)),
             NeonLocalCmd::Mappings(subcmd) => handle_mappings(&subcmd, env),
             NeonLocalCmd::Branch(subcmd) => rt.block_on(handle_branch(&subcmd, Some(env))),
+            NeonLocalCmd::Oggit(subcmd) => rt.block_on(handle_oggit(&subcmd, env)),
         };
 
         let subcommand_result = if &original_env != env {
@@ -1568,63 +1578,31 @@ async fn handle_tenant(subcmd: &TenantCmd, env: &mut local_env::LocalEnv) -> any
 
             let tenant_conf = PageServerNode::parse_config(tenant_conf)?;
 
-            // If tenant ID was not specified, generate one
-            let tenant_id = args.tenant_id.unwrap_or_else(TenantId::generate);
-
-            // We must register the tenant with the storage controller, so
-            // that when the pageserver restarts, it will be re-attached.
             let storage_controller = StorageController::from_env(env);
-            storage_controller
-                .tenant_create(TenantCreateRequest {
-                    // Note that ::unsharded here isn't actually because the tenant is unsharded, its because the
-                    // storage controller expects a shard-naive tenant_id in this attribute, and the TenantCreateRequest
-                    // type is used both in the storage controller (for creating tenants) and in the pageserver (for
-                    // creating shards)
-                    new_tenant_id: TenantShardId::unsharded(tenant_id),
-                    generation: None,
-                    shard_parameters: ShardParameters {
-                        count: ShardCount::new(args.shard_count),
-                        stripe_size: args
-                            .shard_stripe_size
-                            .map(ShardStripeSize)
-                            .unwrap_or(DEFAULT_STRIPE_SIZE),
-                    },
+            let output = create_tenant(
+                &storage_controller,
+                env,
+                TenantCreateOptions {
+                    tenant_id: args.tenant_id,
+                    timeline_id: args.timeline_id,
+                    branch_name: DEFAULT_BRANCH_NAME.to_string(),
+                    set_default: args.set_default,
+                    pg_version: args.pg_version,
+                    shard_count: args.shard_count,
+                    shard_stripe_size: args.shard_stripe_size,
                     placement_policy: args.placement_policy.clone(),
                     config: tenant_conf,
-                })
-                .await?;
+                },
+            )
+            .await?;
+            let tenant_id = output.tenant_id;
+            let new_timeline_id = output.timeline_id;
             println!("tenant {tenant_id} successfully created on the pageserver");
-
-            // Create an initial timeline for the new tenant
-            let new_timeline_id = args.timeline_id.unwrap_or(TimelineId::generate());
-
-            // FIXME: passing None for ancestor_start_lsn is not kosher in a sharded world: we can't have
-            // different shards picking different start lsns.  Maybe we have to teach storage controller
-            // to let shard 0 branch first and then propagate the chosen LSN to other shards.
-            storage_controller
-                .tenant_timeline_create(
-                    tenant_id,
-                    TimelineCreateRequest {
-                        new_timeline_id,
-                        mode: pageserver_api::models::TimelineCreateRequestMode::Bootstrap {
-                            existing_initdb_timeline_id: None,
-                            pg_version: Some(args.pg_version),
-                        },
-                    },
-                )
-                .await?;
-
-            env.register_branch_mapping(
-                DEFAULT_BRANCH_NAME.to_string(),
-                tenant_id,
-                new_timeline_id,
-            )?;
 
             println!("Created an initial timeline '{new_timeline_id}' for tenant: {tenant_id}",);
 
             if args.set_default {
                 println!("Setting tenant {tenant_id} as a default one");
-                env.default_tenant_id = Some(tenant_id);
             }
         }
         TenantCmd::SetDefault(args) => {
@@ -1663,28 +1641,24 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
         }
         TimelineCmd::Create(args) => {
             let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let new_branch_name = &args.branch_name;
-            let new_timeline_id_opt = args.timeline_id;
-            let new_timeline_id = new_timeline_id_opt.unwrap_or(TimelineId::generate());
-
             let storage_controller = StorageController::from_env(env);
-            let create_req = TimelineCreateRequest {
-                new_timeline_id,
-                mode: pageserver_api::models::TimelineCreateRequestMode::Bootstrap {
-                    existing_initdb_timeline_id: None,
-                    pg_version: Some(args.pg_version),
+            let output = create_timeline(
+                &storage_controller,
+                env,
+                TimelineCreateOptions {
+                    tenant_id,
+                    timeline_id: args.timeline_id,
+                    branch_name: args.branch_name.clone(),
+                    pg_version: args.pg_version,
                 },
-            };
-            let timeline_info = storage_controller
-                .tenant_timeline_create(tenant_id, create_req)
-                .await?;
+            )
+            .await?;
 
-            let last_record_lsn = timeline_info.last_record_lsn;
-            env.register_branch_mapping(new_branch_name.to_string(), tenant_id, new_timeline_id)?;
+            let last_record_lsn = output.timeline_info.last_record_lsn;
 
             println!(
                 "Created timeline '{}' at Lsn {last_record_lsn} for tenant: {tenant_id}",
-                timeline_info.timeline_id
+                output.timeline_info.timeline_id
             );
         }
         // TODO: rename to import-basebackup-plus-wal
@@ -1880,26 +1854,22 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                 endpoint_lsn
             };
 
-            let create_req = TimelineCreateRequest {
-                new_timeline_id,
-                mode: pageserver_api::models::TimelineCreateRequestMode::Branch {
+            let output = branch_timeline(
+                &storage_controller,
+                env,
+                TimelineBranchOptions {
+                    tenant_id,
+                    timeline_id: Some(new_timeline_id),
+                    branch_name: new_branch_name.to_string(),
                     ancestor_timeline_id,
                     ancestor_start_lsn: start_lsn,
-                    read_only: false,
-                    pg_version: None,
                 },
-            };
-            let timeline_info = storage_controller
-                .tenant_timeline_create(tenant_id, create_req)
-                .await?;
-
-            let last_record_lsn = timeline_info.last_record_lsn;
-
-            env.register_branch_mapping(new_branch_name.to_string(), tenant_id, new_timeline_id)?;
+            )
+            .await?;
 
             println!(
-                "Created timeline '{}' at Lsn {last_record_lsn} for tenant: {tenant_id}. Ancestor timeline: '{ancestor_branch_name}'",
-                timeline_info.timeline_id
+                "Created timeline '{}' at Lsn {} for tenant: {tenant_id}. Ancestor timeline: '{ancestor_branch_name}'",
+                output.timeline_info.timeline_id, output.timeline_info.last_record_lsn
             );
         }
     }
@@ -1970,124 +1940,7 @@ fn resolve_branch_endpoint(
     Ok(matches.remove(0))
 }
 
-struct BranchEndpointRef {
-    endpoint_id: String,
-    branch_name: String,
-    connstr: String,
-    fdw_host: String,
-    fdw_port: u16,
-    user: String,
-    password: Option<String>,
-    database: String,
-}
-
-impl BranchEndpointRef {
-    fn from_local(
-        endpoint_id: String,
-        endpoint: Arc<Endpoint>,
-        branch_name: String,
-        user: &str,
-        database: &str,
-    ) -> Self {
-        Self {
-            endpoint_id,
-            branch_name,
-            connstr: endpoint.connstr(user, database),
-            fdw_host: endpoint.pg_address.ip().to_string(),
-            fdw_port: endpoint.pg_address.port(),
-            user: user.to_string(),
-            password: None,
-            database: database.to_string(),
-        }
-    }
-
-    fn from_connstr(
-        connstr: &str,
-        branch_name: Option<&String>,
-        fallback_name: &str,
-        fallback_user: &str,
-        fallback_database: &str,
-    ) -> Result<Self> {
-        let (fdw_host, fdw_port, user, password, database) =
-            parse_external_connstr(connstr, fallback_user, fallback_database)?;
-        let branch_name = branch_name
-            .cloned()
-            .unwrap_or_else(|| fallback_name.to_string());
-
-        Ok(Self {
-            endpoint_id: connstr.to_string(),
-            branch_name,
-            connstr: connstr.to_string(),
-            fdw_host,
-            fdw_port,
-            user,
-            password,
-            database,
-        })
-    }
-}
-
-fn parse_external_connstr(
-    connstr: &str,
-    fallback_user: &str,
-    fallback_database: &str,
-) -> Result<(String, u16, String, Option<String>, String)> {
-    if connstr.starts_with("postgresql://") || connstr.starts_with("postgres://") {
-        let url = Url::parse(connstr).context("invalid endpoint connection string")?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow!("endpoint connection string must include host"))?
-            .to_string();
-        let port = url.port().unwrap_or(5432);
-        let user = if url.username().is_empty() {
-            fallback_user.to_string()
-        } else {
-            url.username().to_string()
-        };
-        let password = url
-            .password()
-            .map(urlencoding::decode)
-            .transpose()
-            .context("invalid percent-encoding in endpoint password")?
-            .map(Cow::into_owned);
-        let database = url.path().trim_start_matches('/');
-        let database = if database.is_empty() {
-            fallback_database.to_string()
-        } else {
-            database.to_string()
-        };
-        return Ok((host, port, user, password, database));
-    }
-
-    let mut host = None;
-    let mut port = None;
-    let mut user = None;
-    let mut password = None;
-    let mut database = None;
-    for part in connstr.split_whitespace() {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        let value = value.trim_matches('\'').trim_matches('"');
-        match key {
-            "host" => host = Some(value.to_string()),
-            "port" => port = Some(value.parse::<u16>().context("invalid connstr port")?),
-            "user" => user = Some(value.to_string()),
-            "password" => password = Some(value.to_string()),
-            "dbname" | "database" => database = Some(value.to_string()),
-            _ => {}
-        }
-    }
-
-    let host = host.ok_or_else(|| anyhow!("endpoint connection string must include host"))?;
-    Ok((
-        host,
-        port.unwrap_or(5432),
-        user.unwrap_or_else(|| fallback_user.to_string()),
-        password,
-        database.unwrap_or_else(|| fallback_database.to_string()),
-    ))
-}
+type BranchEndpointRef = branch_ops::BranchEndpointRef;
 
 fn require_branch_env<'a>(env: Option<&'a local_env::LocalEnv>) -> Result<&'a local_env::LocalEnv> {
     env.context("local branch endpoint mode requires an initialized NEON_REPO_DIR; use --source-connstr/--target-connstr for Docker endpoints")
@@ -2148,221 +2001,6 @@ fn resolve_branch_endpoint_ref(
     ))
 }
 
-async fn connect_to_branch_endpoint(
-    endpoint: &BranchEndpointRef,
-) -> Result<tokio_opengauss::Client> {
-    let (client, connection) = tokio_opengauss::connect(&endpoint.connstr, NoTls)
-        .await
-        .with_context(|| format!("failed to connect to endpoint at {}", endpoint.connstr))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
-    Ok(client)
-}
-
-async fn current_endpoint_lsn(client: &tokio_opengauss::Client) -> Result<String> {
-    let row = client
-        .query_one("SELECT pg_current_xlog_location()::text", &[])
-        .await
-        .context("failed to read endpoint current LSN")?;
-    Ok(row.get(0))
-}
-
-async fn lock_branch_fdw_workspace(client: &tokio_opengauss::Client) -> Result<()> {
-    client
-        .query_one(
-            "SELECT pg_advisory_lock(hashtext(current_database()), hashtext($1::text))",
-            &[&OGGIT_FDW_LOCK_NAME],
-        )
-        .await
-        .context("failed to lock the oggit FDW workspace")?;
-    Ok(())
-}
-
-struct SourceColumn {
-    name: String,
-    data_type: String,
-    not_null: bool,
-    default_expr: Option<String>,
-}
-
-struct SourceConstraint {
-    name: String,
-    definition: String,
-}
-
-struct SourceIndex {
-    definition: String,
-}
-
-fn quote_sql_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
-fn quote_sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-async fn import_branch_source_foreign_tables(
-    target_client: &mut tokio_opengauss::Client,
-    source_endpoint: &BranchEndpointRef,
-    source_schema: &str,
-    fdw_schema: &str,
-    fdw_server: &str,
-) -> Result<()> {
-    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
-    let rows = source_client
-        .query(
-            "SELECT c.relname::text,
-                    a.attname::text,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
-                    a.attnotnull
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN pg_attribute a ON a.attrelid = c.oid
-             WHERE n.nspname = $1
-               AND c.relkind = 'r'
-               AND a.attnum > 0
-               AND NOT a.attisdropped
-             ORDER BY c.relname, a.attnum",
-            &[&source_schema],
-        )
-        .await
-        .with_context(|| format!("failed to read source schema {source_schema} metadata"))?;
-
-    let mut tables: BTreeMap<String, Vec<SourceColumn>> = BTreeMap::new();
-    for row in rows {
-        let table_name: String = row.get(0);
-        tables.entry(table_name).or_default().push(SourceColumn {
-            name: row.get(1),
-            data_type: row.get(2),
-            not_null: row.get(3),
-            default_expr: None,
-        });
-    }
-
-    for (table_name, columns) in tables {
-        let column_defs = columns
-            .iter()
-            .map(|column| {
-                let not_null = if column.not_null { " NOT NULL" } else { "" };
-                format!(
-                    "{} {}{}",
-                    quote_sql_ident(&column.name),
-                    column.data_type,
-                    not_null
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let create_sql = format!(
-            "CREATE FOREIGN TABLE {}.{} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
-            quote_sql_ident(fdw_schema),
-            quote_sql_ident(&table_name),
-            column_defs,
-            quote_sql_ident(fdw_server),
-            quote_sql_literal(source_schema),
-            quote_sql_literal(&table_name)
-        );
-
-        target_client
-            .batch_execute(&create_sql)
-            .await
-            .with_context(|| format!("failed to create foreign table {fdw_schema}.{table_name}"))?;
-    }
-
-    Ok(())
-}
-
-async fn import_source_oggit_foreign_tables(
-    target_client: &mut tokio_opengauss::Client,
-    fdw_schema: &str,
-    fdw_server: &str,
-) -> Result<()> {
-    let table_defs = [
-        (
-            "oggit_state",
-            "state",
-            "id boolean,
-             tenant_id text,
-             timeline_id text,
-             ancestor_timeline_id text,
-             branch_start_lsn text,
-             slot_name text,
-             required_lsn text,
-             decode_lsn text,
-             scanned_lsn text,
-             confirmed_lsn text,
-             status text,
-             last_error text,
-             updated_at timestamptz",
-        ),
-        (
-            "oggit_change_log",
-            "change_log",
-            "id bigint,
-			 commit_lsn text,
-			 record_lsn text,
-			 xid text,
-			 merge_id uuid,
-			 ordinal integer,
-			 op text,
-             schema_name text,
-             table_name text,
-             relid oid,
-             identity_kind text,
-             key_json jsonb,
-             old_row jsonb,
-             new_row jsonb,
-             changed_cols text[],
-             unsupported_reason text,
-             created_at timestamptz",
-        ),
-        (
-            "oggit_object_change",
-            "object_change",
-            "id bigint,
-			 commit_lsn text,
-			 merge_id uuid,
-			 ordinal integer,
-             object_type text,
-             schema_name text,
-             object_name text,
-             action text,
-             change_json jsonb,
-             safety_class text,
-             unsupported_reason text,
-             created_at timestamptz",
-        ),
-    ];
-
-    for (foreign_name, remote_name, columns) in table_defs {
-        let create_sql = format!(
-            "CREATE FOREIGN TABLE {}.{} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
-            quote_sql_ident(fdw_schema),
-            quote_sql_ident(foreign_name),
-            columns,
-            quote_sql_ident(fdw_server),
-            quote_sql_literal("oggit"),
-            quote_sql_literal(remote_name)
-        );
-
-        target_client
-            .batch_execute(&create_sql)
-            .await
-            .with_context(|| {
-                format!("failed to create foreign table {fdw_schema}.{foreign_name}")
-            })?;
-    }
-
-    Ok(())
-}
-
 /// Build the compute-side oggit worker configuration for a Primary openGauss
 /// endpoint. Returns None for non-Primary endpoints or when gaussdb is not the
 /// backing binary. Inference of branch_start_lsn / ancestor_timeline_id mirrors
@@ -2371,6 +2009,7 @@ async fn build_oggit_endpoint_config(
     env: &local_env::LocalEnv,
     endpoint: &Endpoint,
     safekeepers: &[NodeId],
+    database: &str,
 ) -> Option<control_plane::endpoint::OggitEndpointConfig> {
     if !matches!(endpoint.mode, ComputeMode::Primary) {
         return None;
@@ -2423,324 +2062,24 @@ async fn build_oggit_endpoint_config(
         timeline_id: timeline_id.to_string(),
         ancestor_timeline_id,
         branch_start_lsn,
-        slot_name: "neon_oggit_slot".to_string(),
-        database: "postgres".to_string(),
+        database: database.to_string(),
         safekeeper_http_urls,
     })
 }
 
-async fn read_database_compatibility(client: &tokio_opengauss::Client) -> Result<String> {
-    let row = client
-        .query_one(
-            "SELECT datcompatibility::text
-             FROM pg_database
-             WHERE datname = current_database()",
-            &[],
-        )
-        .await
-        .context("failed to read database compatibility")?;
-    Ok(row.get(0))
-}
-
-async fn ensure_branch_database_compatibility(
-    target_client: &tokio_opengauss::Client,
-    source_endpoint: &BranchEndpointRef,
-) -> Result<()> {
-    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
-    let source_compatibility = read_database_compatibility(&source_client)
-        .await
-        .context("failed to read source database compatibility")?;
-    let target_compatibility = read_database_compatibility(target_client)
-        .await
-        .context("failed to read target database compatibility")?;
-
-    if source_compatibility != target_compatibility {
-        bail!(
-            "database compatibility mismatch: source database {} is {}, target database is {}",
-            source_endpoint.database,
-            source_compatibility,
-            target_compatibility,
-        );
+fn branch_output_print(output: BranchCommandOutput) {
+    for line in output.lines {
+        println!("{line}");
     }
-
-    Ok(())
 }
 
-async fn list_schema_tables(
-    client: &tokio_opengauss::Client,
-    schema: &str,
-) -> Result<BTreeSet<String>> {
-    let rows = client
-        .query(
-            "SELECT c.relname::text
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = $1
-               AND c.relkind = 'r'
-             ORDER BY c.relname",
-            &[&schema],
-        )
-        .await
-        .with_context(|| format!("failed to list tables in schema {schema}"))?;
-
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
-}
-
-async fn load_source_columns(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    table_name: &str,
-) -> Result<Vec<SourceColumn>> {
-    let rows = source_client
-        .query(
-            "SELECT a.attname::text,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
-                    a.attnotnull,
-                    pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN pg_attribute a ON a.attrelid = c.oid
-             LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
-             WHERE n.nspname = $1
-               AND c.relname = $2
-               AND c.relkind = 'r'
-               AND a.attnum > 0
-               AND NOT a.attisdropped
-             ORDER BY a.attnum",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| format!("failed to read columns for {source_schema}.{table_name}"))?;
-
-    if rows.is_empty() {
-        bail!("source table {source_schema}.{table_name} does not exist or has no columns");
+fn local_branch_strategy(strategy: BranchMergeStrategy) -> control_plane::BranchMergeStrategy {
+    match strategy {
+        BranchMergeStrategy::Fail => control_plane::BranchMergeStrategy::Fail,
+        BranchMergeStrategy::Ours => control_plane::BranchMergeStrategy::Ours,
+        BranchMergeStrategy::Theirs => control_plane::BranchMergeStrategy::Theirs,
+        BranchMergeStrategy::Manual => control_plane::BranchMergeStrategy::Manual,
     }
-
-    Ok(rows
-        .into_iter()
-        .map(|row| SourceColumn {
-            name: row.get(0),
-            data_type: row.get(1),
-            not_null: row.get(2),
-            default_expr: row.get(3),
-        })
-        .collect())
-}
-
-async fn load_source_constraints(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    table_name: &str,
-) -> Result<Vec<SourceConstraint>> {
-    let rows = source_client
-        .query(
-            "SELECT con.conname::text,
-                    pg_catalog.pg_get_constraintdef(con.oid, true)::text
-             FROM pg_constraint con
-             JOIN pg_class c ON c.oid = con.conrelid
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = $1
-               AND c.relname = $2
-               AND con.contype IN ('p', 'u', 'c')
-             ORDER BY CASE con.contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 ELSE 2 END,
-                      con.conname",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| format!("failed to read constraints for {source_schema}.{table_name}"))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| SourceConstraint {
-            name: row.get(0),
-            definition: row.get(1),
-        })
-        .collect())
-}
-
-async fn reject_unsupported_source_schema_objects(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-) -> Result<()> {
-    let rows = source_client
-        .query(
-            "SELECT object_name, feature
-             FROM (
-                 SELECT c.relname::text AS object_name,
-                        CASE c.relkind
-                            WHEN 'v' THEN 'views'
-                            WHEN 'm' THEN 'materialized views'
-                            WHEN 'S' THEN 'sequences'
-                            WHEN 'f' THEN 'foreign tables'
-                            ELSE 'non-regular relations'
-                        END AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relkind IN ('v', 'm', 'S', 'f')
-
-                 UNION ALL
-
-                 SELECT p.proname::text AS object_name,
-                        'functions or procedures'::text AS feature
-                 FROM pg_proc p
-                 JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname = $1
-             ) unsupported
-             ORDER BY feature, object_name",
-            &[&source_schema],
-        )
-        .await
-        .with_context(|| {
-            format!("failed to inspect unsupported objects in schema {source_schema}")
-        })?;
-
-    let objects = rows
-        .into_iter()
-        .map(|row| {
-            let object_name: String = row.get(0);
-            let feature: String = row.get(1);
-            format!("{object_name} ({feature})")
-        })
-        .collect::<Vec<_>>();
-
-    if !objects.is_empty() {
-        bail!(
-            "source schema {source_schema} contains unsupported objects: {}",
-            objects.join(", ")
-        );
-    }
-
-    Ok(())
-}
-
-async fn reject_unsupported_source_table_features(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    table_name: &str,
-) -> Result<()> {
-    let rows = source_client
-        .query(
-            "SELECT feature
-             FROM (
-                 SELECT 'foreign key constraints'::text AS feature
-                 FROM pg_constraint con
-                 JOIN pg_class c ON c.oid = con.conrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND con.contype = 'f'
-
-                 UNION ALL
-
-                 SELECT 'sequence or auto-increment defaults'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_attribute a ON a.attrelid = c.oid
-                 JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND c.relkind = 'r'
-                   AND pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%'
-
-                 UNION ALL
-
-                 SELECT 'table or column comments'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND (
-                       pg_catalog.obj_description(c.oid, 'pg_class') IS NOT NULL
-                       OR EXISTS (
-                           SELECT 1
-                           FROM pg_attribute a
-                           WHERE a.attrelid = c.oid
-                             AND a.attnum > 0
-                             AND NOT a.attisdropped
-                             AND pg_catalog.col_description(c.oid, a.attnum) IS NOT NULL
-                       )
-                   )
-
-                 UNION ALL
-
-                 SELECT 'owner or explicit privileges'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND (
-                       pg_catalog.pg_get_userbyid(c.relowner) <> current_user
-                       OR c.relacl IS NOT NULL
-                   )
-
-                 UNION ALL
-
-                 SELECT 'partitioned tables'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND EXISTS (
-                       SELECT 1
-                       FROM pg_partition p
-                       WHERE p.parentid = c.oid
-                          OR p.oid = c.oid
-                   )
-
-                 UNION ALL
-
-                 SELECT 'triggers'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_trigger t ON t.tgrelid = c.oid
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND NOT t.tgisinternal
-
-                 UNION ALL
-
-                 SELECT 'tablespace settings'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND c.reltablespace <> 0
-
-                 UNION ALL
-
-                 SELECT 'storage parameters'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND EXISTS (
-                       SELECT 1
-                       FROM unnest(c.reloptions) AS opt
-                       WHERE opt NOT IN ('orientation=row', 'compression=no')
-                         AND opt NOT LIKE 'collate=%'
-                   )
-             ) unsupported
-             ORDER BY feature",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| {
-            format!("failed to inspect unsupported features for {source_schema}.{table_name}")
-        })?;
-
-    let features = rows
-        .into_iter()
-        .map(|row| row.get::<_, String>(0))
-        .collect::<Vec<_>>();
-    if !features.is_empty() {
-        bail!(
-            "source-only table {source_schema}.{table_name} uses unsupported features: {}",
-            features.join(", ")
-        );
-    }
-
-    Ok(())
 }
 
 fn retarget_index_definition(
