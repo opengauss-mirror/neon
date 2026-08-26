@@ -19,6 +19,8 @@ use safekeeper_client::mgmt_api;
 use thiserror::Error;
 use utils::auth::{Claims, Scope};
 use utils::id::NodeId;
+use utils::id::{TenantId, TimelineId};
+use utils::lsn::Lsn;
 
 use crate::background_process;
 use crate::local_env::{LocalEnv, SafekeeperConf};
@@ -277,6 +279,19 @@ impl SafekeeperNode {
     pub async fn create_timeline(&self, req: &TimelineCreateRequest) -> Result<()> {
         self.http_client
             .create_timeline(req)
+            .await
+            .map_err(err_from_client_err)?;
+        Ok(())
+    }
+
+    pub async fn update_oggit_required_lsn(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        oggit_required_lsn: Lsn,
+    ) -> Result<()> {
+        self.http_client
+            .update_oggit_required_lsn(tenant_id, timeline_id, oggit_required_lsn)
             .await
             .map_err(err_from_client_err)?;
         Ok(())

@@ -33,8 +33,13 @@ fi
 
 gs_ctl start -D "${PGDATA}" -w -t 60 -l /tmp/storage_controller_db.log
 
-if ! gsql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
-  gsql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d postgres -c "CREATE DATABASE ${DB_NAME}"
+maintenance_db=postgres
+if ! gsql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d "${maintenance_db}" -tAc "SELECT 1" >/dev/null 2>&1; then
+  maintenance_db="${DB_USER}"
+fi
+
+if ! gsql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d "${maintenance_db}" -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
+  gsql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d "${maintenance_db}" -c "CREATE DATABASE ${DB_NAME}"
 fi
 
 trap 'gs_ctl stop -D "${PGDATA}" -m fast' TERM INT
