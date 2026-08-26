@@ -838,3 +838,877 @@ fn oggit_event_order(commit_lsn: &str, ordinal: i32, id: i64) -> (u128, i32, i64
 
 #[derive(Clone)]
 struct OggitState {
+    timeline_id: String,
+    ancestor_timeline_id: Option<String>,
+    branch_start_lsn: String,
+    decode_lsn: String,
+    scanned_lsn: String,
+    status: String,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct OggitChange {
+    id: i64,
+    commit_lsn: String,
+    ordinal: i32,
+    op: String,
+    schema_name: String,
+    table_name: String,
+    identity_kind: String,
+    key_json: Option<JsonValue>,
+    old_row: Option<JsonValue>,
+    new_row: Option<JsonValue>,
+    changed_cols: Vec<String>,
+    unsupported_reason: Option<String>,
+}
+
+#[derive(Clone)]
+struct OggitObjectChange {
+    id: i64,
+    commit_lsn: String,
+    ordinal: i32,
+    object_type: String,
+    schema_name: Option<String>,
+    object_name: Option<String>,
+    change_json: JsonValue,
+    safety_class: String,
+    unsupported_reason: Option<String>,
+}
+
+#[derive(Clone)]
+struct OggitDelta {
+    schema_name: String,
+    table_name: String,
+    identity_kind: String,
+    key_json: Option<JsonValue>,
+    final_op: String,
+    old_row: Option<JsonValue>,
+    new_row: Option<JsonValue>,
+    changed_cols: Vec<String>,
+    unsupported_reason: Option<String>,
+    first_commit_lsn: String,
+    first_ordinal: i32,
+    first_id: i64,
+    segment_id: i64,
+}
+
+#[derive(Clone)]
+enum OggitPlanEvent {
+    Object {
+        segment_id: i64,
+        change: OggitObjectChange,
+    },
+    Dml(OggitDelta),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct OggitOrderKey {
+    lsn: u128,
+    ordinal: i32,
+    id: i64,
+}
+
+#[derive(Clone)]
+enum OggitContinuePlanEvent {
+    Object {
+        order: OggitOrderKey,
+        change: OggitObjectChange,
+        conflict: Option<OggitConflict>,
+    },
+    Dml {
+        order: OggitOrderKey,
+        delta: OggitDelta,
+        conflict: Option<OggitConflict>,
+    },
+}
+
+impl OggitPlanEvent {
+    fn order(&self) -> (i64, u128, i32, i64) {
+        match self {
+            Self::Object { segment_id, change } => {
+                let (lsn, ordinal, id) =
+                    oggit_event_order(&change.commit_lsn, change.ordinal, change.id);
+                (*segment_id, lsn, ordinal, id)
+            }
+            Self::Dml(delta) => {
+                let (lsn, ordinal, id) =
+                    oggit_event_order(&delta.first_commit_lsn, delta.first_ordinal, delta.first_id);
+                (delta.segment_id, lsn, ordinal, id)
+            }
+        }
+    }
+}
+
+impl OggitContinuePlanEvent {
+    fn order(&self) -> OggitOrderKey {
+        match self {
+            Self::Object { order, .. } | Self::Dml { order, .. } => *order,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct OggitDiffRow {
+    pub(crate) diff_scope: String,
+    pub(crate) schema_name: String,
+    pub(crate) table_name: String,
+    pub(crate) key_json: Option<JsonValue>,
+    pub(crate) diff_type: String,
+    pub(crate) ours_json: Option<JsonValue>,
+    pub(crate) theirs_json: Option<JsonValue>,
+    pub(crate) detail: Option<String>,
+}
+
+pub(crate) struct OggitDiffResult {
+    pub(crate) base_lsn: String,
+    pub(crate) child_to_lsn: String,
+    pub(crate) parent_to_lsn: String,
+    pub(crate) rows: Vec<OggitDiffRow>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OggitMergeDirection {
+    ChildToParent,
+    ParentToChild,
+}
+
+impl OggitMergeDirection {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ChildToParent => "child_to_parent",
+            Self::ParentToChild => "parent_to_child",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "child_to_parent" => Ok(Self::ChildToParent),
+            "parent_to_child" => Ok(Self::ParentToChild),
+            other => bail!("unsupported oggit merge direction {other}"),
+        }
+    }
+}
+
+struct OggitMergeBounds {
+    child_state: OggitState,
+    parent_state: OggitState,
+    direction: OggitMergeDirection,
+    base_lsn: String,
+    child_from_lsn: String,
+    child_to_lsn: String,
+    parent_from_lsn: String,
+    parent_to_lsn: String,
+}
+
+impl OggitMergeBounds {
+    fn source_state(&self) -> &OggitState {
+        match self.direction {
+            OggitMergeDirection::ChildToParent => &self.child_state,
+            OggitMergeDirection::ParentToChild => &self.parent_state,
+        }
+    }
+
+    fn target_state(&self) -> &OggitState {
+        match self.direction {
+            OggitMergeDirection::ChildToParent => &self.parent_state,
+            OggitMergeDirection::ParentToChild => &self.child_state,
+        }
+    }
+
+    fn source_from_lsn(&self) -> &str {
+        match self.direction {
+            OggitMergeDirection::ChildToParent => &self.child_from_lsn,
+            OggitMergeDirection::ParentToChild => &self.parent_from_lsn,
+        }
+    }
+
+    fn source_to_lsn(&self) -> &str {
+        match self.direction {
+            OggitMergeDirection::ChildToParent => &self.child_to_lsn,
+            OggitMergeDirection::ParentToChild => &self.parent_to_lsn,
+        }
+    }
+
+    fn target_from_lsn(&self) -> &str {
+        match self.direction {
+            OggitMergeDirection::ChildToParent => &self.parent_from_lsn,
+            OggitMergeDirection::ParentToChild => &self.child_from_lsn,
+        }
+    }
+
+    fn target_to_lsn(&self) -> &str {
+        match self.direction {
+            OggitMergeDirection::ChildToParent => &self.parent_to_lsn,
+            OggitMergeDirection::ParentToChild => &self.child_to_lsn,
+        }
+    }
+}
+
+struct OggitAppliedMergeBounds {
+    child_from_lsn: String,
+    parent_from_lsn: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct OggitMergeResult {
+    pub(crate) merge_id: String,
+    pub(crate) status: String,
+    pub(crate) conflict_count: i64,
+    pub(crate) applied_count: i64,
+    pub(crate) skipped_details: Vec<String>,
+}
+
+struct OggitApplyResult {
+    status: String,
+    generated_key: Option<JsonValue>,
+}
+
+impl OggitApplyResult {
+    fn new(status: &str) -> Self {
+        Self {
+            status: status.to_string(),
+            generated_key: None,
+        }
+    }
+
+    fn with_generated_key(status: &str, generated_key: JsonValue) -> Self {
+        Self {
+            status: status.to_string(),
+            generated_key: Some(generated_key),
+        }
+    }
+}
+
+pub(crate) struct OggitMergeHistory {
+    pub(crate) merge_id: String,
+    pub(crate) child_timeline_id: String,
+    pub(crate) parent_timeline_id: String,
+    pub(crate) base_lsn: String,
+    child_from_lsn: String,
+    pub(crate) child_to_lsn: String,
+    parent_from_lsn: String,
+    pub(crate) parent_to_lsn: String,
+    pub(crate) strategy: String,
+    pub(crate) status: String,
+    pub(crate) conflict_count: i64,
+    child_meta_schema: String,
+    pub(crate) merge_direction: OggitMergeDirection,
+}
+
+impl OggitMergeHistory {
+    fn source_from_lsn(&self) -> &str {
+        match self.merge_direction {
+            OggitMergeDirection::ChildToParent => &self.child_from_lsn,
+            OggitMergeDirection::ParentToChild => &self.parent_from_lsn,
+        }
+    }
+
+    fn source_to_lsn(&self) -> &str {
+        match self.merge_direction {
+            OggitMergeDirection::ChildToParent => &self.child_to_lsn,
+            OggitMergeDirection::ParentToChild => &self.parent_to_lsn,
+        }
+    }
+
+    fn target_from_lsn(&self) -> &str {
+        match self.merge_direction {
+            OggitMergeDirection::ChildToParent => &self.parent_from_lsn,
+            OggitMergeDirection::ParentToChild => &self.child_from_lsn,
+        }
+    }
+
+    fn target_to_lsn(&self) -> &str {
+        match self.merge_direction {
+            OggitMergeDirection::ChildToParent => &self.parent_to_lsn,
+            OggitMergeDirection::ParentToChild => &self.child_to_lsn,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct OggitConflict {
+    pub(crate) conflict_id: i64,
+    pub(crate) conflict_scope: String,
+    pub(crate) conflict_type: String,
+    pub(crate) schema_name: Option<String>,
+    pub(crate) table_name: Option<String>,
+    pub(crate) object_name: Option<String>,
+    theirs_op: Option<String>,
+    pub(crate) key_json: Option<JsonValue>,
+    pub(crate) ours_json: Option<JsonValue>,
+    pub(crate) theirs_json: Option<JsonValue>,
+    pub(crate) reason: String,
+    pub(crate) resolution: Option<String>,
+    custom_sql: Option<String>,
+    pub(crate) status: String,
+}
+
+async fn oggit_meta_table_name(
+    client: &tokio_opengauss::Client,
+    meta_schema: &str,
+    base_name: &str,
+) -> Result<String> {
+    let rows = client
+        .query(
+            "SELECT c.relname
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = $1
+                AND c.relname IN ($2, $3)
+                AND c.relkind IN ('r', 'f', 'v')
+              ORDER BY CASE WHEN c.relname = $2 THEN 0 ELSE 1 END
+              LIMIT 1",
+            &[&meta_schema, &base_name, &format!("oggit_{base_name}")],
+        )
+        .await
+        .with_context(|| {
+            format!("failed to find oggit metadata table {meta_schema}.{base_name}")
+        })?;
+
+    rows.first()
+        .map(|row| row.get::<_, String>(0))
+        .with_context(|| format!("oggit metadata table {meta_schema}.{base_name} not found"))
+}
+
+// Legacy in-Rust event persistence. Superseded by the compute-side oggit
+// bgworker (pgxn/neon/oggit_worker.c), which decodes and persists events inside
+// compute. Kept only for reference; not referenced by the CLI anymore.
+#[allow(dead_code)]
+async fn oggit_record_event(
+    client: &tokio_opengauss::Client,
+    event: &JsonValue,
+    ordinal: i32,
+) -> Result<()> {
+    let event_kind = event.get("event").and_then(JsonValue::as_str);
+    let commit_lsn = oggit_event_lsn(event);
+
+    match event_kind {
+        Some("change") => {
+            if event
+                .get("schema")
+                .and_then(JsonValue::as_str)
+                .is_some_and(oggit_is_internal_schema)
+            {
+                return Ok(());
+            }
+
+            let key_payload = oggit_tuple_payload_to_json(event.get("key"));
+            let identity = if key_payload.as_object().is_some_and(|map| !map.is_empty()) {
+                "primary_key"
+            } else if event.get("old_row").is_some() || event.get("new_row").is_some() {
+                "replica_identity_full"
+            } else {
+                "unsupported"
+            };
+            let key_json = if key_payload.as_object().is_some_and(|map| map.is_empty()) {
+                None
+            } else {
+                Some(key_payload)
+            };
+            let old_row = oggit_tuple_payload_to_json(event.get("old_row"));
+            let old_row = if old_row.as_object().is_some_and(|map| map.is_empty()) {
+                None
+            } else {
+                Some(old_row)
+            };
+            let new_row = oggit_tuple_payload_to_json(event.get("new_row"));
+            let new_row = if new_row.as_object().is_some_and(|map| map.is_empty()) {
+                None
+            } else {
+                Some(new_row)
+            };
+            let changed_cols = if event.get("op").and_then(JsonValue::as_str) == Some("INSERT") {
+                oggit_tuple_payload_nonkey_columns(event.get("new_row"))
+            } else {
+                oggit_json_array_to_text_vec(event.get("changed_cols"))
+            };
+            let unsupported_reason = (identity == "unsupported")
+                .then(|| "no usable row identity in decoded event".to_string());
+            let relid = event
+                .get("relid")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let key_json_text = key_json.as_ref().map(JsonValue::to_string);
+            let old_row_text = old_row.as_ref().map(JsonValue::to_string);
+            let new_row_text = new_row.as_ref().map(JsonValue::to_string);
+
+            client
+                .execute(
+                    "INSERT INTO oggit.change_log (
+                        commit_lsn, record_lsn, xid, ordinal, op, schema_name, table_name,
+                        relid, identity_kind, key_json, old_row, new_row, changed_cols,
+                        unsupported_reason
+                     )
+                     VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')::oid, $9,
+                        $10::text::jsonb, $11::text::jsonb, $12::text::jsonb, $13, $14
+                     )",
+                    &[
+                        &commit_lsn,
+                        &event
+                            .get("change_lsn")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        &event
+                            .get("xid")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        &ordinal,
+                        &event
+                            .get("op")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("UNSUPPORTED"),
+                        &event
+                            .get("schema")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        &event
+                            .get("table")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        &relid,
+                        &identity,
+                        &key_json_text,
+                        &old_row_text,
+                        &new_row_text,
+                        &changed_cols,
+                        &unsupported_reason,
+                    ],
+                )
+                .await
+                .context("failed to insert oggit.change_log")?;
+        }
+        Some("truncate") => {
+            let relation = event
+                .get("relations")
+                .and_then(JsonValue::as_array)
+                .and_then(|relations| {
+                    relations.iter().find(|relation| {
+                        relation
+                            .get("schema")
+                            .and_then(JsonValue::as_str)
+                            .is_some_and(|schema| !oggit_is_internal_schema(schema))
+                    })
+                });
+            let Some(relation) = relation else {
+                return Ok(());
+            };
+
+            let mut change_json = event.clone();
+            if let Some(sql) = oggit_truncate_replay_sql(&change_json) {
+                if let Some(map) = change_json.as_object_mut() {
+                    map.insert("sql".to_string(), JsonValue::String(sql));
+                }
+            }
+            let change_json_text = change_json.to_string();
+            client
+                .execute(
+                    "INSERT INTO oggit.object_change (
+                        commit_lsn, ordinal, object_type, schema_name, object_name,
+                        action, change_json, safety_class
+                     )
+                     VALUES ($1, $2, 'TRUNCATE', $3, $4, 'TRUNCATE', $5::text::jsonb, 'destructive')",
+                    &[
+                        &commit_lsn,
+                        &ordinal,
+                        &relation
+                            .get("schema")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        &relation
+                            .get("table")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        &change_json_text,
+                    ],
+                )
+                .await
+                .context("failed to insert oggit truncate object_change")?;
+        }
+        Some("ddl") => {
+            let ddl_payload = event
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .and_then(|message| serde_json::from_str::<JsonValue>(message).ok())
+                .unwrap_or_else(oggit_empty_object);
+            let raw_type = ddl_payload
+                .get("objtype")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("OTHER")
+                .to_uppercase();
+            let message = event
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let sql_text = event.get("sql").and_then(JsonValue::as_str).unwrap_or("");
+            let ddl_text = if sql_text.is_empty() {
+                message.to_string()
+            } else {
+                format!("{message} {sql_text}")
+            };
+            let upper_message = ddl_text.to_uppercase();
+            let rename_column = upper_message.contains("RENAME COLUMN");
+            let rename_table =
+                upper_message.contains("ALTER TABLE") && upper_message.contains(" RENAME TO ");
+            let add_column = upper_message.contains("ADD COLUMN");
+            let create_index = upper_message.contains("INDEX") && upper_message.contains(" ON ");
+            let object_type = if rename_column || add_column {
+                "COLUMN"
+            } else if create_index {
+                "INDEX"
+            } else {
+                match raw_type.as_str() {
+                    "TABLE" => "TABLE",
+                    "COLUMN" => "COLUMN",
+                    "INDEX" => "INDEX",
+                    "CONSTRAINT" | "TABLE CONSTRAINT" => "CONSTRAINT",
+                    "SEQUENCE" | "LARGE SEQUENCE" => "SEQUENCE",
+                    "TRIGGER" => "TRIGGER",
+                    "FUNCTION" => "FUNCTION",
+                    "VIEW" => "VIEW",
+                    "RULE" => "RULE",
+                    _ if upper_message.contains("SEQUENCE") => "SEQUENCE",
+                    _ if upper_message.contains("RULE") => "RULE",
+                    _ if upper_message.contains("ADD CONSTRAINT")
+                        || upper_message.contains("CHECK")
+                        || upper_message.contains("FOREIGN KEY") =>
+                    {
+                        "CONSTRAINT"
+                    }
+                    _ if upper_message.contains("TABLE") => "TABLE",
+                    _ => "OTHER",
+                }
+            };
+            let cmdtype = event
+                .get("cmdtype")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("DDL");
+            let safety_class = if cmdtype.to_lowercase().contains("drop")
+                || upper_message.contains("DROP ")
+            {
+                "destructive"
+            } else if (matches!(cmdtype, "table_alter") || upper_message.contains("ALTER TABLE"))
+                && (upper_message.contains("ADD CONSTRAINT")
+                    || upper_message.contains("CHECK")
+                    || upper_message.contains("FOREIGN KEY")
+                    || upper_message.contains("SET NOT NULL"))
+            {
+                "requires_validation"
+            } else if rename_column
+                || rename_table
+                || ((matches!(cmdtype, "table_alter") || upper_message.contains("ALTER TABLE"))
+                    && upper_message.contains("ALTER COLUMN")
+                    && (upper_message.contains(" TYPE ")
+                        || upper_message.contains("SET DATA TYPE")))
+            {
+                "semantic"
+            } else if matches!(object_type, "COLUMN" | "INDEX")
+                && (matches!(cmdtype, "table_alter" | "object_create")
+                    || add_column
+                    || create_index)
+                && !upper_message.contains("NOT NULL")
+                && !upper_message.contains("UNIQUE")
+                && !upper_message.contains("CHECK")
+                && !upper_message.contains("FOREIGN KEY")
+            {
+                "safe_additive"
+            } else if matches!(object_type, "SEQUENCE" | "TRIGGER" | "FUNCTION" | "VIEW") {
+                "semantic"
+            } else if object_type == "CONSTRAINT" {
+                "requires_validation"
+            } else {
+                "unsupported"
+            };
+            let unsupported_reason = (safety_class == "unsupported")
+                .then(|| "DDL is not supported by object-level merge".to_string());
+            let object_schema = ddl_payload
+                .pointer("/identity/schemaname")
+                .and_then(JsonValue::as_str)
+                .or_else(|| {
+                    ddl_payload
+                        .pointer("/table/schemaname")
+                        .and_then(JsonValue::as_str)
+                })
+                .map(str::to_string);
+            let object_name = if object_type == "COLUMN" {
+                ddl_payload.get("colname").and_then(JsonValue::as_str)
+            } else {
+                None
+            }
+            .or_else(|| {
+                ddl_payload
+                    .pointer("/identity/objname")
+                    .and_then(JsonValue::as_str)
+            })
+            .or_else(|| ddl_payload.get("name").and_then(JsonValue::as_str))
+            .or_else(|| ddl_payload.get("objidentity").and_then(JsonValue::as_str))
+            .map(str::to_string);
+            let objidentity = ddl_payload
+                .get("objidentity")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            let (object_schema, object_name) = if object_type == "RULE" {
+                oggit_rule_target_from_text(message)
+                    .or_else(|| oggit_rule_target_from_text(objidentity))
+                    .unwrap_or((object_schema, object_name.unwrap_or_default()))
+            } else {
+                (object_schema, object_name.unwrap_or_default())
+            };
+            let object_name = Some(object_name);
+            if object_schema
+                .as_deref()
+                .is_some_and(oggit_is_internal_schema)
+                || (object_schema.is_none()
+                    && object_name.as_deref().is_some_and(oggit_is_internal_schema))
+            {
+                return Ok(());
+            }
+
+            let change_json_text = event.to_string();
+
+            client
+                .execute(
+                    "INSERT INTO oggit.object_change (
+                        commit_lsn, ordinal, object_type, schema_name, object_name,
+                        action, change_json, safety_class, unsupported_reason
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9)",
+                    &[
+                        &commit_lsn,
+                        &ordinal,
+                        &object_type,
+                        &object_schema,
+                        &object_name,
+                        &cmdtype,
+                        &change_json_text,
+                        &safety_class,
+                        &unsupported_reason,
+                    ],
+                )
+                .await
+                .context("failed to insert oggit ddl object_change")?;
+        }
+        Some("commit") => {
+            let confirmed_lsn = event
+                .get("callback_commit_lsn")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&commit_lsn)
+                .to_string();
+            client
+                .execute(
+                    "UPDATE oggit.state
+                        SET decode_lsn = $1,
+                            confirmed_lsn = $2,
+                            updated_at = now()
+                      WHERE id",
+                    &[&commit_lsn, &confirmed_lsn],
+                )
+                .await
+                .context("failed to update oggit.state commit progress")?;
+        }
+        _ => {
+            let change_json_text = event.to_string();
+            let action = event_kind.unwrap_or("unknown");
+            client
+                .execute(
+                    "INSERT INTO oggit.object_change (
+                        commit_lsn, ordinal, object_type, action, change_json,
+                        safety_class, unsupported_reason
+                     )
+                     VALUES ($1, $2, 'OTHER', $3, $4::text::jsonb, 'unsupported', 'unknown neon_oggit event')",
+                    &[&commit_lsn, &ordinal, &action, &change_json_text],
+                )
+                .await
+                .context("failed to insert oggit unsupported object_change")?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn oggit_read_state(
+    client: &tokio_opengauss::Client,
+    meta_schema: &str,
+) -> Result<OggitState> {
+    let relname = oggit_meta_table_name(client, meta_schema, "state").await?;
+    let sql = format!(
+        "SELECT tenant_id, timeline_id, ancestor_timeline_id, branch_start_lsn,
+                required_lsn, decode_lsn, scanned_lsn, confirmed_lsn, status, last_error
+           FROM {}.{}
+          WHERE id",
+        quote_sql_ident(meta_schema),
+        quote_sql_ident(&relname)
+    );
+    let row = client
+        .query_opt(sql.as_str(), &[])
+        .await
+        .with_context(|| format!("failed to read oggit state from {meta_schema}.{relname}"))?
+        .with_context(|| format!("oggit state not found in schema {meta_schema}"))?;
+
+    Ok(OggitState {
+        timeline_id: row.get(1),
+        ancestor_timeline_id: row.get(2),
+        branch_start_lsn: row.get(3),
+        decode_lsn: row.get(5),
+        scanned_lsn: row.get(6),
+        status: row.get(8),
+        last_error: row.get(9),
+    })
+}
+
+async fn oggit_read_change_log(
+    client: &tokio_opengauss::Client,
+    meta_schema: &str,
+    from_lsn: &str,
+    to_lsn: &str,
+    include_tables: Option<&[String]>,
+) -> Result<Vec<OggitChange>> {
+    let relname = oggit_meta_table_name(client, meta_schema, "change_log").await?;
+    let sql = format!(
+        "SELECT id, commit_lsn, ordinal, op, schema_name, table_name, identity_kind,
+                key_json::text, old_row::text, new_row::text, changed_cols, unsupported_reason
+           FROM {}.{}",
+        quote_sql_ident(meta_schema),
+        quote_sql_ident(&relname)
+    );
+    let include_tables = include_tables
+        .map(|tables| tables.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let from_value = oggit_lsn_value(from_lsn);
+    let to_value = oggit_lsn_value(to_lsn);
+    let mut changes = Vec::new();
+
+    for row in client
+        .query(sql.as_str(), &[])
+        .await
+        .with_context(|| format!("failed to read oggit change_log from {meta_schema}.{relname}"))?
+    {
+        let commit_lsn: String = row.get(1);
+        let table_name: Option<String> = row.get(5);
+        if oggit_lsn_value(&commit_lsn) <= from_value || oggit_lsn_value(&commit_lsn) > to_value {
+            continue;
+        }
+        let table_name = table_name.unwrap_or_default();
+        if !include_tables.is_empty() && !include_tables.contains(&table_name) {
+            continue;
+        }
+
+        changes.push(OggitChange {
+            id: row.get(0),
+            commit_lsn,
+            ordinal: row.get(2),
+            op: row.get(3),
+            schema_name: row.get::<_, Option<String>>(4).unwrap_or_default(),
+            table_name,
+            identity_kind: row.get(6),
+            key_json: oggit_parse_json_text(row.get(7))?,
+            old_row: oggit_parse_json_text(row.get(8))?,
+            new_row: oggit_parse_json_text(row.get(9))?,
+            changed_cols: row.get::<_, Option<Vec<String>>>(10).unwrap_or_default(),
+            unsupported_reason: row.get(11),
+        });
+    }
+
+    changes.sort_by_key(|change| {
+        (
+            oggit_lsn_value(&change.commit_lsn),
+            change.ordinal,
+            change.id,
+        )
+    });
+    Ok(changes)
+}
+
+async fn oggit_read_object_change(
+    client: &tokio_opengauss::Client,
+    meta_schema: &str,
+    from_lsn: &str,
+    to_lsn: &str,
+) -> Result<Vec<OggitObjectChange>> {
+    let relname = oggit_meta_table_name(client, meta_schema, "object_change").await?;
+    let sql = format!(
+        "SELECT id, commit_lsn, ordinal, object_type, schema_name, object_name,
+                action, change_json::text, safety_class, unsupported_reason
+           FROM {}.{}",
+        quote_sql_ident(meta_schema),
+        quote_sql_ident(&relname)
+    );
+    let from_value = oggit_lsn_value(from_lsn);
+    let to_value = oggit_lsn_value(to_lsn);
+    let mut changes = Vec::new();
+
+    for row in client.query(sql.as_str(), &[]).await.with_context(|| {
+        format!("failed to read oggit object_change from {meta_schema}.{relname}")
+    })? {
+        let commit_lsn: String = row.get(1);
+        if oggit_lsn_value(&commit_lsn) <= from_value || oggit_lsn_value(&commit_lsn) > to_value {
+            continue;
+        }
+        let change_json_text: Option<String> = row.get(7);
+        changes.push(OggitObjectChange {
+            id: row.get(0),
+            commit_lsn,
+            ordinal: row.get(2),
+            object_type: row.get(3),
+            schema_name: row.get(4),
+            object_name: row.get(5),
+            change_json: oggit_parse_json_text(change_json_text)?
+                .unwrap_or_else(oggit_empty_object),
+            safety_class: row.get(8),
+            unsupported_reason: row.get(9),
+        });
+    }
+
+    changes.sort_by_key(|change| {
+        (
+            oggit_lsn_value(&change.commit_lsn),
+            change.ordinal,
+            change.id,
+        )
+    });
+    Ok(changes)
+}
+
+async fn oggit_user_changes_after_planned_lsn(
+    client: &tokio_opengauss::Client,
+    planned_lsn: &str,
+    current_lsn: &str,
+) -> Result<Vec<String>> {
+    let planned_value = oggit_lsn_value(planned_lsn);
+    let mut changes = Vec::new();
+
+    for change in oggit_read_change_log(client, "oggit", planned_lsn, current_lsn, None).await? {
+        if oggit_lsn_value(&change.commit_lsn) <= planned_value
+            || oggit_is_internal_schema(&change.schema_name)
+        {
+            continue;
+        }
+        changes.push(format!(
+            "row {}.{} at {}",
+            change.schema_name, change.table_name, change.commit_lsn
+        ));
+    }
+
+    for object in oggit_read_object_change(client, "oggit", planned_lsn, current_lsn).await? {
+        if oggit_lsn_value(&object.commit_lsn) <= planned_value {
+            continue;
+        }
+        if oggit_object_change_is_internal(&object) {
+            continue;
+        }
+        if oggit_object_change_is_merge_barrier_ddl(&object) {
+            continue;
+        }
+        changes.push(format!(
+            "object {}.{} ({}) at {}",
+            object.schema_name.unwrap_or_default(),
+            object.object_name.unwrap_or_default(),
+            object.object_type,
+            object.commit_lsn
+        ));
+    }
+
+    Ok(changes)
+}
