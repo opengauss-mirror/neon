@@ -1712,3 +1712,801 @@ async fn oggit_user_changes_after_planned_lsn(
 
     Ok(changes)
 }
+
+async fn oggit_validate_merge_inputs(
+    client: &tokio_opengauss::Client,
+    source_meta_schema: &str,
+    from_lsn: Option<&str>,
+    source_to_lsn: Option<&str>,
+    target_to_lsn: Option<&str>,
+) -> Result<OggitMergeBounds> {
+    let source_state = oggit_read_state(client, source_meta_schema).await?;
+    if source_state.status != "active" {
+        bail!(
+            "source oggit worker is not active: {}, last_error={}",
+            source_state.status,
+            source_state.last_error.unwrap_or_default()
+        );
+    }
+
+    let target_state = oggit_read_state(client, "oggit").await?;
+    if target_state.status != "active" {
+        bail!(
+            "target oggit worker is not active: {}, last_error={}",
+            target_state.status,
+            target_state.last_error.unwrap_or_default()
+        );
+    }
+
+    let direction = if source_state.ancestor_timeline_id.as_deref()
+        == Some(target_state.timeline_id.as_str())
+    {
+        OggitMergeDirection::ChildToParent
+    } else if target_state.ancestor_timeline_id.as_deref()
+        == Some(source_state.timeline_id.as_str())
+    {
+        OggitMergeDirection::ParentToChild
+    } else {
+        bail!(
+            "source timeline {} and target timeline {} are not direct parent/child timelines (source ancestor: {}, target ancestor: {})",
+            source_state.timeline_id,
+            target_state.timeline_id,
+            source_state
+                .ancestor_timeline_id
+                .clone()
+                .unwrap_or_default(),
+            target_state
+                .ancestor_timeline_id
+                .clone()
+                .unwrap_or_default()
+        );
+    };
+
+    let source_timeline_id = source_state.timeline_id.clone();
+    let target_timeline_id = target_state.timeline_id.clone();
+    let (mut child_state, mut parent_state) = match direction {
+        OggitMergeDirection::ChildToParent => (source_state, target_state),
+        OggitMergeDirection::ParentToChild => (target_state, source_state),
+    };
+
+    let base_lsn = child_state.branch_start_lsn.clone();
+    let (child_to_lsn, parent_to_lsn) = match direction {
+        OggitMergeDirection::ChildToParent => (
+            source_to_lsn
+                .map(str::to_string)
+                .unwrap_or_else(|| child_state.decode_lsn.clone()),
+            target_to_lsn
+                .map(str::to_string)
+                .unwrap_or_else(|| parent_state.decode_lsn.clone()),
+        ),
+        OggitMergeDirection::ParentToChild => (
+            target_to_lsn
+                .map(str::to_string)
+                .unwrap_or_else(|| child_state.decode_lsn.clone()),
+            source_to_lsn
+                .map(str::to_string)
+                .unwrap_or_else(|| parent_state.decode_lsn.clone()),
+        ),
+    };
+
+    let (child_from_lsn, parent_from_lsn) = if let Some(from_lsn) = from_lsn {
+        (from_lsn.to_string(), from_lsn.to_string())
+    } else if let Some(previous) = oggit_find_latest_applied_merge_bounds(
+        client,
+        source_meta_schema,
+        &source_timeline_id,
+        &target_timeline_id,
+        &child_state.timeline_id,
+        &parent_state.timeline_id,
+        &child_to_lsn,
+        &parent_to_lsn,
+    )
+    .await?
+    {
+        (previous.child_from_lsn, previous.parent_from_lsn)
+    } else {
+        (base_lsn.clone(), base_lsn.clone())
+    };
+
+    if oggit_lsn_value(&child_from_lsn) > oggit_lsn_value(&child_to_lsn)
+        || oggit_lsn_value(&parent_from_lsn) > oggit_lsn_value(&parent_to_lsn)
+    {
+        bail!(
+            "oggit merge history boundary is invalid: child_from_lsn={}, child_to_lsn={}, parent_from_lsn={}, parent_to_lsn={}",
+            child_from_lsn,
+            child_to_lsn,
+            parent_from_lsn,
+            parent_to_lsn
+        );
+    }
+    if oggit_lsn_value(&child_from_lsn) < oggit_lsn_value(&child_state.branch_start_lsn) {
+        bail!(
+            "oggit merge history boundary {} predates child branch start {}",
+            child_from_lsn,
+            child_state.branch_start_lsn
+        );
+    }
+
+    let child_meta_schema = match direction {
+        OggitMergeDirection::ChildToParent => source_meta_schema,
+        OggitMergeDirection::ParentToChild => "oggit",
+    };
+    let parent_meta_schema = match direction {
+        OggitMergeDirection::ChildToParent => "oggit",
+        OggitMergeDirection::ParentToChild => source_meta_schema,
+    };
+    if oggit_lsn_value(&child_to_lsn) > oggit_lsn_value(&child_state.scanned_lsn) {
+        child_state =
+            oggit_wait_metadata_lsn(client, child_meta_schema, &child_to_lsn, "child").await?;
+    }
+    if oggit_lsn_value(&parent_to_lsn) > oggit_lsn_value(&parent_state.scanned_lsn) {
+        parent_state =
+            oggit_wait_metadata_lsn(client, parent_meta_schema, &parent_to_lsn, "parent").await?;
+    }
+
+    Ok(OggitMergeBounds {
+        child_state,
+        parent_state,
+        direction,
+        base_lsn,
+        child_from_lsn,
+        child_to_lsn,
+        parent_from_lsn,
+        parent_to_lsn,
+    })
+}
+
+async fn oggit_wait_metadata_lsn(
+    client: &tokio_opengauss::Client,
+    meta_schema: &str,
+    requested_lsn: &str,
+    label: &str,
+) -> Result<OggitState> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = oggit_read_state(client, meta_schema).await?;
+        if state.status != "active" {
+            bail!(
+                "{label} oggit worker is not active while waiting for requested LSN {}: {}, last_error={}",
+                requested_lsn,
+                state.status,
+                state.last_error.clone().unwrap_or_default()
+            );
+        }
+        if oggit_lsn_value(&state.scanned_lsn) >= oggit_lsn_value(requested_lsn) {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for {label} oggit metadata: requested_lsn={}, scanned_lsn={}, decode_lsn={}, status={}, last_error={}",
+                requested_lsn,
+                state.scanned_lsn,
+                state.decode_lsn,
+                state.status,
+                state.last_error.clone().unwrap_or_default()
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+pub(crate) async fn oggit_freeze_metadata_lsn(
+    client: &tokio_opengauss::Client,
+    requested_lsn: &str,
+    label: &str,
+) -> Result<()> {
+    oggit_wait_metadata_lsn(client, "oggit", requested_lsn, label)
+        .await
+        .map(|_| ())
+}
+
+async fn oggit_compact_change_log(
+    client: &tokio_opengauss::Client,
+    meta_schema: &str,
+    from_lsn: &str,
+    to_lsn: &str,
+    include_tables: Option<&[String]>,
+) -> Result<Vec<OggitDelta>> {
+    let mut work = BTreeMap::<String, OggitDelta>::new();
+    let changes =
+        oggit_read_change_log(client, meta_schema, from_lsn, to_lsn, include_tables).await?;
+    let object_barriers = oggit_read_object_change(client, meta_schema, from_lsn, to_lsn)
+        .await?
+        .into_iter()
+        .filter(|object| !oggit_object_change_is_internal(object))
+        .collect::<Vec<_>>();
+    let mut barrier_index = 0_usize;
+    let mut segment_id = 0_i64;
+
+    for change in changes {
+        while object_barriers.get(barrier_index).is_some_and(|barrier| {
+            oggit_event_order(&barrier.commit_lsn, barrier.ordinal, barrier.id)
+                <= oggit_event_order(&change.commit_lsn, change.ordinal, change.id)
+        }) {
+            segment_id += 1;
+            barrier_index += 1;
+        }
+
+        let key_text = format!(
+            "{}:{}.{}:{}",
+            segment_id,
+            change.schema_name,
+            change.table_name,
+            change
+                .key_json
+                .as_ref()
+                .or(change.old_row.as_ref())
+                .map(JsonValue::to_string)
+                .unwrap_or_else(|| change.id.to_string())
+        );
+
+        if change.identity_kind == "unsupported" || change.op == "UNSUPPORTED" {
+            work.entry(format!("{key_text}:unsupported:{}", change.id))
+                .or_insert(OggitDelta {
+                    schema_name: change.schema_name,
+                    table_name: change.table_name,
+                    identity_kind: change.identity_kind,
+                    key_json: change.key_json,
+                    final_op: "UNSUPPORTED".to_string(),
+                    old_row: change.old_row,
+                    new_row: change.new_row,
+                    changed_cols: change.changed_cols,
+                    unsupported_reason: Some(
+                        change
+                            .unsupported_reason
+                            .unwrap_or_else(|| "unsupported decoded row change".to_string()),
+                    ),
+                    first_commit_lsn: change.commit_lsn,
+                    first_ordinal: change.ordinal,
+                    first_id: change.id,
+                    segment_id,
+                });
+            continue;
+        }
+
+        if change.identity_kind == "replica_identity_full" {
+            let full_key = match change.op.as_str() {
+                "UPDATE" | "DELETE" => change.old_row.clone(),
+                "INSERT" => change.new_row.clone(),
+                _ => change.old_row.clone().or(change.new_row.clone()),
+            };
+            if full_key.is_none() {
+                work.entry(format!("{key_text}:replica_identity_full:{}", change.id))
+                    .or_insert(OggitDelta {
+                        schema_name: change.schema_name,
+                        table_name: change.table_name,
+                        identity_kind: change.identity_kind,
+                        key_json: change.key_json,
+                        final_op: "UNSUPPORTED".to_string(),
+                        old_row: change.old_row,
+                        new_row: change.new_row,
+                        changed_cols: change.changed_cols,
+                        unsupported_reason: Some(
+                            "replica identity full change has no row image for matching"
+                                .to_string(),
+                        ),
+                        first_commit_lsn: change.commit_lsn,
+                        first_ordinal: change.ordinal,
+                        first_id: change.id,
+                        segment_id,
+                    });
+                continue;
+            }
+            let key_text = format!(
+                "{}:{}.{}:{}",
+                segment_id,
+                change.schema_name,
+                change.table_name,
+                full_key
+                    .as_ref()
+                    .map(JsonValue::to_string)
+                    .unwrap_or_default()
+            );
+            if !work.contains_key(&key_text) {
+                work.insert(
+                    key_text.clone(),
+                    OggitDelta {
+                        schema_name: change.schema_name.clone(),
+                        table_name: change.table_name.clone(),
+                        identity_kind: change.identity_kind.clone(),
+                        key_json: full_key.clone(),
+                        final_op: change.op.clone(),
+                        old_row: change.old_row.clone(),
+                        new_row: change.new_row.clone(),
+                        changed_cols: change.changed_cols.clone(),
+                        unsupported_reason: None,
+                        first_commit_lsn: change.commit_lsn.clone(),
+                        first_ordinal: change.ordinal,
+                        first_id: change.id,
+                        segment_id,
+                    },
+                );
+                continue;
+            }
+        }
+
+        if !work.contains_key(&key_text) {
+            match change.op.as_str() {
+                "INSERT" => {
+                    work.insert(
+                        key_text,
+                        OggitDelta {
+                            schema_name: change.schema_name,
+                            table_name: change.table_name,
+                            identity_kind: change.identity_kind,
+                            key_json: change.key_json,
+                            final_op: "INSERT".to_string(),
+                            old_row: None,
+                            new_row: Some(oggit_json_object_or_empty(change.new_row)),
+                            changed_cols: change.changed_cols,
+                            unsupported_reason: None,
+                            first_commit_lsn: change.commit_lsn,
+                            first_ordinal: change.ordinal,
+                            first_id: change.id,
+                            segment_id,
+                        },
+                    );
+                }
+                "UPDATE" => {
+                    work.insert(
+                        key_text,
+                        OggitDelta {
+                            schema_name: change.schema_name,
+                            table_name: change.table_name,
+                            identity_kind: change.identity_kind,
+                            key_json: change.key_json,
+                            final_op: "UPDATE".to_string(),
+                            old_row: Some(oggit_json_object_or_empty(change.old_row)),
+                            new_row: Some(oggit_json_object_or_empty(change.new_row)),
+                            changed_cols: change.changed_cols,
+                            unsupported_reason: None,
+                            first_commit_lsn: change.commit_lsn,
+                            first_ordinal: change.ordinal,
+                            first_id: change.id,
+                            segment_id,
+                        },
+                    );
+                }
+                "DELETE" => {
+                    work.insert(
+                        key_text,
+                        OggitDelta {
+                            schema_name: change.schema_name,
+                            table_name: change.table_name,
+                            identity_kind: change.identity_kind,
+                            key_json: change.key_json,
+                            final_op: "DELETE".to_string(),
+                            old_row: Some(oggit_json_object_or_empty(change.old_row)),
+                            new_row: None,
+                            changed_cols: Vec::new(),
+                            unsupported_reason: None,
+                            first_commit_lsn: change.commit_lsn,
+                            first_ordinal: change.ordinal,
+                            first_id: change.id,
+                            segment_id,
+                        },
+                    );
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some(existing) = work.get_mut(&key_text) {
+            match change.op.as_str() {
+                "INSERT" => {
+                    existing.final_op = "INSERT".to_string();
+                    existing.old_row = None;
+                    existing.new_row = Some(oggit_json_object_or_empty(change.new_row));
+                    existing.changed_cols =
+                        oggit_array_union(&existing.changed_cols, &change.changed_cols);
+                }
+                "UPDATE" => {
+                    if existing.final_op != "INSERT" {
+                        existing.final_op = "UPDATE".to_string();
+                    }
+                    existing.new_row = Some(oggit_json_merge(
+                        existing.new_row.as_ref(),
+                        change.new_row.as_ref(),
+                    ));
+                    existing.changed_cols =
+                        oggit_array_union(&existing.changed_cols, &change.changed_cols);
+                }
+                "DELETE" => {
+                    if existing.final_op == "INSERT" {
+                        work.remove(&key_text);
+                    } else {
+                        existing.final_op = "DELETE".to_string();
+                        existing.new_row = None;
+                        existing.changed_cols.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut values = work.into_values().collect::<Vec<_>>();
+    values.sort_by_key(|delta| {
+        oggit_event_order(&delta.first_commit_lsn, delta.first_ordinal, delta.first_id)
+    });
+    Ok(values)
+}
+
+fn oggit_row_conflict_type(
+    ours_op: Option<&str>,
+    ours_new: Option<&JsonValue>,
+    ours_cols: &[String],
+    theirs_op: Option<&str>,
+    theirs_new: Option<&JsonValue>,
+    theirs_cols: &[String],
+) -> Option<String> {
+    let (Some(ours_op), Some(theirs_op)) = (ours_op, theirs_op) else {
+        return None;
+    };
+
+    if ours_op == "DELETE" && theirs_op == "DELETE" {
+        return None;
+    }
+    if ours_op == "DELETE" || theirs_op == "DELETE" {
+        return Some("delete_update".to_string());
+    }
+    if oggit_json_object_or_empty(ours_new.cloned())
+        == oggit_json_object_or_empty(theirs_new.cloned())
+    {
+        return None;
+    }
+
+    let ours_cols = oggit_effective_changed_cols(ours_cols);
+    let theirs_cols = oggit_effective_changed_cols(theirs_cols);
+    for col in &theirs_cols {
+        if ours_cols.contains(col)
+            && ours_new.and_then(|v| v.get(col)) != theirs_new.and_then(|v| v.get(col))
+        {
+            return Some("same_column_update".to_string());
+        }
+    }
+
+    None
+}
+
+fn oggit_effective_changed_cols(changed_cols: &[String]) -> BTreeSet<String> {
+    changed_cols.iter().cloned().collect()
+}
+
+fn oggit_delta_key(delta: &OggitDelta) -> String {
+    format!(
+        "{}.{}:{}",
+        delta.schema_name,
+        delta.table_name,
+        oggit_json_text(&delta.key_json)
+    )
+}
+
+fn oggit_delta_map_by_key(delta: &[OggitDelta]) -> BTreeMap<String, &OggitDelta> {
+    delta
+        .iter()
+        .map(|delta| (oggit_delta_key(delta), delta))
+        .collect::<BTreeMap<_, _>>()
+}
+
+fn oggit_row_conflict_matches_delta(conflict: &OggitConflict, delta: &OggitDelta) -> bool {
+    if conflict.table_name.is_none()
+        || conflict.key_json.is_none()
+        || conflict.theirs_op.as_deref() != Some(delta.final_op.as_str())
+    {
+        return false;
+    }
+    conflict.schema_name.as_deref() == Some(delta.schema_name.as_str())
+        && conflict.table_name.as_deref() == Some(delta.table_name.as_str())
+        && oggit_json_text(&conflict.key_json) == oggit_json_text(&delta.key_json)
+        && (conflict.conflict_type == "apply_error" || conflict.theirs_json == delta.new_row)
+}
+
+fn oggit_project_update_to_changed_cols(delta: &mut OggitDelta) {
+    if delta.final_op != "UPDATE" {
+        return;
+    }
+    let Some(JsonValue::Object(new_map)) = delta.new_row.as_ref() else {
+        return;
+    };
+
+    let projected = if !delta.changed_cols.is_empty() {
+        new_map
+            .iter()
+            .filter(|(key, _)| delta.changed_cols.contains(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<JsonMap<_, _>>()
+    } else {
+        JsonMap::new()
+    };
+
+    if !projected.is_empty() || !new_map.is_empty() {
+        delta.new_row = Some(JsonValue::Object(projected));
+    }
+}
+
+fn oggit_projected_update_delta(delta: Option<&OggitDelta>) -> Option<OggitDelta> {
+    let mut delta = delta.cloned()?;
+    oggit_project_update_to_changed_cols(&mut delta);
+    Some(delta)
+}
+
+fn oggit_rebase_replica_identity_full_key(delta: &mut OggitDelta, ours: Option<&OggitDelta>) {
+    if !oggit_uses_full_row_identity(delta) || delta.final_op == "INSERT" {
+        return;
+    }
+
+    let Some(ours) = ours else {
+        return;
+    };
+    if ours.final_op == "DELETE" {
+        return;
+    }
+    let Some(current_row) = ours.new_row.as_ref() else {
+        return;
+    };
+
+    delta.key_json = Some(oggit_json_merge(delta.key_json.as_ref(), Some(current_row)));
+}
+
+fn oggit_uses_full_row_identity(delta: &OggitDelta) -> bool {
+    if delta.identity_kind == "replica_identity_full" {
+        return true;
+    }
+    if delta.identity_kind != "unique_key" || delta.final_op == "INSERT" {
+        return false;
+    }
+
+    match (&delta.key_json, &delta.old_row) {
+        (Some(key_json), Some(old_row)) => key_json == old_row,
+        _ => false,
+    }
+}
+
+async fn oggit_replica_full_match_conflict(
+    client: &tokio_opengauss::Client,
+    delta: &OggitDelta,
+    ours: Option<&OggitDelta>,
+) -> Result<Option<String>> {
+    if !oggit_uses_full_row_identity(delta) || delta.final_op == "INSERT" {
+        return Ok(None);
+    }
+
+    let mut match_delta = delta.clone();
+    oggit_rebase_replica_identity_full_key(&mut match_delta, ours);
+    let matches = oggit_count_matching_rows(
+        client,
+        &match_delta.schema_name,
+        &match_delta.table_name,
+        &match_delta.key_json,
+    )
+    .await?;
+
+    Ok((matches != 1).then(|| format!("replica_identity_full_match_count_{matches}")))
+}
+
+pub(crate) async fn oggit_diff_from_meta(
+    client: &tokio_opengauss::Client,
+    source_meta_schema: &str,
+    include_tables: Option<&[String]>,
+    from_lsn: Option<&str>,
+    source_to_lsn: Option<&str>,
+    target_to_lsn: Option<&str>,
+) -> Result<OggitDiffResult> {
+    let bounds = oggit_validate_merge_inputs(
+        client,
+        source_meta_schema,
+        from_lsn,
+        source_to_lsn,
+        target_to_lsn,
+    )
+    .await?;
+
+    let ours_delta = oggit_compact_change_log(
+        client,
+        "oggit",
+        bounds.target_from_lsn(),
+        bounds.target_to_lsn(),
+        include_tables,
+    )
+    .await?;
+    let theirs_delta = oggit_compact_change_log(
+        client,
+        source_meta_schema,
+        bounds.source_from_lsn(),
+        bounds.source_to_lsn(),
+        include_tables,
+    )
+    .await?;
+    let mut ours_by_key = BTreeMap::new();
+    let mut keys = BTreeSet::new();
+    for delta in &ours_delta {
+        let key = format!(
+            "{}.{}:{}",
+            delta.schema_name,
+            delta.table_name,
+            oggit_json_text(&delta.key_json)
+        );
+        keys.insert(key.clone());
+        ours_by_key.insert(key, delta.clone());
+    }
+    let mut theirs_by_key = BTreeMap::new();
+    for delta in &theirs_delta {
+        let key = format!(
+            "{}.{}:{}",
+            delta.schema_name,
+            delta.table_name,
+            oggit_json_text(&delta.key_json)
+        );
+        keys.insert(key.clone());
+        theirs_by_key.insert(key, delta.clone());
+    }
+
+    let mut rows = Vec::new();
+    for key in keys {
+        let ours = ours_by_key.get(&key);
+        let theirs = theirs_by_key.get(&key);
+        let sample = ours.or(theirs).expect("key came from a delta");
+        let projected_ours = oggit_projected_update_delta(ours);
+        let projected_theirs = oggit_projected_update_delta(theirs);
+        let ours_for_diff = projected_ours.as_ref().or(ours);
+        let theirs_for_diff = projected_theirs.as_ref().or(theirs);
+        let mut detail = ours
+            .and_then(|delta| delta.unsupported_reason.clone())
+            .or_else(|| theirs.and_then(|delta| delta.unsupported_reason.clone()));
+        let replica_full_match_conflict = if let Some(theirs) = theirs {
+            oggit_replica_full_match_conflict(client, theirs, ours).await?
+        } else {
+            None
+        };
+        let diff_type = if detail.is_some() {
+            "unsupported".to_string()
+        } else if let Some(conflict_type) = replica_full_match_conflict {
+            detail = Some(conflict_type);
+            "row_conflict".to_string()
+        } else if ours.is_none() {
+            "theirs_only".to_string()
+        } else if theirs.is_none() {
+            "ours_only".to_string()
+        } else if let Some(conflict_type) = oggit_row_conflict_type(
+            ours_for_diff.map(|d| d.final_op.as_str()),
+            ours_for_diff.and_then(|d| d.new_row.as_ref()),
+            ours_for_diff
+                .map(|d| d.changed_cols.as_slice())
+                .unwrap_or(&[]),
+            theirs_for_diff.map(|d| d.final_op.as_str()),
+            theirs_for_diff.and_then(|d| d.new_row.as_ref()),
+            theirs_for_diff
+                .map(|d| d.changed_cols.as_slice())
+                .unwrap_or(&[]),
+        ) {
+            detail = Some(conflict_type);
+            "row_conflict".to_string()
+        } else if ours_for_diff.map(|d| d.final_op.as_str())
+            == theirs_for_diff.map(|d| d.final_op.as_str())
+            && oggit_json_object_or_empty(ours_for_diff.and_then(|d| d.new_row.clone()))
+                == oggit_json_object_or_empty(theirs_for_diff.and_then(|d| d.new_row.clone()))
+        {
+            "same_change".to_string()
+        } else {
+            "mergeable".to_string()
+        };
+
+        rows.push(OggitDiffRow {
+            diff_scope: "row".to_string(),
+            schema_name: sample.schema_name.clone(),
+            table_name: sample.table_name.clone(),
+            key_json: sample.key_json.clone(),
+            diff_type,
+            ours_json: ours_for_diff.and_then(|d| d.new_row.clone()),
+            theirs_json: theirs_for_diff.and_then(|d| d.new_row.clone()),
+            detail,
+        });
+    }
+
+    let theirs_objects = oggit_read_object_change(
+        client,
+        source_meta_schema,
+        bounds.source_from_lsn(),
+        bounds.source_to_lsn(),
+    )
+    .await?
+    .into_iter()
+    .filter(|object| !oggit_object_change_is_internal(object))
+    .collect::<Vec<_>>();
+    let ours_objects = oggit_read_object_change(
+        client,
+        "oggit",
+        bounds.target_from_lsn(),
+        bounds.target_to_lsn(),
+    )
+    .await?
+    .into_iter()
+    .filter(|object| !oggit_object_change_is_internal(object))
+    .collect::<Vec<_>>();
+    let ours_object_keys = ours_objects
+        .iter()
+        .map(oggit_object_change_diff_key)
+        .collect::<BTreeSet<_>>();
+    let theirs_object_keys = theirs_objects
+        .iter()
+        .map(oggit_object_change_diff_key)
+        .collect::<BTreeSet<_>>();
+    let ours_objects_by_merge_key = ours_objects
+        .iter()
+        .map(|object| (oggit_object_change_merge_key(object), object))
+        .collect::<BTreeMap<_, _>>();
+    let theirs_objects_by_merge_key = theirs_objects
+        .iter()
+        .map(|object| (oggit_object_change_merge_key(object), object))
+        .collect::<BTreeMap<_, _>>();
+
+    for (key, theirs_object) in &theirs_objects_by_merge_key {
+        if let Some(ours_object) = ours_objects_by_merge_key.get(key) {
+            if oggit_object_change_diff_key(theirs_object)
+                == oggit_object_change_diff_key(ours_object)
+            {
+                continue;
+            }
+            rows.push(OggitDiffRow {
+                diff_scope: theirs_object.object_type.to_lowercase(),
+                schema_name: theirs_object.schema_name.clone().unwrap_or_default(),
+                table_name: theirs_object.object_name.clone().unwrap_or_default(),
+                key_json: None,
+                diff_type: "object_conflict".to_string(),
+                ours_json: Some(ours_object.change_json.clone()),
+                theirs_json: Some(theirs_object.change_json.clone()),
+                detail: Some(format!(
+                    "ours={} theirs={}",
+                    ours_object.safety_class, theirs_object.safety_class
+                )),
+            });
+        }
+    }
+
+    for (side, objects, other_keys) in [
+        ("theirs_object", &theirs_objects, &ours_object_keys),
+        ("ours_object", &ours_objects, &theirs_object_keys),
+    ] {
+        for object in objects {
+            if other_keys.contains(&oggit_object_change_diff_key(&object))
+                || (side == "theirs_object"
+                    && ours_objects_by_merge_key
+                        .contains_key(&oggit_object_change_merge_key(&object)))
+                || (side == "ours_object"
+                    && theirs_objects_by_merge_key
+                        .contains_key(&oggit_object_change_merge_key(&object)))
+            {
+                continue;
+            }
+            rows.push(OggitDiffRow {
+                diff_scope: object.object_type.to_lowercase(),
+                schema_name: object.schema_name.clone().unwrap_or_default(),
+                table_name: object.object_name.clone().unwrap_or_default(),
+                key_json: None,
+                diff_type: side.to_string(),
+                ours_json: (side == "ours_object").then(|| object.change_json.clone()),
+                theirs_json: (side == "theirs_object").then(|| object.change_json.clone()),
+                detail: Some(
+                    if oggit_object_change_can_auto_apply(object, bounds.direction) {
+                        object.safety_class.clone()
+                    } else {
+                        format!(
+                            "{}: {}",
+                            object.safety_class,
+                            oggit_object_change_review_reason(object)
+                        )
+                    },
+                ),
+            });
+        }
+    }
+
+    Ok(OggitDiffResult {
+        base_lsn: bounds.base_lsn,
+        child_to_lsn: bounds.child_to_lsn,
+        parent_to_lsn: bounds.parent_to_lsn,
+        rows,
+    })
+}
