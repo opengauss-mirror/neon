@@ -2,48 +2,60 @@ name: neon_poc
 
 services:
   data_permissions:
-    image: ${NEON_IMAGE:-neon:latest_opgs}
+    image: ${NEON_IMAGE:-og_storage:latest}
     pull_policy: never
     user: "0:0"
     volumes:
-      - ./.neon/pageserver:/data/.neon/pageserver
-      - ./.neon/endpoint_storage:/data/.neon/endpoint_storage
+      - ./.neon:/data/.neon
       - ./.neon/storage_controller_db:/var/db/omm
-      - ./.neon/safekeeper1:/data/.neon/safekeeper1
-      - ./.neon/safekeeper2:/data/.neon/safekeeper2
-      - ./.neon/safekeeper3:/data/.neon/safekeeper3
-      - ./.neon/compute1:/var/db/gaussdb
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
         mkdir -p \
           /data/.neon/pageserver \
+          /data/.neon/shared_remote_storage \
           /data/.neon/endpoint_storage \
+          /data/.neon/control_plane/endpoints \
           /var/db/omm \
-          /data/.neon/safekeeper1 \
-          /data/.neon/safekeeper2 \
-          /data/.neon/safekeeper3 \
-          /var/db/gaussdb/compute \
-          /var/db/gaussdb/specs \
-          /var/db/gaussdb/configs
-        chmod -R 0777 /data/.neon /var/db/omm /var/db/gaussdb
+          /data/.neon/safekeeper
+        chmod -R 0777 /data/.neon /var/db/omm
+
+  docker_control_plane:
+    restart: always
+    image: ${NEON_IMAGE:-og_storage:latest}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${OG_VERSION:-V702}
+      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - DOCKER_CONTROL_PLANE_LISTEN=0.0.0.0:8080
+      - DOCKER_CONTROL_PLANE_STATE_DIR=/data/.neon/control_plane
+      - STORAGE_CONTROLLER_HTTP=${STORAGE_CONTROLLER_HTTP:-http://storage_controller:1234}
+    ports:
+      - ${DOCKER_CONTROL_PLANE_HOST_PORT:-8080}:8080
+    volumes:
+      - ./.neon:/data/.neon
+    command:
+      - docker_control_plane
+    depends_on:
+      data_permissions:
+        condition: service_completed_successfully
 
   storage_broker:
     restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
+    image: ${NEON_IMAGE:-og_storage:latest}
     pull_policy: never
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     ports:
-      - 50051:50051
+      - ${STORAGE_BROKER_HOST_PORT:-50051}:50051
     command:
       - storage_broker
       - --listen-addr=0.0.0.0:50051
 
   storage_controller_db:
     restart: always
-    image: ${COMPUTE_IMAGE:-compute-node-opengauss-v702:latest}
+    image: ${COMPUTE_IMAGE:-og_compute:latest}
     pull_policy: never
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
@@ -57,66 +69,78 @@ services:
 
   storage_controller:
     restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
+    image: ${NEON_IMAGE:-og_storage:latest}
     pull_policy: never
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - TIMELINE_SAFEKEEPER_COUNT=${TIMELINE_SAFEKEEPER_COUNT:-1}
+      - STORAGE_CONTROLLER_EXTRA_ARGS=${STORAGE_CONTROLLER_EXTRA_ARGS:-}
     ports:
-      - 1234:1234
-    command:
-      - storage_controller
-      - --listen=0.0.0.0:1234
-      - --database-url=postgresql://omm@storage_controller_db:5432/storage_controller
-      - --db-connect-timeout=60s
-      - --dev
+      - ${STORAGE_CONTROLLER_HOST_PORT:-1234}:1234
+    command: >
+      /bin/sh -ec 'exec storage_controller
+      --listen=0.0.0.0:1234
+      --database-url=postgresql://omm@storage_controller_db:5432/storage_controller
+      --db-connect-timeout=60s
+      --dev
+      --timelines-onto-safekeepers
+      --timeline-safekeeper-count=$$TIMELINE_SAFEKEEPER_COUNT
+      --control-plane-url=http://docker_control_plane:8080
+      $$STORAGE_CONTROLLER_EXTRA_ARGS'
     depends_on:
+      - docker_control_plane
       - storage_broker
       - storage_controller_db
 
   endpoint_storage:
     restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
+    image: ${NEON_IMAGE:-og_storage:latest}
     pull_policy: never
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - RUST_LOG=${RUST_LOG:-info}
     ports:
-      - 9993:9993
+      - ${ENDPOINT_STORAGE_HOST_PORT:-9993}:9993
     volumes:
       - ./.neon/endpoint_storage:/data/.neon/endpoint_storage
+      - ./.neon/control_plane:/data/.neon/control_plane
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
         mkdir -p /data/.neon/endpoint_storage/etc
-        cat > /data/.neon/endpoint_storage/etc/public-key.pem <<'EOF'
+        if [ ! -s /data/.neon/control_plane/auth_public_key.pem ]; then
+          mkdir -p /data/.neon/control_plane
+          cat > /data/.neon/control_plane/auth_public_key.pem <<'EOF'
         -----BEGIN PUBLIC KEY-----
-        MCowBQYDK2VwAyEADY0al/U0bgB3+9fUGk+3PKWnsck9OyxN5DjHIN6Xep0=
+        MCowBQYDK2VwAyEARYwaNBayR+eGI0iXB4s3QxE3Nl2g1iWbr6KtLWeVD/w=
         -----END PUBLIC KEY-----
         EOF
-        exec endpoint_storage --config '{"listen":"0.0.0.0:9993","pemfile":"/data/.neon/endpoint_storage/etc/public-key.pem","type":"LocalFs","local_path":"/data/.neon/endpoint_storage/local_fs_remote_storage"}'
+        fi
+        exec endpoint_storage --config '{"listen":"0.0.0.0:9993","pemfile":"/data/.neon/control_plane/auth_public_key.pem","type":"LocalFs","local_path":"/data/.neon/endpoint_storage/local_fs_remote_storage"}'
     depends_on:
       data_permissions:
         condition: service_completed_successfully
 
   pageserver:
     restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
+    image: ${NEON_IMAGE:-og_storage:latest}
     pull_policy: never
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     ports:
-      - 9898:9898
+      - ${PAGESERVER_HOST_HTTP_PORT:-9898}:9898
     volumes:
       - ./.neon/pageserver:/data/.neon/pageserver
+      - ./.neon/shared_remote_storage:/data/.neon/shared_remote_storage
       - ./pageserver_config/identity.toml:/data/.neon/pageserver/identity.toml:ro
       - ./pageserver_config/pageserver.toml:/data/.neon/pageserver/pageserver.toml:ro
+      - ./pageserver_config/metadata.json:/data/.neon/pageserver/metadata.json:ro
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        mkdir -p /data/.neon/pageserver/remote_storage
         exec pageserver -D /data/.neon/pageserver
     depends_on:
       data_permissions:
@@ -126,20 +150,21 @@ services:
       storage_controller:
         condition: service_started
 
-  safekeeper1:
+  safekeeper:
     restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
+    image: ${NEON_IMAGE:-og_storage:latest}
     pull_policy: never
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - SAFEKEEPER_ADVERTISE_URL=safekeeper1:5454
+      - SAFEKEEPER_ADVERTISE_URL=safekeeper:5454
       - SAFEKEEPER_ID=1
       - BROKER_ENDPOINT=http://storage_broker:50051
+      - SAFEKEEPER_EXTRA_OPT=${SAFEKEEPER_EXTRA_OPT:-}
     ports:
-      - 7676:7676
+      - ${SAFEKEEPER_HOST_HTTP_PORT:-7676}:7676
     volumes:
-      - ./.neon/safekeeper1:/data/.neon/safekeeper1
+      - ./.neon/safekeeper:/data/.neon/safekeeper
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -148,115 +173,16 @@ services:
           --listen-http=0.0.0.0:7676 \
           --id=$$SAFEKEEPER_ID \
           --broker-endpoint=$$BROKER_ENDPOINT \
-          -D /data/.neon/safekeeper1
+          $$SAFEKEEPER_EXTRA_OPT \
+          -D /data/.neon/safekeeper
     depends_on:
       data_permissions:
         condition: service_completed_successfully
       storage_broker:
         condition: service_started
 
-  safekeeper2:
-    restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
-    pull_policy: never
-    environment:
-      - OG_VERSION=${OG_VERSION:-V702}
-      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - SAFEKEEPER_ADVERTISE_URL=safekeeper2:5454
-      - SAFEKEEPER_ID=2
-      - BROKER_ENDPOINT=http://storage_broker:50051
-    ports:
-      - 7677:7676
-    volumes:
-      - ./.neon/safekeeper2:/data/.neon/safekeeper2
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        exec safekeeper \
-          --listen-pg=$$SAFEKEEPER_ADVERTISE_URL \
-          --listen-http=0.0.0.0:7676 \
-          --id=$$SAFEKEEPER_ID \
-          --broker-endpoint=$$BROKER_ENDPOINT \
-          -D /data/.neon/safekeeper2
-    depends_on:
-      data_permissions:
-        condition: service_completed_successfully
-      storage_broker:
-        condition: service_started
-
-  safekeeper3:
-    restart: always
-    image: ${NEON_IMAGE:-neon:latest_opgs}
-    pull_policy: never
-    environment:
-      - OG_VERSION=${OG_VERSION:-V702}
-      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - SAFEKEEPER_ADVERTISE_URL=safekeeper3:5454
-      - SAFEKEEPER_ID=3
-      - BROKER_ENDPOINT=http://storage_broker:50051
-    ports:
-      - 7678:7676
-    volumes:
-      - ./.neon/safekeeper3:/data/.neon/safekeeper3
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        exec safekeeper \
-          --listen-pg=$$SAFEKEEPER_ADVERTISE_URL \
-          --listen-http=0.0.0.0:7676 \
-          --id=$$SAFEKEEPER_ID \
-          --broker-endpoint=$$BROKER_ENDPOINT \
-          -D /data/.neon/safekeeper3
-    depends_on:
-      data_permissions:
-        condition: service_completed_successfully
-      storage_broker:
-        condition: service_started
-
-  compute1:
-    restart: always
-    image: ${COMPUTE_IMAGE:-compute-node-opengauss-v702:latest}
-    pull_policy: never
-    environment:
-      - OG_VERSION=${OG_VERSION:-V702}
-      - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - OTEL_SDK_DISABLED=true
-      - TENANT_ID=${TENANT_ID:-}
-      - TIMELINE_ID=${TIMELINE_ID:-}
-    volumes:
-      - ./.neon/compute1:/var/db/gaussdb
-      - ../compute/gaussdb/configs/config.json:/var/db/gaussdb/configs/config.json:ro
-    ports:
-      - 55433:55433
-      - 3080:3080
-    entrypoint: ["/shell/compute.sh"]
-    networks:
-      default:
-        aliases:
-          - compute
-    depends_on:
-      - safekeeper1
-      - safekeeper2
-      - safekeeper3
-      - pageserver
-      - endpoint_storage
-
-  compute_is_ready:
-    image: ${COMPUTE_IMAGE:-compute-node-opengauss-v702:latest}
-    pull_policy: never
-    network_mode: service:compute1
-    environment:
-      - OG_VERSION=${OG_VERSION:-V702}
-      - GAUSSHOME=/usr/local/${OG_VERSION:-V702}
-      - LD_LIBRARY_PATH=/usr/lib64:/usr/local/${OG_VERSION:-V702}/lib
-      - PARALLEL_COMPUTES=1
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        export PATH=/usr/local/$${OG_VERSION}/bin:$$PATH
-        until /usr/local/$${OG_VERSION}/bin/gsql -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -c 'SELECT 1' >/dev/null 2>&1; do
-          sleep 1
-        done
-        echo All computes are started
-    depends_on:
-      - compute1
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/20

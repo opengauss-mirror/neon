@@ -5,7 +5,6 @@
 !Cargo.toml
 !Makefile
 !opengauss.mk
-!openEuler_aarch64.repo
 !rust-toolchain.toml
 !scripts/ninstall.sh
 !docker-compose/run-tests.sh

@@ -1,0 +1,15 @@
+export COMPOSE_PROJECT_NAME=neon_poc
+export OG_VERSION=V702
+export NEON_IMAGE=og_storage:latest
+export COMPUTE_IMAGE=og_compute:latest
+export NEON_LOCAL_IMAGE="$NEON_IMAGE"
+
+# 合并用户。主分支和后续创建的源分支都会读取这组变量。
+export BRANCH_MERGE_USER=branch_merge
+export BRANCH_MERGE_PASSWORD='Branch_merge@123'
+
+# neon_local 命令使用的变量。MERGE_PASS 需要使用 URL 编码，@ 写成 %40。
+export MERGE_USER="$BRANCH_MERGE_USER"
+export MERGE_PASS='Branch_merge%40123'
+export SRC_CONNSTR="postgresql://${MERGE_USER}:${MERGE_PASS}@compute_branch1:55433/postgres?sslmode=disable"
+export TGT_CONNSTR="postgresql://${MERGE_USER}:${MERGE_PASS}@compute_main:55433/postgres?sslmode=disable"
