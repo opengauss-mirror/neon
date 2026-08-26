@@ -7,7 +7,7 @@ ARG IMAGE=build-tools
 ARG TAG=pinned
 ARG APT_DEBIAN_MIRROR=
 ARG APT_SECURITY_MIRROR=
-ARG CARGO_REGISTRY_MIRROR=
+ARG CARGO_REGISTRY_MIRROR=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 ARG DEBIAN_VERSION=bookworm
 ARG DEBIAN_FLAVOR=${DEBIAN_VERSION}-slim
 ARG OPENGAUSS_BINARYLIBS_DIR
@@ -27,7 +27,9 @@ FROM openeuler/openeuler:22.03-lts AS og-build
 
 USER root
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
+    && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 RUN set -e \
     && yum makecache \
     && yum install -y \
@@ -56,8 +58,11 @@ RUN set -e \
     && rm -f /tmp/binarylibs.tar.gz
 ENV BUILD_TYPE=release
 ENV OPENGAUSS_BINARYLIBS_DIR=/home/nonroot/3rd_og
+# Cap openGauss compile parallelism. On machines with very high core counts
+# (e.g. 128), make -j $(nproc) races linking libpq_ce against -lkeymgr before
+# libkeymgr.a has been produced.
 RUN set -e \
-    && make -j $(nproc) -s opengauss-install
+    && make -j 32 -s opengauss-install
 
 # 2. Prepare cargo-chef recipe
 FROM $REPOSITORY/$IMAGE:$TAG AS plan
@@ -65,11 +70,15 @@ ARG CARGO_REGISTRY_MIRROR
 WORKDIR /home/nonroot
 
 COPY --chown=nonroot . .
-COPY --chown=nonroot .cargo-cache/git/      /home/nonroot/.cargo/git/
-COPY --chown=nonroot .cargo-cache/registry/ /home/nonroot/.cargo/registry/
+COPY --chown=nonroot .cargo-cache/ /tmp/cargo-cache/
 
 RUN set -e \
     && mkdir -p /home/nonroot/.cargo \
+    && mkdir -p /home/nonroot/.cargo/git /home/nonroot/.cargo/registry \
+    && if [ -d /tmp/cargo-cache/git ]; then cp -a /tmp/cargo-cache/git/. /home/nonroot/.cargo/git/; fi \
+    && if [ ! -d /tmp/cargo-cache/git/db ] && [ -d /tmp/cargo-cache/git/git ]; then cp -a /tmp/cargo-cache/git/git/. /home/nonroot/.cargo/git/; fi \
+    && if [ -d /tmp/cargo-cache/registry ]; then cp -a /tmp/cargo-cache/registry/. /home/nonroot/.cargo/registry/; fi \
+    && rm -rf /tmp/cargo-cache \
     && { \
         if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
             printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n\n' "${CARGO_REGISTRY_MIRROR}"; \
@@ -117,10 +126,14 @@ ARG GIT_VERSION=local
 ARG BUILD_TAG
 ARG ADDITIONAL_RUSTFLAGS=""
 ARG CARGO_REGISTRY_MIRROR
+# Build Rust jemalloc with a 64K allocator page so the storage binaries run on
+# aarch64 hosts configured with 64K OS pages.
+ARG JEMALLOC_SYS_WITH_LG_PAGE=16
 ENV CARGO_FEATURES="default"
 ENV CARGO_NET_OFFLINE=true
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=600
+ENV JEMALLOC_SYS_WITH_LG_PAGE=${JEMALLOC_SYS_WITH_LG_PAGE}
 
 # 3. Build cargo dependencies. Note that this step doesn't depend on anything else than
 # `recipe.json`, so the layer can be reused as long as none of the dependencies change.
@@ -206,6 +219,7 @@ RUN  --mount=type=secret,uid=1000,id=SUBZERO_ACCESS_TOKEN \
           --bin safekeeper  \
           --bin storage_broker  \
           --bin storage_controller  \
+          --bin docker_control_plane \
           --bin proxy  \
           --bin endpoint_storage \
           --bin neon_local \
@@ -226,7 +240,8 @@ RUN mkdir -p og_install/V702/include/postgresql/include \
     && cp og_install/V702/include/securec*.h og_install/V702/include/postgresql/include/ \
     && cp -a og_install/V702/include/postgresql/server/. og_install/V702/include/postgresql/include/
 
-RUN mold -run env \
+RUN find pgxn -name '*.o' -o -name '*.so' -o -name '*.a' | xargs -r rm -f \
+    && mold -run env \
     GAUSSHOME=/home/nonroot/og_install/V702 \
     PATH="/home/nonroot/og_install/V702/bin:$PATH" \
     OG_INSTALL_CACHED=1 \
@@ -237,7 +252,9 @@ FROM openeuler/openeuler:22.03-lts
 WORKDIR /data
 
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
+    && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 
 RUN set -e \
     && yum makecache \
@@ -280,6 +297,7 @@ COPY --from=build --chown=neon:neon /home/nonroot/target/release/pagectl        
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/safekeeper          /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_broker      /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/storage_controller  /usr/local/bin
+COPY --from=build --chown=neon:neon /home/nonroot/target/release/docker_control_plane /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/proxy               /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/endpoint_storage    /usr/local/bin
 COPY --from=build --chown=neon:neon /home/nonroot/target/release/neon_local          /usr/local/bin

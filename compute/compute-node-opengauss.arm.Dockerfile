@@ -23,12 +23,13 @@
 
 ARG OG_VERSION
 ARG BUILD_TAG
+ARG OPENGAUSS_BUILD_JOBS=8
 ARG DEBIAN_VERSION=bookworm
 ARG DEBIAN_FLAVOR=${DEBIAN_VERSION}-slim
 ARG OPENGAUSS_BINARYLIBS_DIR=3rd_og
 ARG APT_DEBIAN_MIRROR=
 ARG APT_SECURITY_MIRROR=
-ARG CARGO_REGISTRY_MIRROR=
+ARG CARGO_REGISTRY_MIRROR=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 
 ARG BOOKWORM_SLIM_SHA=sha256:40b107342c492725bc7aacbe93a49945445191ae364184a6d24fedb28172f6f7
 ARG BULLSEYE_SLIM_SHA=sha256:e831d9a884d63734fe3dd9c491ed9a5a3d4c6a6d32c5b14f2067357c49b0b7e1
@@ -40,7 +41,7 @@ ARG BASE_IMAGE_SHA=${BASE_IMAGE_SHA/debian:bullseye-slim/debian@$BULLSEYE_SLIM_S
 ARG REPOSITORY=ghcr.io/neondatabase
 ARG IMAGE=build-tools
 ARG TAG=pinned
-ARG NEON_IMAGE=neon:latest_opgs
+ARG NEON_IMAGE=og_storage:latest
 
 #########################################################################################
 #
@@ -52,7 +53,9 @@ FROM openeuler/openeuler:22.03-lts AS build-deps
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
+    && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 
 RUN yum makecache && \
     yum install -y \
@@ -72,10 +75,13 @@ RUN yum makecache && \
 FROM openeuler/openeuler:22.03-lts AS og-build
 ARG OG_VERSION
 ARG OPENGAUSS_BINARYLIBS_DIR
+ARG OPENGAUSS_BUILD_JOBS
 
 USER root
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
+    && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 RUN yum makecache \
     && yum install -y \
         autoconf automake bison ccache cmake dkms flex gcc gcc-c++ git java-1.8.0-openjdk-devel \
@@ -96,13 +102,17 @@ COPY --chown=nonroot scripts/ninstall.sh scripts/ninstall.sh
 
 ENV BUILD_TYPE=release
 ENV OPENGAUSS_BINARYLIBS_DIR=/home/nonroot/3rd_og
+ENV OPENGAUSS_BUILD_JOBS=${OPENGAUSS_BUILD_JOBS}
+ENV CCACHE_DISABLE=1
 RUN set -e \
     && curl -SL -o /tmp/binarylibs.tar.gz https://opengauss.obs.cn-south-1.myhuaweicloud.com/latest/binarylibs/gcc10.3/openGauss-third_party_binarylibs_openEuler_2203_arm.tar.gz \
     && tar -xzf /tmp/binarylibs.tar.gz \
     && mv openGauss-third_party_binarylibs_openEuler_2203_arm 3rd_og \
     && rm -f /tmp/binarylibs.tar.gz
 RUN set -e \
-    && make -j $(nproc) -s opengauss-install
+    && sed -i 's/cpus_num=$(grep -w processor \/proc\/cpuinfo|wc -l)/cpus_num=${OPENGAUSS_BUILD_JOBS:-$(grep -w processor \/proc\/cpuinfo|wc -l)}/' vendor/openGauss/build/script/utils/cmake_compile.sh \
+    && make -j "${OPENGAUSS_BUILD_JOBS}" -s opengauss-install \
+    || { status=$?; find vendor/openGauss -name makemppdb_pkg.log -exec tail -n 240 {} \; || true; exit "$status"; }
 
 #########################################################################################
 #
@@ -171,7 +181,9 @@ ARG OG_VERSION
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
+    && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 
 RUN yum makecache && \
     yum install -y \
@@ -243,12 +255,9 @@ COPY --from=neon_extensions /usr/local/V702/share/postgresql/extension/neon* /us
 
 RUN set -e \
     && LC_ALL=C sed -i 's/SELECT FROM/SELECT*FROM/g' /usr/local/bin/compute_ctl \
-    && LC_ALL=C sed -i 's/BYPASSRLS/         /g; s/NOBYPASSRLS/           /g' /usr/local/bin/compute_ctl \
     && p="starts_with(rolname, 'pg_')" \
     && r=$(printf "%-${#p}s" "rolname LIKE 'pg_%'") \
     && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
-    && perl -0777 -pi -e 'BEGIN { $p = "EXECUTE '\''ALTER ROLE '\'' || quote_ident(role_name) || '\'' INHERIT'\'';"; $r = "NULL;"; die "replacement is longer" if length($r) > length($p); $r .= " " x (length($p) - length($r)); } s/\Q$p\E/$r/g' /usr/local/bin/compute_ctl \
-    && perl -0777 -pi -e 'BEGIN { $p = "EXECUTE '\''ALTER ROLE '\'' || quote_ident(role_name) || '\'' NO         '\'';"; $r = "NULL;"; die "replacement is longer" if length($r) > length($p); $r .= " " x (length($p) - length($r)); } s/\Q$p\E/$r/g' /usr/local/bin/compute_ctl \
     && p='GRANT pg_monitor TO {privileged_role_name} WITH ADMIN OPTION;' \
     && r=$(printf "%-${#p}s" "-- SKIP pg_monitor") \
     && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
@@ -260,15 +269,6 @@ RUN set -e \
     && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
     && perl -0777 -pi -e 'BEGIN { $p = "INSERT INTO health_check VALUES (1, now())\n        ON CONFLICT (id) DO UPDATE\n         SET updated_at = now();"; $r = "DELETE FROM health_check WHERE id = 1; INSERT INTO health_check VALUES (1, now());"; die "replacement is longer" if length($r) > length($p); $r .= " " x (length($p) - length($r)); } s/\Q$p\E/$r/g' /usr/local/bin/compute_ctl \
     && perl -0777 -pi -e 'BEGIN { $p = "INSERT INTO neon.drop_subscriptions_done VALUES (1, current_setting('"'"'neon.timeline_id'"'"'))\n    ON CONFLICT (id) DO UPDATE\n    SET timeline_id = current_setting('"'"'neon.timeline_id'"'"');"; $r = "DELETE FROM neon.drop_subscriptions_done WHERE id = 1; INSERT INTO neon.drop_subscriptions_done VALUES (1, current_setting('"'"'neon.timeline_id'"'"'));"; die "replacement is longer" if length($r) > length($p); $r .= " " x (length($p) - length($r)); } s/\Q$p\E/$r/g' /usr/local/bin/compute_ctl \
-    && p='CREATE EXTENSION IF NOT EXISTS neon WITH SCHEMA neon' \
-    && r=$(printf "%-${#p}s" "SELECT 1") \
-    && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
-    && p='ALTER EXTENSION neon SET SCHEMA neon' \
-    && r=$(printf "%-${#p}s" "SELECT 1") \
-    && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
-    && p='ALTER EXTENSION neon UPDATE' \
-    && r=$(printf "%-${#p}s" "SELECT 1") \
-    && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
     && p='GRANT EXECUTE ON FUNCTION pg_show_replication_origin_status TO ' \
     && r=$(printf "%-${#p}s" "-- SKIP pg_show_replication_origin_status") \
     && LC_ALL=C sed -i "s|$p|$r|g" /usr/local/bin/compute_ctl \
@@ -280,6 +280,7 @@ RUN set -e \
 
 COPY --chown=omm:omm compute/gaussdb/configs/ /var/db/gaussdb/configs/
 COPY --chown=omm:omm compute/shell/ /shell/
+RUN chmod 0755 /shell/*.sh
 
 ENV LANG=en_US.utf8
 ENV OG_VERSION=${OG_VERSION}
