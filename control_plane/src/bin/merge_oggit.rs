@@ -2510,3 +2510,828 @@ pub(crate) async fn oggit_diff_from_meta(
         rows,
     })
 }
+
+async fn oggit_table_exists(
+    client: &tokio_opengauss::Client,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND c.relkind = 'r'
+             )",
+            &[&schema_name, &table_name],
+        )
+        .await
+        .context("failed to check oggit target table")?
+        .get(0))
+}
+
+async fn oggit_count_matching_rows(
+    client: &tokio_opengauss::Client,
+    schema_name: &str,
+    table_name: &str,
+    key_json: &Option<JsonValue>,
+) -> Result<i64> {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.{} t WHERE {}",
+        quote_sql_ident(schema_name),
+        quote_sql_ident(table_name),
+        oggit_json_where_expr("t", key_json)
+    );
+    Ok(client
+        .query_one(sql.as_str(), &[])
+        .await
+        .with_context(|| format!("failed to count matching rows in {schema_name}.{table_name}"))?
+        .get(0))
+}
+
+async fn oggit_column_exists(
+    client: &tokio_opengauss::Client,
+    schema_name: &str,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid = c.oid
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND a.attname = $3
+                   AND a.attnum > 0
+                   AND NOT a.attisdropped
+             )",
+            &[&schema_name, &table_name, &column_name],
+        )
+        .await
+        .context("failed to check oggit target column")?
+        .get(0))
+}
+
+async fn oggit_index_exists(
+    client: &tokio_opengauss::Client,
+    schema_name: &str,
+    index_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND c.relkind = 'i'
+             )",
+            &[&schema_name, &index_name],
+        )
+        .await
+        .context("failed to check oggit target index")?
+        .get(0))
+}
+
+async fn oggit_is_sequence_owned_column(
+    client: &tokio_opengauss::Client,
+    schema_name: &str,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid = c.oid
+                  JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+                 WHERE n.nspname = $1
+                   AND c.relname = $2
+                   AND a.attname = $3
+                   AND pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%'
+             )",
+            &[&schema_name, &table_name, &column_name],
+        )
+        .await
+        .context("failed to check oggit sequence-owned column")?
+        .get(0))
+}
+
+fn oggit_json_value_from_returned_text(template: &JsonValue, value: Option<String>) -> JsonValue {
+    let Some(value) = value else {
+        return JsonValue::Null;
+    };
+
+    match template {
+        JsonValue::Number(_) => {
+            serde_json::from_str::<JsonValue>(&value).unwrap_or_else(|_| JsonValue::String(value))
+        }
+        JsonValue::Bool(_) => JsonValue::Bool(value.eq_ignore_ascii_case("true") || value == "1"),
+        JsonValue::Null => JsonValue::Null,
+        _ => JsonValue::String(value),
+    }
+}
+
+async fn oggit_foreign_key_columns_to_parent(
+    client: &tokio_opengauss::Client,
+    child_schema: &str,
+    child_table: &str,
+    parent_schema: &str,
+    parent_table: &str,
+    parent_column: &str,
+) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT fa.attname::text
+               FROM pg_constraint con
+               JOIN pg_class fc ON fc.oid = con.conrelid
+               JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+               JOIN pg_class pc ON pc.oid = con.confrelid
+               JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+               JOIN pg_attribute pa ON pa.attrelid = pc.oid
+               JOIN pg_attribute fa ON fa.attrelid = fc.oid
+              WHERE con.contype = 'f'
+                AND fn.nspname = $1
+                AND fc.relname = $2
+                AND pn.nspname = $3
+                AND pc.relname = $4
+                AND pa.attname = $5
+                AND pa.attnum = ANY(con.confkey)
+                AND fa.attnum = con.conkey[array_position(con.confkey, pa.attnum)]",
+            &[
+                &child_schema,
+                &child_table,
+                &parent_schema,
+                &parent_table,
+                &parent_column,
+            ],
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect foreign keys from {child_schema}.{child_table} to {parent_schema}.{parent_table}.{parent_column}"
+            )
+        })?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+async fn oggit_rewrite_sequence_references(
+    client: &tokio_opengauss::Client,
+    delta: &mut OggitDelta,
+    mappings: &BTreeMap<(String, String, String, String), JsonValue>,
+    foreign_key_cache: &mut BTreeMap<OggitForeignKeyLookupKey, Vec<String>>,
+) -> Result<()> {
+    for ((parent_schema, parent_table, parent_column, old_value_text), new_value) in mappings {
+        let lookup_key = (
+            delta.schema_name.clone(),
+            delta.table_name.clone(),
+            parent_schema.clone(),
+            parent_table.clone(),
+            parent_column.clone(),
+        );
+        let fk_columns = if let Some(columns) = foreign_key_cache.get(&lookup_key) {
+            columns.clone()
+        } else {
+            let columns = oggit_foreign_key_columns_to_parent(
+                client,
+                &delta.schema_name,
+                &delta.table_name,
+                parent_schema,
+                parent_table,
+                parent_column,
+            )
+            .await?;
+            foreign_key_cache.insert(lookup_key, columns.clone());
+            columns
+        };
+        let mut candidate_columns = fk_columns;
+        if delta.schema_name == *parent_schema && delta.table_name == *parent_table {
+            candidate_columns.push(parent_column.clone());
+        }
+
+        for column in candidate_columns {
+            for payload in [&mut delta.key_json, &mut delta.new_row] {
+                if let Some(JsonValue::Object(map)) = payload {
+                    if map
+                        .get(&column)
+                        .is_some_and(|value| value.to_string() == *old_value_text)
+                    {
+                        map.insert(column.clone(), new_value.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn oggit_read_complete_source_row(
+    client: &tokio_opengauss::Client,
+    source_schema: &str,
+    source_table: &str,
+    key_json: &Option<JsonValue>,
+) -> Result<JsonValue> {
+    let Some(JsonValue::Object(key_map)) = key_json else {
+        bail!("cannot restore oggit update without a row key");
+    };
+    if key_map.is_empty() {
+        bail!("cannot restore oggit update with an empty row key");
+    }
+
+    let sql = format!(
+        "SELECT row_to_json(s)::text FROM {}.{} s WHERE {} LIMIT 2",
+        quote_sql_ident(source_schema),
+        quote_sql_ident(source_table),
+        oggit_json_where_expr("s", key_json)
+    );
+    let rows = client.query(sql.as_str(), &[]).await.with_context(|| {
+        format!("failed to read complete source row from {source_schema}.{source_table}")
+    })?;
+    if rows.len() != 1 {
+        bail!(
+            "cannot restore oggit update from {source_schema}.{source_table}: source key matched {} rows",
+            rows.len()
+        );
+    }
+
+    let row_text: String = rows[0].get(0);
+    let row: JsonValue = serde_json::from_str(&row_text).with_context(|| {
+        format!("invalid complete source row from {source_schema}.{source_table}: {row_text}")
+    })?;
+    if !matches!(row, JsonValue::Object(ref map) if !map.is_empty()) {
+        bail!("complete source row from {source_schema}.{source_table} is empty");
+    }
+    Ok(row)
+}
+
+async fn oggit_insert_complete_row(
+    client: &tokio_opengauss::Client,
+    target_schema: &str,
+    target_table: &str,
+    complete_row: &JsonValue,
+) -> Result<()> {
+    let JsonValue::Object(map) = complete_row else {
+        bail!("complete oggit recovery row is not a JSON object");
+    };
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    for (key, value) in map {
+        if oggit_column_exists(client, target_schema, target_table, key).await? {
+            cols.push(quote_sql_ident(key));
+            vals.push(oggit_json_sql_value(value));
+        }
+    }
+    if cols.is_empty() {
+        bail!("complete oggit recovery row has no target columns");
+    }
+
+    let sql = format!(
+        "INSERT INTO {}.{} ({}) VALUES ({})",
+        quote_sql_ident(target_schema),
+        quote_sql_ident(target_table),
+        cols.join(", "),
+        vals.join(", ")
+    );
+    let affected = client.execute(sql.as_str(), &[]).await.with_context(|| {
+        format!("failed to restore complete row into {target_schema}.{target_table}")
+    })?;
+    if affected != 1 {
+        bail!(
+            "complete oggit recovery expected 1 inserted row in {target_schema}.{target_table}, affected {affected}"
+        );
+    }
+    Ok(())
+}
+
+async fn oggit_missing_delta_target_dependency_reason(
+    client: &tokio_opengauss::Client,
+    delta: &OggitDelta,
+) -> Result<Option<String>> {
+    if !oggit_table_exists(client, &delta.schema_name, &delta.table_name).await? {
+        return Ok(Some(format!(
+            "source DML {} on {}.{} skipped because target table does not exist",
+            delta.final_op, delta.schema_name, delta.table_name
+        )));
+    }
+
+    for (payload_name, payload) in [("key_json", &delta.key_json), ("new_row", &delta.new_row)] {
+        let Some(JsonValue::Object(map)) = payload else {
+            continue;
+        };
+        for column in map.keys() {
+            if !oggit_column_exists(client, &delta.schema_name, &delta.table_name, column).await? {
+                return Ok(Some(format!(
+                    "source DML {} on {}.{} skipped because it references missing target column {} in {}",
+                    delta.final_op, delta.schema_name, delta.table_name, column, payload_name
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn oggit_apply_delta(
+    client: &tokio_opengauss::Client,
+    source_schema: Option<&str>,
+    target_schema: &str,
+    target_table: &str,
+    final_op: &str,
+    key_json: &Option<JsonValue>,
+    expected_row: &Option<JsonValue>,
+    new_row: &Option<JsonValue>,
+    overwrite: bool,
+) -> Result<OggitApplyResult> {
+    if !oggit_table_exists(client, target_schema, target_table).await? {
+        bail!("target table {target_schema}.{target_table} does not exist");
+    }
+
+    match final_op {
+        "INSERT" => {
+            let payload = oggit_json_merge(key_json.as_ref(), new_row.as_ref());
+            let mut cols = Vec::new();
+            let mut vals = Vec::new();
+            let mut update_sets = Vec::new();
+            let mut skipped_sequence_cols = Vec::new();
+            if let JsonValue::Object(map) = payload {
+                for (key, value) in map {
+                    if oggit_is_sequence_owned_column(client, target_schema, target_table, &key)
+                        .await?
+                    {
+                        skipped_sequence_cols.push((key, value));
+                        continue;
+                    }
+                    if !oggit_column_exists(client, target_schema, target_table, &key).await? {
+                        continue;
+                    }
+                    cols.push(quote_sql_ident(&key));
+                    vals.push(oggit_json_sql_value(&value));
+                }
+            }
+            if overwrite {
+                if let Some(JsonValue::Object(map)) = new_row {
+                    for (key, value) in map {
+                        if oggit_column_exists(client, target_schema, target_table, key).await? {
+                            update_sets.push(format!(
+                                "{} = {}",
+                                quote_sql_ident(key),
+                                oggit_json_sql_value(value)
+                            ));
+                        }
+                    }
+                }
+                if !update_sets.is_empty() {
+                    let update_sql = format!(
+                        "UPDATE {}.{} t SET {} WHERE {}",
+                        quote_sql_ident(target_schema),
+                        quote_sql_ident(target_table),
+                        update_sets.join(", "),
+                        oggit_json_where_expr("t", key_json)
+                    );
+                    let affected = client
+                        .execute(update_sql.as_str(), &[])
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to overwrite existing row in {target_schema}.{target_table}"
+                            )
+                        })?;
+                    if affected > 1 {
+                        bail!(
+                            "oggit overwrite insert expected at most 1 row in {target_schema}.{target_table}, affected {affected}"
+                        );
+                    }
+                    if affected == 1 {
+                        return Ok(OggitApplyResult::new("updated"));
+                    }
+                }
+            }
+
+            let returning = if skipped_sequence_cols.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " RETURNING {}",
+                    skipped_sequence_cols
+                        .iter()
+                        .map(|(col, _)| format!("{}::text", quote_sql_ident(col)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let sql = if cols.is_empty() {
+                format!(
+                    "INSERT INTO {}.{} DEFAULT VALUES{}",
+                    quote_sql_ident(target_schema),
+                    quote_sql_ident(target_table),
+                    returning
+                )
+            } else {
+                format!(
+                    "INSERT INTO {}.{} ({}) VALUES ({}){}",
+                    quote_sql_ident(target_schema),
+                    quote_sql_ident(target_table),
+                    cols.join(", "),
+                    vals.join(", "),
+                    returning
+                )
+            };
+            if skipped_sequence_cols.is_empty() {
+                client.execute(sql.as_str(), &[]).await.with_context(|| {
+                    format!("failed to apply oggit insert to {target_schema}.{target_table}")
+                })?;
+                Ok(OggitApplyResult::new("inserted"))
+            } else {
+                let row = client.query_one(sql.as_str(), &[]).await.with_context(|| {
+                    format!("failed to apply oggit insert to {target_schema}.{target_table}")
+                })?;
+                let mut generated = JsonMap::new();
+                for (idx, (column, old_value)) in skipped_sequence_cols.iter().enumerate() {
+                    let returned: Option<String> = row.get(idx);
+                    generated.insert(
+                        column.clone(),
+                        oggit_json_value_from_returned_text(old_value, returned),
+                    );
+                }
+                Ok(OggitApplyResult::with_generated_key(
+                    "inserted",
+                    JsonValue::Object(generated),
+                ))
+            }
+        }
+        "UPDATE" => {
+            let mut sets = Vec::new();
+            if let Some(JsonValue::Object(map)) = new_row {
+                for (key, value) in map {
+                    if oggit_column_exists(client, target_schema, target_table, key).await? {
+                        sets.push(format!(
+                            "{} = {}",
+                            quote_sql_ident(key),
+                            oggit_json_sql_value(value)
+                        ));
+                    }
+                }
+            }
+            if sets.is_empty() {
+                return Ok(OggitApplyResult::new("skipped"));
+            }
+            let sql = format!(
+                "UPDATE {}.{} t SET {} WHERE {}",
+                quote_sql_ident(target_schema),
+                quote_sql_ident(target_table),
+                sets.join(", "),
+                if overwrite {
+                    oggit_json_where_expr("t", key_json)
+                } else {
+                    oggit_json_defensive_where_expr("t", key_json, expected_row)
+                }
+            );
+            let affected = client.execute(sql.as_str(), &[]).await.with_context(|| {
+                format!("failed to apply oggit update to {target_schema}.{target_table}")
+            })?;
+            if overwrite && affected == 0 {
+                let source_schema = source_schema.with_context(|| {
+                    format!(
+                        "cannot restore missing target row in {target_schema}.{target_table}: source schema is unavailable"
+                    )
+                })?;
+                let complete_row =
+                    oggit_read_complete_source_row(client, source_schema, target_table, key_json)
+                        .await?;
+                oggit_insert_complete_row(client, target_schema, target_table, &complete_row)
+                    .await?;
+                return Ok(OggitApplyResult::new("inserted"));
+            }
+            if affected != 1 {
+                bail!(
+                    "oggit update expected 1 row in {target_schema}.{target_table}, affected {affected}"
+                );
+            }
+            Ok(OggitApplyResult::new("updated"))
+        }
+        "DELETE" => {
+            let sql = format!(
+                "DELETE FROM {}.{} t WHERE {}",
+                quote_sql_ident(target_schema),
+                quote_sql_ident(target_table),
+                if overwrite {
+                    oggit_json_where_expr("t", key_json)
+                } else {
+                    oggit_json_defensive_where_expr("t", key_json, expected_row)
+                }
+            );
+            let affected = client.execute(sql.as_str(), &[]).await.with_context(|| {
+                format!("failed to apply oggit delete to {target_schema}.{target_table}")
+            })?;
+            if affected != 1 {
+                if overwrite && affected == 0 {
+                    return Ok(OggitApplyResult::new("skipped"));
+                }
+                bail!(
+                    "oggit delete expected 1 row in {target_schema}.{target_table}, affected {affected}"
+                );
+            }
+            Ok(OggitApplyResult::new("deleted"))
+        }
+        _ => Ok(OggitApplyResult::new("skipped")),
+    }
+}
+
+async fn oggit_apply_delta_locked(
+    client: &tokio_opengauss::Client,
+    source_schema: Option<&str>,
+    target_schema: &str,
+    target_table: &str,
+    final_op: &str,
+    key_json: &Option<JsonValue>,
+    expected_row: &Option<JsonValue>,
+    new_row: &Option<JsonValue>,
+    overwrite: bool,
+) -> Result<OggitApplyResult> {
+    client
+        .batch_execute(&format!(
+            "LOCK TABLE {}.{} IN SHARE ROW EXCLUSIVE MODE",
+            quote_sql_ident(target_schema),
+            quote_sql_ident(target_table)
+        ))
+        .await
+        .context("failed to lock oggit target table")?;
+    oggit_apply_delta(
+        client,
+        source_schema,
+        target_schema,
+        target_table,
+        final_op,
+        key_json,
+        expected_row,
+        new_row,
+        overwrite,
+    )
+    .await
+}
+
+async fn oggit_apply_object_change(
+    client: &tokio_opengauss::Client,
+    object: &OggitObjectChange,
+    direction: OggitMergeDirection,
+) -> Result<String> {
+    if !oggit_object_change_can_auto_apply(object, direction) {
+        bail!(
+            "oggit object change {}.{} ({}) cannot be replayed automatically: {}",
+            object.schema_name.clone().unwrap_or_default(),
+            object.object_name.clone().unwrap_or_default(),
+            object.object_type,
+            object.safety_class
+        );
+    }
+
+    let replay_sql = object
+        .change_json
+        .get("sql")
+        .and_then(JsonValue::as_str)
+        .filter(|sql| !sql.is_empty());
+    let Some(replay_sql) = replay_sql else {
+        return Ok("skipped".to_string());
+    };
+    if !matches!(
+        object.object_type.as_str(),
+        "TABLE" | "COLUMN" | "INDEX" | "CONSTRAINT" | "VIEW" | "SCHEMA"
+    ) {
+        bail!(
+            "oggit object change {}.{} ({}) cannot be replayed automatically",
+            object.schema_name.clone().unwrap_or_default(),
+            object.object_name.clone().unwrap_or_default(),
+            object.object_type
+        );
+    }
+
+    client
+        .batch_execute(replay_sql)
+        .await
+        .with_context(|| format!("failed to apply oggit object change {replay_sql}"))?;
+    Ok("applied".to_string())
+}
+
+async fn oggit_apply_object_change_confirmed_theirs(
+    client: &tokio_opengauss::Client,
+    object: &OggitObjectChange,
+) -> Result<String> {
+    if oggit_object_change_is_internal(object) || oggit_object_change_is_merge_barrier_ddl(object) {
+        bail!(
+            "oggit object change {}.{} ({}) cannot be replayed from a manual theirs resolution because it targets internal merge metadata",
+            object.schema_name.clone().unwrap_or_default(),
+            object.object_name.clone().unwrap_or_default(),
+            object.object_type
+        );
+    }
+
+    let replay_sql = object
+        .change_json
+        .get("sql")
+        .and_then(JsonValue::as_str)
+        .filter(|sql| !sql.is_empty())
+        .with_context(|| {
+            format!(
+                "manual theirs object change {}.{} ({}) has no replay SQL; resolve with custom_sql instead",
+                object.schema_name.clone().unwrap_or_default(),
+                object.object_name.clone().unwrap_or_default(),
+                object.object_type
+            )
+        })?;
+
+    client
+        .batch_execute(replay_sql)
+        .await
+        .with_context(|| format!("failed to apply confirmed oggit object change {replay_sql}"))?;
+    Ok("applied".to_string())
+}
+
+async fn oggit_validate_object_change(
+    client: &tokio_opengauss::Client,
+    object: &OggitObjectChange,
+) -> Result<()> {
+    let replay_sql = object
+        .change_json
+        .get("sql")
+        .and_then(JsonValue::as_str)
+        .filter(|sql| !sql.is_empty())
+        .context("requires_validation object change has no replay SQL")?;
+
+    client
+        .batch_execute("SAVEPOINT oggit_validate_object")
+        .await
+        .context("failed to create oggit validation savepoint")?;
+    let validation = client.batch_execute(replay_sql).await;
+    client
+        .batch_execute(
+            "ROLLBACK TO SAVEPOINT oggit_validate_object; RELEASE SAVEPOINT oggit_validate_object",
+        )
+        .await
+        .context("failed to rollback oggit validation savepoint")?;
+
+    validation.with_context(|| format!("object validation failed for {replay_sql}"))
+}
+
+fn oggit_object_change_review_reason(object: &OggitObjectChange) -> String {
+    match object.safety_class.as_str() {
+        "semantic" => "semantic DDL requires manual object-level merge review".to_string(),
+        "destructive" => "destructive DDL requires manual object-level merge review".to_string(),
+        "unsupported" => object
+            .unsupported_reason
+            .clone()
+            .unwrap_or_else(|| "DDL is not supported by object-level merge".to_string()),
+        safety_class => format!("{safety_class} DDL requires object-level merge review"),
+    }
+}
+
+fn oggit_object_change_can_auto_apply(
+    object: &OggitObjectChange,
+    direction: OggitMergeDirection,
+) -> bool {
+    match direction {
+        OggitMergeDirection::ParentToChild => matches!(
+            object.safety_class.as_str(),
+            "safe_additive" | "requires_validation" | "semantic" | "destructive"
+        ),
+        OggitMergeDirection::ChildToParent => matches!(
+            object.safety_class.as_str(),
+            "safe_additive" | "requires_validation"
+        ),
+    }
+}
+
+async fn oggit_ensure_merge_origin_metadata(client: &tokio_opengauss::Client) -> Result<()> {
+    if !oggit_column_exists(client, "oggit", "change_log", "merge_id").await? {
+        client
+            .batch_execute("ALTER TABLE oggit.change_log ADD COLUMN merge_id uuid")
+            .await
+            .context("failed to add oggit.change_log.merge_id")?;
+    }
+    if !oggit_column_exists(client, "oggit", "object_change", "merge_id").await? {
+        client
+            .batch_execute("ALTER TABLE oggit.object_change ADD COLUMN merge_id uuid")
+            .await
+            .context("failed to add oggit.object_change.merge_id")?;
+    }
+    if !oggit_index_exists(client, "oggit", "change_log_merge_id_idx").await? {
+        client
+            .batch_execute("CREATE INDEX change_log_merge_id_idx ON oggit.change_log (merge_id)")
+            .await
+            .context("failed to create oggit.change_log merge_id index")?;
+    }
+    if !oggit_index_exists(client, "oggit", "object_change_merge_id_idx").await? {
+        client
+            .batch_execute(
+                "CREATE INDEX object_change_merge_id_idx ON oggit.object_change (merge_id)",
+            )
+            .await
+            .context("failed to create oggit.object_change merge_id index")?;
+    }
+    if !oggit_table_exists(client, "oggit", "merge_event_marker").await? {
+        client
+            .batch_execute(
+                "CREATE TABLE oggit.merge_event_marker (
+                    id bigserial PRIMARY KEY,
+                    merge_id uuid NOT NULL,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                )",
+            )
+            .await
+            .context("failed to create oggit.merge_event_marker")?;
+    }
+    Ok(())
+}
+
+async fn oggit_ensure_merge_history_direction_column(
+    client: &tokio_opengauss::Client,
+) -> Result<()> {
+    if oggit_table_exists(client, "oggit", "merge_history").await?
+        && !oggit_column_exists(client, "oggit", "merge_history", "merge_direction").await?
+    {
+        client
+            .batch_execute(
+                "ALTER TABLE oggit.merge_history
+                    ADD COLUMN merge_direction text NOT NULL DEFAULT 'child_to_parent'",
+            )
+            .await
+            .context("failed to add oggit.merge_history.merge_direction")?;
+    }
+    Ok(())
+}
+
+async fn oggit_set_merge_apply_session(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+) -> Result<()> {
+    oggit_ensure_merge_origin_metadata(client).await?;
+    client
+        .batch_execute("SET LOCAL neon.oggit_apply_merge = 'on'")
+        .await
+        .context("failed to mark oggit merge apply session")?;
+    client
+        .execute(
+            "INSERT INTO oggit.merge_event_marker (merge_id) VALUES ($1::text::uuid)",
+            &[&merge_id],
+        )
+        .await
+        .context("failed to mark oggit merge origin")?;
+    Ok(())
+}
+
+pub(crate) async fn oggit_finalize_merge_commit_lsn(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+) -> Result<()> {
+    oggit_ensure_merge_origin_metadata(client).await?;
+    let row = client
+        .query_one("SELECT pg_current_xlog_location()::text", &[])
+        .await
+        .context("failed to read post-merge target LSN")?;
+    let post_merge_lsn: String = row.get(0);
+
+    oggit_wait_metadata_lsn(client, "oggit", &post_merge_lsn, "target merge apply").await?;
+
+    let rows = client
+        .query(
+            "SELECT commit_lsn
+               FROM oggit.change_log
+              WHERE merge_id = $1::text::uuid
+             UNION ALL
+             SELECT commit_lsn
+               FROM oggit.object_change
+              WHERE merge_id = $1::text::uuid",
+            &[&merge_id],
+        )
+        .await
+        .context("failed to read oggit merge-origin events")?;
+
+    let merge_commit_lsn = rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .max_by_key(|lsn| oggit_lsn_value(lsn));
+
+    if let Some(merge_commit_lsn) = merge_commit_lsn {
+        client
+            .execute(
+                "UPDATE oggit.merge_history
+                    SET merge_commit_lsn = $2,
+                        finished_at = COALESCE(finished_at, now())
+                  WHERE merge_id = $1::text::uuid
+                    AND status = 'applied'",
+                &[&merge_id, &merge_commit_lsn],
+            )
+            .await
+            .context("failed to finalize oggit merge commit LSN")?;
+    }
+
+    Ok(())
+}
