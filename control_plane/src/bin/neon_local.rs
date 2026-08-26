@@ -56,7 +56,7 @@ use safekeeper_api::{
 use storage_broker::DEFAULT_LISTEN_ADDR as DEFAULT_BROKER_ADDR;
 use tokio::task::JoinSet;
 use tokio_opengauss::NoTls;
-use url::Host;
+use url::{Host, Url};
 use utils::auth::{Claims, Scope};
 use utils::id::{NodeId, TenantId, TenantTimelineId, TimelineId};
 use utils::lsn::Lsn;
@@ -64,9 +64,9 @@ use utils::project_git_version;
 
 mod merge_oggit;
 use merge_oggit::{
-    oggit_abort_merge, oggit_continue_merge, oggit_diff_from_meta, oggit_freeze_metadata_lsn,
-    oggit_json_text, oggit_merge_from_meta, oggit_merge_status, oggit_read_conflicts,
-    oggit_resolve_conflict, oggit_resolve_conflict_sql,
+    oggit_abort_merge, oggit_continue_merge, oggit_diff_from_meta, oggit_finalize_merge_commit_lsn,
+    oggit_freeze_metadata_lsn, oggit_json_text, oggit_merge_from_meta, oggit_merge_status,
+    oggit_read_conflicts, oggit_resolve_conflict, oggit_resolve_conflict_sql,
 };
 
 // Default id of a safekeeper node, if not specified on the command line.
@@ -266,6 +266,22 @@ enum BranchCmd {
     Abort(BranchAbortCmdArgs),
 }
 
+impl BranchCmd {
+    fn uses_only_connstrs(&self) -> bool {
+        match self {
+            BranchCmd::Diff(args) => args.source_connstr.is_some() && args.target_connstr.is_some(),
+            BranchCmd::Merge(args) => {
+                args.source_connstr.is_some() && args.target_connstr.is_some()
+            }
+            BranchCmd::MergeStatus(args) => args.target_connstr.is_some(),
+            BranchCmd::Conflicts(args) => args.target_connstr.is_some(),
+            BranchCmd::Resolve(args) => args.target_connstr.is_some(),
+            BranchCmd::Continue(args) => args.target_connstr.is_some(),
+            BranchCmd::Abort(args) => args.target_connstr.is_some(),
+        }
+    }
+}
+
 #[derive(clap::Args)]
 #[clap(about = "Diff a source branch against a target branch")]
 struct BranchDiffCmdArgs {
@@ -276,16 +292,22 @@ struct BranchDiffCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Source branch name")]
-    source_branch: String,
+    source_branch: Option<String>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the source branch")]
     source_endpoint: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external source endpoint")]
+    source_connstr: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(
         long,
@@ -360,16 +382,22 @@ struct BranchMergeCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Source branch name")]
-    source_branch: String,
+    source_branch: Option<String>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the source branch")]
     source_endpoint: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external source endpoint")]
+    source_connstr: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(
         long,
@@ -436,10 +464,13 @@ struct BranchMergeStatusCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
@@ -461,10 +492,13 @@ struct BranchConflictsCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
@@ -503,10 +537,13 @@ struct BranchResolveCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
@@ -541,10 +578,13 @@ struct BranchContinueCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
@@ -566,10 +606,13 @@ struct BranchAbortCmdArgs {
     tenant_id: Option<TenantId>,
 
     #[clap(long, help = "Target branch name")]
-    target_branch: String,
+    target_branch: Option<String>,
 
     #[clap(long, help = "Running endpoint id for the target branch")]
     target_endpoint: Option<String>,
+
+    #[clap(long, help = "Connection string for an external target endpoint")]
+    target_connstr: Option<String>,
 
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
@@ -1169,6 +1212,16 @@ impl RepoLock {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if let NeonLocalCmd::Branch(subcmd) = &cli.command {
+        if subcmd.uses_only_connstrs() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            return rt.block_on(handle_branch(subcmd, None));
+        }
+    }
+
     // Check for 'neon init' command first.
     let (subcommand_result, _lock) = if let NeonLocalCmd::Init(args) = cli.command {
         (handle_init(&args).map(|env| Some(Cow::Owned(env))), None)
@@ -1204,7 +1257,7 @@ fn main() -> Result<()> {
             }
             NeonLocalCmd::Endpoint(subcmd) => rt.block_on(handle_endpoint(&subcmd, env)),
             NeonLocalCmd::Mappings(subcmd) => handle_mappings(&subcmd, env),
-            NeonLocalCmd::Branch(subcmd) => rt.block_on(handle_branch(&subcmd, env)),
+            NeonLocalCmd::Branch(subcmd) => rt.block_on(handle_branch(&subcmd, Some(env))),
         };
 
         let subcommand_result = if &original_env != env {
@@ -1917,15 +1970,190 @@ fn resolve_branch_endpoint(
     Ok(matches.remove(0))
 }
 
-async fn connect_to_endpoint(
-    endpoint: &Endpoint,
+struct BranchEndpointRef {
+    endpoint_id: String,
+    branch_name: String,
+    connstr: String,
+    fdw_host: String,
+    fdw_port: u16,
+    user: String,
+    password: Option<String>,
+    database: String,
+}
+
+impl BranchEndpointRef {
+    fn from_local(
+        endpoint_id: String,
+        endpoint: Arc<Endpoint>,
+        branch_name: String,
+        user: &str,
+        database: &str,
+    ) -> Self {
+        Self {
+            endpoint_id,
+            branch_name,
+            connstr: endpoint.connstr(user, database),
+            fdw_host: endpoint.pg_address.ip().to_string(),
+            fdw_port: endpoint.pg_address.port(),
+            user: user.to_string(),
+            password: None,
+            database: database.to_string(),
+        }
+    }
+
+    fn from_connstr(
+        connstr: &str,
+        branch_name: Option<&String>,
+        fallback_name: &str,
+        fallback_user: &str,
+        fallback_database: &str,
+    ) -> Result<Self> {
+        let (fdw_host, fdw_port, user, password, database) =
+            parse_external_connstr(connstr, fallback_user, fallback_database)?;
+        let branch_name = branch_name
+            .cloned()
+            .unwrap_or_else(|| fallback_name.to_string());
+
+        Ok(Self {
+            endpoint_id: connstr.to_string(),
+            branch_name,
+            connstr: connstr.to_string(),
+            fdw_host,
+            fdw_port,
+            user,
+            password,
+            database,
+        })
+    }
+}
+
+fn parse_external_connstr(
+    connstr: &str,
+    fallback_user: &str,
+    fallback_database: &str,
+) -> Result<(String, u16, String, Option<String>, String)> {
+    if connstr.starts_with("postgresql://") || connstr.starts_with("postgres://") {
+        let url = Url::parse(connstr).context("invalid endpoint connection string")?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("endpoint connection string must include host"))?
+            .to_string();
+        let port = url.port().unwrap_or(5432);
+        let user = if url.username().is_empty() {
+            fallback_user.to_string()
+        } else {
+            url.username().to_string()
+        };
+        let password = url
+            .password()
+            .map(urlencoding::decode)
+            .transpose()
+            .context("invalid percent-encoding in endpoint password")?
+            .map(Cow::into_owned);
+        let database = url.path().trim_start_matches('/');
+        let database = if database.is_empty() {
+            fallback_database.to_string()
+        } else {
+            database.to_string()
+        };
+        return Ok((host, port, user, password, database));
+    }
+
+    let mut host = None;
+    let mut port = None;
+    let mut user = None;
+    let mut password = None;
+    let mut database = None;
+    for part in connstr.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.trim_matches('\'').trim_matches('"');
+        match key {
+            "host" => host = Some(value.to_string()),
+            "port" => port = Some(value.parse::<u16>().context("invalid connstr port")?),
+            "user" => user = Some(value.to_string()),
+            "password" => password = Some(value.to_string()),
+            "dbname" | "database" => database = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    let host = host.ok_or_else(|| anyhow!("endpoint connection string must include host"))?;
+    Ok((
+        host,
+        port.unwrap_or(5432),
+        user.unwrap_or_else(|| fallback_user.to_string()),
+        password,
+        database.unwrap_or_else(|| fallback_database.to_string()),
+    ))
+}
+
+fn require_branch_env<'a>(env: Option<&'a local_env::LocalEnv>) -> Result<&'a local_env::LocalEnv> {
+    env.context("local branch endpoint mode requires an initialized NEON_REPO_DIR; use --source-connstr/--target-connstr for Docker endpoints")
+}
+
+fn resolve_branch_endpoint_ref(
+    cplane: Option<&ComputeControlPlane>,
+    env: Option<&local_env::LocalEnv>,
+    tenant_id: Option<TenantId>,
+    branch_name: &Option<String>,
+    endpoint_id: &Option<String>,
+    connstr: &Option<String>,
+    endpoint_arg_name: &str,
+    fallback_name: &str,
     user: &str,
     database: &str,
+) -> Result<BranchEndpointRef> {
+    if let Some(connstr) = connstr {
+        if endpoint_id.is_some() {
+            bail!(
+                "pass either --{endpoint_arg_name}-endpoint or --{endpoint_arg_name}-connstr, not both"
+            );
+        }
+        return BranchEndpointRef::from_connstr(
+            connstr,
+            branch_name.as_ref(),
+            fallback_name,
+            user,
+            database,
+        );
+    }
+
+    let branch_name = branch_name.as_ref().with_context(|| {
+        format!("--{endpoint_arg_name}-branch is required without --{endpoint_arg_name}-connstr")
+    })?;
+    let tenant_id = tenant_id.with_context(|| {
+        format!("--tenant-id or default tenant is required without --{endpoint_arg_name}-connstr")
+    })?;
+    let cplane = cplane.with_context(|| {
+        format!("local --{endpoint_arg_name}-branch lookup requires endpoint metadata")
+    })?;
+    let env = require_branch_env(env)?;
+    let (endpoint_id, endpoint) = resolve_branch_endpoint(
+        cplane,
+        env,
+        tenant_id,
+        branch_name,
+        endpoint_id,
+        endpoint_arg_name,
+    )?;
+
+    Ok(BranchEndpointRef::from_local(
+        endpoint_id,
+        endpoint,
+        branch_name.clone(),
+        user,
+        database,
+    ))
+}
+
+async fn connect_to_branch_endpoint(
+    endpoint: &BranchEndpointRef,
 ) -> Result<tokio_opengauss::Client> {
-    let connstr = endpoint.connstr(user, database);
-    let (client, connection) = tokio_opengauss::connect(&connstr, NoTls)
+    let (client, connection) = tokio_opengauss::connect(&endpoint.connstr, NoTls)
         .await
-        .with_context(|| format!("failed to connect to endpoint at {connstr}"))?;
+        .with_context(|| format!("failed to connect to endpoint at {}", endpoint.connstr))?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -1981,14 +2209,12 @@ fn quote_sql_literal(value: &str) -> String {
 
 async fn import_branch_source_foreign_tables(
     target_client: &mut tokio_opengauss::Client,
-    source_endpoint: &Endpoint,
+    source_endpoint: &BranchEndpointRef,
     source_schema: &str,
     fdw_schema: &str,
     fdw_server: &str,
-    database: &str,
-    user: &str,
 ) -> Result<()> {
-    let source_client = connect_to_endpoint(source_endpoint, user, database).await?;
+    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
     let rows = source_client
         .query(
             "SELECT c.relname::text,
@@ -2080,11 +2306,12 @@ async fn import_source_oggit_foreign_tables(
             "oggit_change_log",
             "change_log",
             "id bigint,
-             commit_lsn text,
-             record_lsn text,
-             xid text,
-             ordinal integer,
-             op text,
+			 commit_lsn text,
+			 record_lsn text,
+			 xid text,
+			 merge_id uuid,
+			 ordinal integer,
+			 op text,
              schema_name text,
              table_name text,
              relid oid,
@@ -2100,8 +2327,9 @@ async fn import_source_oggit_foreign_tables(
             "oggit_object_change",
             "object_change",
             "id bigint,
-             commit_lsn text,
-             ordinal integer,
+			 commit_lsn text,
+			 merge_id uuid,
+			 ordinal integer,
              object_type text,
              schema_name text,
              object_name text,
@@ -2216,11 +2444,9 @@ async fn read_database_compatibility(client: &tokio_opengauss::Client) -> Result
 
 async fn ensure_branch_database_compatibility(
     target_client: &tokio_opengauss::Client,
-    source_endpoint: &Endpoint,
-    database: &str,
-    user: &str,
+    source_endpoint: &BranchEndpointRef,
 ) -> Result<()> {
-    let source_client = connect_to_endpoint(source_endpoint, user, database).await?;
+    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
     let source_compatibility = read_database_compatibility(&source_client)
         .await
         .context("failed to read source database compatibility")?;
@@ -2230,7 +2456,10 @@ async fn ensure_branch_database_compatibility(
 
     if source_compatibility != target_compatibility {
         bail!(
-            "database compatibility mismatch: source database {database} is {source_compatibility}, target database {database} is {target_compatibility}"
+            "database compatibility mismatch: source database {} is {}, target database is {}",
+            source_endpoint.database,
+            source_compatibility,
+            target_compatibility,
         );
     }
 
@@ -2579,15 +2808,13 @@ async fn load_source_indexes(
 
 async fn copy_source_only_tables_with_schema(
     target_client: &mut tokio_opengauss::Client,
-    source_endpoint: &Endpoint,
+    source_endpoint: &BranchEndpointRef,
     source_schema: &str,
     target_schema: &str,
     fdw_schema: &str,
-    database: &str,
-    user: &str,
     copy_source_only_tables: bool,
 ) -> Result<(Vec<(String, i64)>, Vec<String>)> {
-    let source_client = connect_to_endpoint(source_endpoint, user, database).await?;
+    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
     reject_unsupported_source_schema_objects(&source_client, source_schema).await?;
 
     target_client
@@ -2726,33 +2953,39 @@ async fn prepare_branch_source_fdw(
     args_source_schema: &str,
     fdw_schema: &str,
     fdw_server: &str,
-    source_endpoint: &Endpoint,
-    database: &str,
-    user: &str,
+    source_endpoint: &BranchEndpointRef,
 ) -> Result<()> {
     client
         .batch_execute("CREATE EXTENSION IF NOT EXISTS neon")
         .await
         .context("failed to create neon extension on target endpoint")?;
 
-    let source_host = source_endpoint.pg_address.ip().to_string();
-    let source_port = i32::from(source_endpoint.pg_address.port());
+    let source_port = i32::from(source_endpoint.fdw_port);
+
+    let user_mapping_options = match &source_endpoint.password {
+        Some(password) => format!(
+            "user {}, password {}",
+            quote_sql_literal(&source_endpoint.user),
+            quote_sql_literal(password)
+        ),
+        None => format!("user {}", quote_sql_literal(&source_endpoint.user)),
+    };
 
     let prepare_sql = format!(
         "DROP SERVER IF EXISTS {} CASCADE;
          DROP SCHEMA IF EXISTS {} CASCADE;
          CREATE SCHEMA {};
          CREATE SERVER {} FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host {}, port {}, dbname {});
-         CREATE USER MAPPING FOR CURRENT_USER SERVER {} OPTIONS (user {});",
+         CREATE USER MAPPING FOR CURRENT_USER SERVER {} OPTIONS ({});",
         quote_sql_ident(fdw_server),
         quote_sql_ident(fdw_schema),
         quote_sql_ident(fdw_schema),
         quote_sql_ident(fdw_server),
-        quote_sql_literal(&source_host),
+        quote_sql_literal(&source_endpoint.fdw_host),
         quote_sql_literal(&source_port.to_string()),
-        quote_sql_literal(database),
+        quote_sql_literal(&source_endpoint.database),
         quote_sql_ident(fdw_server),
-        quote_sql_literal(user),
+        user_mapping_options,
     );
 
     client
@@ -2766,8 +2999,6 @@ async fn prepare_branch_source_fdw(
         args_source_schema,
         fdw_schema,
         fdw_server,
-        database,
-        user,
     )
     .await
     .context("failed to create source foreign tables")?;
@@ -2795,36 +3026,54 @@ async fn cleanup_branch_source_fdw(
     Ok(())
 }
 
-async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<()> {
-    let cplane = ComputeControlPlane::load(env.clone())?;
-
+async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) -> Result<()> {
     match subcmd {
         BranchCmd::Diff(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (source_endpoint_id, source_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.source_connstr.is_none() || args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let source_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.source_branch,
                 &args.source_endpoint,
+                &args.source_connstr,
                 "source",
+                "source",
+                &args.user,
+                &args.database,
             )?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
             println!(
                 "Diffing source branch '{}' ({}) against target branch '{}' ({})",
-                args.source_branch, source_endpoint_id, args.target_branch, target_endpoint_id
+                source_endpoint.branch_name,
+                source_endpoint.endpoint_id,
+                target_endpoint.branch_name,
+                target_endpoint.endpoint_id
             );
 
-            let mut client =
-                connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let mut client = connect_to_branch_endpoint(&target_endpoint).await?;
             lock_branch_fdw_workspace(&client).await?;
             let parent_command_lsn = if args.incremental_oggit {
                 Some(current_endpoint_lsn(&client).await?)
@@ -2832,27 +3081,18 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                 None
             };
             let child_command_lsn = if args.incremental_oggit {
-                let source_client =
-                    connect_to_endpoint(&source_endpoint, &args.user, &args.database).await?;
+                let source_client = connect_to_branch_endpoint(&source_endpoint).await?;
                 Some(current_endpoint_lsn(&source_client).await?)
             } else {
                 None
             };
-            ensure_branch_database_compatibility(
-                &client,
-                &source_endpoint,
-                &args.database,
-                &args.user,
-            )
-            .await?;
+            ensure_branch_database_compatibility(&client, &source_endpoint).await?;
             prepare_branch_source_fdw(
                 &mut client,
                 &args.source_schema,
                 &OGGIT_FDW_SCHEMA,
                 &args.fdw_server,
                 &source_endpoint,
-                &args.database,
-                &args.user,
             )
             .await?;
 
@@ -2937,35 +3177,52 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             }
         }
         BranchCmd::Merge(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (source_endpoint_id, source_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.source_connstr.is_none() || args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let source_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.source_branch,
                 &args.source_endpoint,
+                &args.source_connstr,
                 "source",
+                "source",
+                &args.user,
+                &args.database,
             )?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
             println!(
                 "Merging source branch '{}' ({}) into target branch '{}' ({}) with strategy '{}'",
-                args.source_branch,
-                source_endpoint_id,
-                args.target_branch,
-                target_endpoint_id,
+                source_endpoint.branch_name,
+                source_endpoint.endpoint_id,
+                target_endpoint.branch_name,
+                target_endpoint.endpoint_id,
                 args.strategy.as_str()
             );
 
-            let mut client =
-                connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let mut client = connect_to_branch_endpoint(&target_endpoint).await?;
             lock_branch_fdw_workspace(&client).await?;
             let parent_command_lsn = if args.incremental_oggit {
                 Some(current_endpoint_lsn(&client).await?)
@@ -2973,8 +3230,7 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                 None
             };
             let child_command_lsn = if args.incremental_oggit {
-                let source_client =
-                    connect_to_endpoint(&source_endpoint, &args.user, &args.database).await?;
+                let source_client = connect_to_branch_endpoint(&source_endpoint).await?;
                 let requested_lsn = current_endpoint_lsn(&source_client).await?;
                 oggit_freeze_metadata_lsn(&source_client, &requested_lsn, "child")
                     .await
@@ -2988,21 +3244,13 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     .await
                     .context("failed to freeze parent oggit metadata before merge")?;
             }
-            ensure_branch_database_compatibility(
-                &client,
-                &source_endpoint,
-                &args.database,
-                &args.user,
-            )
-            .await?;
+            ensure_branch_database_compatibility(&client, &source_endpoint).await?;
             prepare_branch_source_fdw(
                 &mut client,
                 &args.source_schema,
                 &OGGIT_FDW_SCHEMA,
                 &args.fdw_server,
                 &source_endpoint,
-                &args.database,
-                &args.user,
             )
             .await?;
 
@@ -3055,6 +3303,11 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     .batch_execute("COMMIT")
                     .await
                     .context("failed to commit branch merge transaction")?;
+                if merge_result.status == "applied" {
+                    oggit_finalize_merge_commit_lsn(&client, &merge_result.merge_id)
+                        .await
+                        .context("failed to finalize oggit merge commit LSN")?;
+                }
 
                 if merge_result.status == "blocked" && !args.keep_fdw {
                     eprintln!(
@@ -3077,6 +3330,9 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     merge_result.conflict_count,
                     merge_result.applied_count
                 );
+                for detail in &merge_result.skipped_details {
+                    println!("oggit.skipped\t{detail}");
+                }
                 if merge_result.status == "failed" {
                     bail!("branch merge failed");
                 }
@@ -3096,8 +3352,6 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     &args.source_schema,
                     &args.target_schema,
                     &OGGIT_FDW_SCHEMA,
-                    &args.database,
-                    &args.user,
                     copy_source_only_tables,
                 )
                 .await?;
@@ -3171,17 +3425,31 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             }
         }
         BranchCmd::MergeStatus(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
-            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let client = connect_to_branch_endpoint(&target_endpoint).await?;
             let (history, pending_conflict_count) = oggit_merge_status(&client, &args.merge_id)
                 .await
                 .context("failed to read oggit merge status")?
@@ -3190,8 +3458,8 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             println!(
                 "oggit.merge\tmerge_id={}\tbranch={} ({})\tchild_timeline={}\tparent_timeline={}\tbase_lsn={}\tchild_to_lsn={}\tparent_to_lsn={}\tstrategy={}\tstatus={}\tconflicts={}\tpending={}",
                 history.merge_id,
-                args.target_branch,
-                target_endpoint_id,
+                target_endpoint.branch_name,
+                target_endpoint.endpoint_id,
                 history.child_timeline_id,
                 history.parent_timeline_id,
                 history.base_lsn,
@@ -3204,22 +3472,36 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             );
         }
         BranchCmd::Conflicts(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
             println!(
                 "Listing oggit merge conflicts on target branch '{}' ({}) for merge {}",
-                args.target_branch, target_endpoint_id, args.merge_id
+                target_endpoint.branch_name, target_endpoint.endpoint_id, args.merge_id
             );
 
-            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let client = connect_to_branch_endpoint(&target_endpoint).await?;
             for conflict in oggit_read_conflicts(&client, &args.merge_id)
                 .await
                 .context("failed to list oggit merge conflicts")?
@@ -3242,24 +3524,38 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             }
         }
         BranchCmd::Resolve(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
-            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let client = connect_to_branch_endpoint(&target_endpoint).await?;
             if let Some(custom_sql) = &args.custom_sql {
                 oggit_resolve_conflict_sql(&client, &args.merge_id, args.conflict_id, custom_sql)
                     .await
                     .context("failed to store custom oggit conflict SQL")?;
                 println!(
                     "Resolved conflict {} on target branch '{}' ({}) with custom SQL",
-                    args.conflict_id, args.target_branch, target_endpoint_id
+                    args.conflict_id, target_endpoint.branch_name, target_endpoint.endpoint_id
                 );
             } else {
                 let resolution = args
@@ -3276,29 +3572,43 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                 println!(
                     "Resolved conflict {} on target branch '{}' ({}) as {}",
                     args.conflict_id,
-                    args.target_branch,
-                    target_endpoint_id,
+                    target_endpoint.branch_name,
+                    target_endpoint.endpoint_id,
                     resolution.as_str()
                 );
             }
         }
         BranchCmd::Continue(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
             println!(
                 "Continuing oggit merge {} on target branch '{}' ({})",
-                args.merge_id, args.target_branch, target_endpoint_id
+                args.merge_id, target_endpoint.branch_name, target_endpoint.endpoint_id
             );
 
-            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let client = connect_to_branch_endpoint(&target_endpoint).await?;
             client
                 .batch_execute("BEGIN")
                 .await
@@ -3314,23 +3624,45 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                 .batch_execute("COMMIT")
                 .await
                 .context("failed to commit oggit continue transaction")?;
+            if result.status == "applied" {
+                oggit_finalize_merge_commit_lsn(&client, &result.merge_id)
+                    .await
+                    .context("failed to finalize oggit merge commit LSN")?;
+            }
             println!(
                 "oggit.merge\tmerge_id={}\tstatus={}\tconflicts={}\tapplied={}",
                 result.merge_id, result.status, result.conflict_count, result.applied_count
             );
+            for detail in &result.skipped_details {
+                println!("oggit.skipped\t{detail}");
+            }
         }
         BranchCmd::Abort(args) => {
-            let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
-                &cplane,
+            let needs_local = args.target_connstr.is_none();
+            let tenant_id = if needs_local {
+                Some(get_tenant_id(args.tenant_id, require_branch_env(env)?)?)
+            } else {
+                None
+            };
+            let cplane = if needs_local {
+                Some(ComputeControlPlane::load(require_branch_env(env)?.clone())?)
+            } else {
+                None
+            };
+            let target_endpoint = resolve_branch_endpoint_ref(
+                cplane.as_ref(),
                 env,
                 tenant_id,
                 &args.target_branch,
                 &args.target_endpoint,
+                &args.target_connstr,
                 "target",
+                "target",
+                &args.user,
+                &args.database,
             )?;
 
-            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let client = connect_to_branch_endpoint(&target_endpoint).await?;
             client
                 .batch_execute("BEGIN")
                 .await
@@ -3348,7 +3680,7 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                 .context("failed to commit oggit abort transaction")?;
             println!(
                 "Aborted oggit merge {} on target branch '{}' ({})",
-                args.merge_id, args.target_branch, target_endpoint_id
+                args.merge_id, target_endpoint.branch_name, target_endpoint.endpoint_id
             );
         }
     }
