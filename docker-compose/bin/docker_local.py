@@ -1573,3 +1573,981 @@ def cmd_timeline(args):
             "end_lsn": end_lsn,
             "pg_version": args.pg_version,
         }))
+
+
+def cmd_mappings(args):
+    if args.mappings_cmd == "list":
+        print_json(api("GET", "/v1/mappings"))
+    elif args.mappings_cmd == "map":
+        print_json(api("POST", "/v1/mappings/map", {
+            "branch_name": args.branch_name,
+            "tenant_id": args.tenant_id,
+            "timeline_id": args.timeline_id,
+        }))
+
+
+def cmd_endpoint(args):
+    if args.endpoint_cmd == "list":
+        value = api("GET", "/v1/endpoint")
+        if getattr(args, "tenant_id", None):
+            value["endpoints"] = [
+                endpoint
+                for endpoint in value.get("endpoints", [])
+                if endpoint.get("tenant_id") == args.tenant_id
+            ]
+        print_json(value)
+    elif args.endpoint_cmd == "status":
+        print_json(api("GET", f"/v1/endpoint/{args.endpoint_id}"))
+    elif args.endpoint_cmd == "create":
+        if args.oggit_database is not None and not args.enable_oggit:
+            raise SystemExit("--oggit-database requires --enable-oggit")
+        extra_config = parse_extra_config(args.config)
+        static_lsn = args.static_lsn or args.lsn
+        host_http_port = (
+            args.http_port
+            if args.http_port is not None
+            else args.external_http_port
+            if args.external_http_port is not None
+            else 3081
+        )
+        endpoint_id = args.endpoint_id or f"ep-{args.branch_name or 'main'}"
+        endpoint = {
+            "endpoint_id": endpoint_id,
+            "tenant_id": args.tenant_id,
+            "timeline_id": args.timeline_id,
+            "branch_name": args.branch_name,
+            "host_pg_port": args.pg_port,
+            "host_http_port": host_http_port,
+            "internal_http_port": args.internal_http_port,
+            "endpoint_pageserver_id": args.pageserver_id,
+            "service_name": args.service_name,
+            "static_lsn": static_lsn,
+            "hot_standby": args.hot_standby,
+            "autoprewarm": args.autoprewarm,
+            "offload_lfc_interval_seconds": args.offload_lfc_interval_seconds,
+            "pg_version": args.pg_version,
+            "grpc": args.grpc,
+            "config_only": args.config_only,
+            "enable_oggit": args.enable_oggit,
+            "oggit_database": args.oggit_database or "postgres",
+            "update_catalog": args.update_catalog,
+            "create_test_user": False,
+            "privileged_role_name": args.privileged_role_name,
+            "extra_config": extra_config,
+        }
+        endpoint, _changed = resolve_endpoint_host_ports(endpoint)
+        print_json(api("POST", "/v1/endpoint", endpoint))
+    elif args.endpoint_cmd == "start":
+        if args.oggit_database is not None and not args.enable_oggit:
+            raise SystemExit("--oggit-database requires --enable-oggit")
+        endpoint = api("GET", f"/v1/endpoint/{args.endpoint_id}")
+        updates = {}
+        if args.safekeepers_generation is not None:
+            updates["safekeepers_generation"] = args.safekeepers_generation
+        if args.pageserver_id is not None:
+            updates["endpoint_pageserver_id"] = args.pageserver_id
+        if args.safekeepers:
+            updates["safekeeper_connstrings"] = [
+                safekeeper_connstring_arg(item)
+                for item in args.safekeepers.split(",")
+                if item.strip()
+            ]
+        if args.remote_ext_base_url:
+            updates["remote_ext_base_url"] = args.remote_ext_base_url
+        if args.create_test_user:
+            updates["create_test_user"] = True
+            updates["skip_pg_catalog_updates"] = False
+        if args.autoprewarm:
+            updates["autoprewarm"] = True
+        if args.offload_lfc_interval_seconds is not None:
+            updates["offload_lfc_interval_seconds"] = args.offload_lfc_interval_seconds
+        if args.enable_oggit:
+            updates["enable_oggit"] = True
+            updates["skip_pg_catalog_updates"] = False
+            if args.oggit_database is not None:
+                updates["oggit_database"] = args.oggit_database
+        if updates:
+            endpoint = rewrite_endpoint_with_ports({**endpoint, **updates})
+        endpoint, changed = resolve_endpoint_host_ports(endpoint)
+        if changed:
+            endpoint = rewrite_endpoint_with_ports(endpoint)
+        if not args.allow_multiple:
+            ensure_no_running_primary_on_same_timeline(endpoint)
+        plan = api("POST", f"/v1/endpoint/{args.endpoint_id}/start", {})
+        prepare_endpoint_data_dir(api("GET", f"/v1/endpoint/{args.endpoint_id}"))
+        service = plan["services"][0]
+        disable_endpoint_restart_policy(args.endpoint_id)
+        compose_endpoint(args.endpoint_id, "up", "-d", service)
+        wait_endpoint_started(args.endpoint_id, service, timeout=args.timeout)
+        print_json(api("GET", f"/v1/endpoint/{args.endpoint_id}"))
+    elif args.endpoint_cmd == "stop":
+        stopped = stop_endpoint(args.endpoint_id, mode=args.mode)
+        if getattr(args, "destroy", False):
+            endpoint = api("GET", f"/v1/endpoint/{args.endpoint_id}")
+            data_dir = endpoint.get("data_dir") or os.path.join(".neon", endpoint["service_name"])
+            safe_rmtree(data_dir if os.path.isabs(data_dir) else os.path.join(COMPOSE_DIR, data_dir))
+        print_json(stopped)
+    elif args.endpoint_cmd == "restart":
+        stop_endpoint(args.endpoint_id, quiet=True)
+        restart_args = argparse.Namespace(
+            endpoint_cmd="start",
+            endpoint_id=args.endpoint_id,
+            timeout=args.timeout,
+            allow_multiple=args.allow_multiple,
+            safekeepers_generation=args.safekeepers_generation,
+            safekeepers=args.safekeepers,
+            remote_ext_base_url=args.remote_ext_base_url,
+            create_test_user=args.create_test_user,
+            enable_oggit=args.enable_oggit,
+            oggit_database=args.oggit_database,
+            autoprewarm=args.autoprewarm,
+            offload_lfc_interval_seconds=args.offload_lfc_interval_seconds,
+            pageserver_id=args.pageserver_id,
+            dev=args.dev,
+        )
+        cmd_endpoint(restart_args)
+    elif args.endpoint_cmd in {"reconfigure", "refresh-configuration", "update-pageservers"}:
+        if args.endpoint_cmd in {"reconfigure", "update-pageservers"}:
+            endpoint = api("GET", f"/v1/endpoint/{args.endpoint_id}")
+            updates = {}
+            if getattr(args, "pageserver_id", None) is not None:
+                updates["endpoint_pageserver_id"] = args.pageserver_id
+            if getattr(args, "safekeepers", None):
+                updates["safekeeper_connstrings"] = [
+                    safekeeper_connstring_arg(item)
+                    for item in args.safekeepers.split(",")
+                    if item.strip()
+                ]
+            if updates:
+                rewrite_endpoint_with_ports({**endpoint, **updates})
+        print_json(api("POST", f"/v1/endpoint/{args.endpoint_id}/{args.endpoint_cmd}", {}))
+    elif args.endpoint_cmd == "generate-jwt":
+        path = f"/v1/endpoint/{args.endpoint_id}/generate-jwt"
+        if args.scope:
+            path += "?" + urllib.parse.urlencode({"scope": args.scope})
+        print_json(api("POST", path, {}))
+    elif args.endpoint_cmd == "destroy":
+        endpoint = api("GET", f"/v1/endpoint/{args.endpoint_id}")
+        compose_endpoint(args.endpoint_id, "stop", endpoint["service_name"], check=False)
+        compose_endpoint(args.endpoint_id, "rm", "-f", endpoint["service_name"], check=False)
+        if args.remove_data:
+            data_dir = endpoint.get("data_dir") or os.path.join(".neon", endpoint["service_name"])
+            safe_rmtree(data_dir if os.path.isabs(data_dir) else os.path.join(COMPOSE_DIR, data_dir))
+        print_json(api("DELETE", f"/v1/endpoint/{args.endpoint_id}"))
+
+
+def stop_endpoint(endpoint_id, quiet=False, mode="fast"):
+    endpoint = api("GET", f"/v1/endpoint/{endpoint_id}")
+    service = endpoint["service_name"]
+    last_lsn = None
+    try:
+        last_lsn = compose_endpoint(endpoint_id, "exec", "-T", service, "gsql",
+                                    "-d", "postgres", "-U", "cloud_admin", "-p", "55433",
+                                    "-h", "127.0.0.1", "-tAc",
+                                    "SELECT pg_current_xlog_location()", capture=True, check=False)
+    except Exception:
+        last_lsn = None
+    if mode == "immediate":
+        compose_endpoint(endpoint_id, "kill", service, check=False)
+    else:
+        compose_endpoint(endpoint_id, "stop", service, check=False)
+    result = api("POST", f"/v1/endpoint/{endpoint_id}/stop", {"last_lsn": last_lsn})
+    if not quiet:
+        print(f"last_lsn={last_lsn or 'unknown'}", file=sys.stderr)
+    return result
+
+
+def cmd_pageserver(args):
+    if args.pageserver_cmd == "list":
+        print_json(api("GET", "/v1/pageserver"))
+    elif args.pageserver_cmd == "status":
+        _ordinal, node_id, service_name = pageserver_ref(pageserver_arg_ref(args))
+        print_json({
+            "node": pageserver_node(node_id),
+            "compose": parse_json_lines(compose_pageserver(
+                service_name,
+                "ps",
+                service_name,
+                "--format",
+                "json",
+                capture=True,
+                check=False,
+            )),
+        })
+    elif args.pageserver_cmd == "add":
+        ordinal, node_id, service_name = pageserver_ref(args.ordinal)
+        if ordinal == 1:
+            raise SystemExit("pageserver ordinal 1 is the static default pageserver")
+        node_id = args.node_id or node_id
+        host_http_port = args.http_port if args.http_port is not None else 9897 + ordinal
+        host_pg_port = args.pg_port if args.pg_port is not None else 6399 + ordinal
+        host_http_port, host_pg_port = resolve_pageserver_host_ports(service_name, host_http_port, host_pg_port)
+        ensure_dir(os.path.join(COMPOSE_DIR, ".neon"))
+        chmod_dir(os.path.join(COMPOSE_DIR, ".neon"))
+        try:
+            storage_controller_api("DELETE", f"/debug/v1/tombstone/{node_id}", timeout=10)
+        except SystemExit:
+            pass
+        plan = api("POST", "/v1/pageserver", {
+            "service_name": service_name,
+            "node_id": node_id,
+            "host_http_port": host_http_port,
+            "host_pg_port": host_pg_port,
+            "og_version": args.og_version,
+            "storage_image": args.image,
+            "storage_controller_http": args.storage_controller_http,
+            "broker_endpoint": args.broker_endpoint,
+        })
+        env = os.environ.copy()
+        env["OG_VERSION"] = args.og_version
+        env["NEON_IMAGE"] = args.image
+        compose_pageserver(service_name, "up", "-d", service_name, env=env)
+        wait_pageserver_registered(node_id, service_name, timeout=args.timeout)
+        persist_num_pageservers_at_least(ordinal)
+        print(f"Started {service_name}")
+        print(f"node_id={node_id}")
+        print(f"host_http=http://127.0.0.1:{host_http_port}")
+        print(f"host_pg=127.0.0.1:{host_pg_port}")
+        print(f"override={plan['override_file']}")
+        print("check_nodes=curl -s http://127.0.0.1:1234/control/v1/node | jq")
+    elif args.pageserver_cmd == "start":
+        _ordinal, node_id, service_name = pageserver_ref(pageserver_arg_ref(args))
+        compose_pageserver(service_name, "up", "-d", service_name)
+        wait_pageserver_registered(node_id, service_name, timeout=args.timeout)
+        print_json(pageserver_node(node_id))
+    elif args.pageserver_cmd == "stop":
+        _ordinal, _node_id, service_name = pageserver_ref(pageserver_arg_ref(args))
+        if args.stop_mode == "immediate":
+            compose_pageserver(service_name, "kill", service_name, check=False)
+        else:
+            compose_pageserver(service_name, "stop", "--timeout", str(args.timeout), service_name, check=False)
+    elif args.pageserver_cmd == "restart":
+        _ordinal, node_id, service_name = pageserver_ref(pageserver_arg_ref(args))
+        if args.stop_mode == "immediate":
+            compose_pageserver(service_name, "kill", service_name, check=False)
+            compose_pageserver(service_name, "up", "-d", service_name)
+        else:
+            compose_pageserver(service_name, "restart", service_name, check=False)
+        wait_pageserver_registered(node_id, service_name, timeout=args.timeout)
+        print_json(pageserver_node(node_id))
+    elif args.pageserver_cmd == "remove":
+        ordinal, node_id, service_name = pageserver_ref(pageserver_arg_ref(args))
+        if node_id == 1001 and not args.allow_remove_primary:
+            raise SystemExit("refusing to remove the default pageserver node 1001; pass --allow-remove-primary to override")
+        nodes = pageserver_nodes()
+        registered = any(node.get("id") == node_id for node in nodes)
+        moved_shards = []
+        if registered:
+            dest_node_id = args.dest_node_id
+            if dest_node_id is None:
+                candidates = [
+                    node.get("id")
+                    for node in nodes
+                    if node.get("id") != node_id
+                    and node.get("availability") == "Active"
+                    and node.get("scheduling") == "Active"
+                ]
+                dest_node_id = candidates[0] if candidates else None
+            if dest_node_id is None:
+                raise SystemExit(f"no active destination node found for moving shards off {node_id}")
+            print(f"Moving attached tenant shards from node {node_id} to node {dest_node_id}...")
+            for shard in tenant_shards():
+                if shard.get("node_attached") == node_id:
+                    tenant_shard_id = shard["tenant_shard_id"]
+                    print(f"Migrating {tenant_shard_id} -> {dest_node_id}")
+                    moved_shards.append(tenant_shard_id)
+                    print_json(migrate_tenant_shard(
+                        tenant_shard_id,
+                        dest_node_id,
+                        origin_node_id=node_id,
+                        override_scheduler=True,
+                    ))
+            print(f"Waiting for node {node_id} to have no attached tenant shards...")
+            deadline = time.time() + args.timeout
+            while time.time() < deadline:
+                if not any(shard.get("node_attached") == node_id for shard in tenant_shards()):
+                    break
+                time.sleep(1)
+            if any(shard.get("node_attached") == node_id for shard in tenant_shards()):
+                raise SystemExit(f"timed out waiting for node {node_id} to drain attached shards")
+            print(f"Deleting node {node_id} from storage_controller...")
+            print_json(api("POST", f"/v1/pageserver/{node_id}/delete", {"force": args.force}))
+            deadline = time.time() + args.timeout
+            while time.time() < deadline:
+                if pageserver_node(node_id) is None:
+                    break
+                time.sleep(1)
+            if pageserver_node(node_id) is not None:
+                raise SystemExit(f"timed out waiting for storage_controller to delete node {node_id}")
+        else:
+            print(f"Node {node_id} is not registered in storage_controller; stopping container only.", file=sys.stderr)
+        compose_pageserver(service_name, "stop", service_name, check=False)
+        compose_pageserver(service_name, "rm", "-f", service_name, check=False)
+        if args.remove_data:
+            safe_rmtree(os.path.join(COMPOSE_DIR, ".neon", service_name))
+            safe_rmtree(os.path.join(COMPOSE_DIR, ".neon", f"{service_name}_config"))
+            override = os.path.join(COMPOSE_DIR, pageserver_override(service_name))
+            if os.path.exists(override):
+                os.remove(override)
+        print(f"Removed {service_name} node_id={node_id}")
+        if moved_shards:
+            print("Tenant shards were moved. Running endpoints are reconfigured by notify-attach when storage_controller emits it.")
+    elif args.pageserver_cmd == "migrate":
+        print_json(migrate_tenant_shard(
+            args.tenant_shard_id,
+            args.node_id,
+            origin_node_id=args.origin_node_id,
+            prewarm=args.prewarm,
+            override_scheduler=args.override_scheduler,
+            timeout=args.timeout,
+        ))
+    elif args.pageserver_cmd == "migrate-secondary":
+        print_json(api("POST", f"/v1/pageserver/{args.tenant_shard_id}/migrate-secondary", {
+            "node_id": args.node_id,
+            "origin_node_id": args.origin_node_id,
+            "prewarm": args.prewarm,
+            "override_scheduler": args.override_scheduler,
+            "timeout_seconds": args.timeout,
+        }, timeout=args.timeout + 5))
+    elif args.pageserver_cmd == "cancel-reconcile":
+        print_json(api("POST", f"/v1/pageserver/{args.tenant_shard_id}/cancel-reconcile", {}))
+    elif args.pageserver_cmd == "bulk-migrate":
+        print_json(api("POST", "/v1/pageserver/bulk-migrate", {
+            "nodes": parse_id_list(args.nodes, "--nodes"),
+            "concurrency": args.concurrency,
+            "max_shards": args.max_shards,
+            "dry_run": args.dry_run,
+            "override_scheduler": args.override_scheduler,
+            "timeout_seconds": args.timeout,
+        }, timeout=args.timeout + 5))
+    elif args.pageserver_cmd == "fill":
+        print_json(api("POST", f"/v1/pageserver/{args.node_id}/fill", {}))
+    elif args.pageserver_cmd == "drain":
+        print_json(api("POST", f"/v1/pageserver/{args.node_id}/drain", {}))
+    elif args.pageserver_cmd == "cancel-drain":
+        print_json(api("POST", f"/v1/pageserver/{args.node_id}/cancel-drain", {
+            "timeout_seconds": args.timeout,
+        }, timeout=args.timeout + 5))
+    elif args.pageserver_cmd == "cancel-fill":
+        print_json(api("POST", f"/v1/pageserver/{args.node_id}/cancel-fill", {
+            "timeout_seconds": args.timeout,
+        }, timeout=args.timeout + 5))
+    elif args.pageserver_cmd == "shards":
+        print_json(tenant_shards(args.tenant_id))
+
+
+def cmd_safekeeper(args):
+    if args.safekeeper_cmd == "list":
+        registered = {}
+        try:
+            registered = {int(row.get("id")): row for row in storage_controller_safekeepers()}
+        except Exception as exc:
+            print(f"warning: could not query storage_controller safekeepers: {exc}", file=sys.stderr)
+        rows = []
+        for sk_id in sorted(set(configured_safekeeper_ids()) | set(registered)):
+            service = safekeeper_service(sk_id)
+            rows.append({
+                "id": sk_id,
+                "service": service,
+                "storage_controller": registered.get(sk_id),
+                "compose": parse_json_lines(compose_safekeeper(sk_id, "ps", service, "--format", "json", capture=True, check=False)),
+            })
+        print_json(rows)
+    elif args.safekeeper_cmd == "status":
+        service = safekeeper_service(args.id)
+        print_json({
+            "id": args.id,
+            "service": service,
+            "storage_controller": storage_controller_safekeeper(args.id),
+            "compose": parse_json_lines(compose_safekeeper(args.id, "ps", service, "--format", "json", capture=True, check=False)),
+        })
+    elif args.safekeeper_cmd in {"start", "stop", "restart"}:
+        service = safekeeper_service(args.id)
+        env = None
+        extra_opts = getattr(args, "safekeeper_extra_opt", None) or []
+        if extra_opts:
+            env = os.environ.copy()
+            env["SAFEKEEPER_EXTRA_OPT"] = " ".join(extra_opts)
+        if args.safekeeper_cmd == "start":
+            if extra_opts:
+                compose_safekeeper(args.id, "up", "-d", "--force-recreate", service, env=env)
+            else:
+                compose_safekeeper(args.id, "up", "-d", service)
+            maybe_register_safekeeper(args.id, timeout=args.timeout)
+        elif args.safekeeper_cmd == "stop":
+            if args.stop_mode == "immediate":
+                compose_safekeeper(args.id, "kill", service, check=False)
+            else:
+                compose_safekeeper(args.id, "stop", "--timeout", str(args.timeout), service)
+        else:
+            if args.stop_mode == "immediate":
+                compose_safekeeper(args.id, "kill", service, check=False)
+                if extra_opts:
+                    compose_safekeeper(args.id, "up", "-d", "--force-recreate", service, env=env)
+                else:
+                    compose_safekeeper(args.id, "up", "-d", service)
+            elif extra_opts:
+                compose_safekeeper(args.id, "up", "-d", "--force-recreate", service, env=env)
+            else:
+                compose_safekeeper(args.id, "restart", service)
+            maybe_register_safekeeper(args.id, timeout=args.timeout)
+    elif args.safekeeper_cmd == "add":
+        if args.id == 1:
+            service = safekeeper_service(args.id)
+            persist_num_safekeepers_at_least(args.id)
+            compose_safekeeper(args.id, "up", "-d", service)
+            row = maybe_register_safekeeper(args.id, timeout=args.timeout)
+            print(f"{service} is the built-in safekeeper; ensured it is running")
+            if row:
+                print(f"storage_controller_scheduling={row.get('scheduling_policy')}")
+            return
+        service = safekeeper_service(args.id)
+        host_http_port = args.http_port if args.http_port is not None else safekeeper_http_host_port(args.id)
+        host_http_port = next_available_host_port(
+            host_http_port,
+            owning_container=f"{local_compose_project()}-{service}-1",
+        )
+        override = write_safekeeper_override(
+            args.id,
+            host_http_port,
+            image=args.image,
+            og_version=args.og_version,
+            broker_endpoint=args.broker_endpoint,
+        )
+        persist_num_safekeepers_at_least(args.id)
+        compose_safekeeper(args.id, "up", "-d", service)
+        row = maybe_register_safekeeper(args.id, timeout=args.timeout)
+        print(f"Started {service}")
+        print(f"id={args.id}")
+        print(f"host_http=http://127.0.0.1:{host_http_port}")
+        print(f"compute_connstring={service}:5454")
+        if row:
+            print(f"storage_controller_scheduling={row.get('scheduling_policy')}")
+        print(f"override={override}")
+        print("new timelines choose safekeeper membership through storage-controller")
+        print(f"migrate_existing=bin/docker_local safekeeper migrate --tenant-id <tenant_id> --timeline-id <timeline_id> --new-sk-set {','.join(str(i) for i in configured_safekeeper_ids())}")
+    elif args.safekeeper_cmd == "remove":
+        service = safekeeper_service(args.id)
+        refs = []
+        try:
+            for endpoint in api("GET", "/v1/endpoint").get("endpoints", []):
+                for connstr in endpoint.get("safekeeper_connstrings") or []:
+                    if connstr.startswith(f"{service}:"):
+                        refs.append(endpoint.get("endpoint_id"))
+                        break
+        except Exception as exc:
+            print(f"warning: could not inspect endpoint safekeeper refs: {exc}", file=sys.stderr)
+        if refs and not args.force:
+            raise SystemExit(
+                f"refusing to remove {service}: endpoints still reference it: {', '.join(refs)}. "
+                "Restart/reconfigure them with --safekeepers first, or pass --force."
+            )
+        try:
+            set_safekeeper_scheduling_policy(args.id, "Decomissioned")
+        except Exception as exc:
+            print(f"warning: could not mark {service} decomissioned in storage_controller: {exc}", file=sys.stderr)
+        compose_safekeeper(args.id, "stop", service, check=False)
+        compose_safekeeper(args.id, "rm", "-f", service, check=False)
+        if args.remove_data:
+            safe_rmtree(os.path.join(COMPOSE_DIR, ".neon", service))
+            override = os.path.join(COMPOSE_DIR, safekeeper_override(args.id))
+            if os.path.exists(override):
+                os.remove(override)
+        print(f"Removed {service}")
+    elif args.safekeeper_cmd == "scheduling":
+        print_json(api("PUT", f"/v1/safekeeper/{args.id}/scheduling", {
+            "scheduling_policy": args.scheduling_policy,
+        }))
+    elif args.safekeeper_cmd == "migrate":
+        tenant_id = resolve_tenant_id(args.tenant_id)
+        new_sk_set = parse_id_list(args.new_sk_set, "--new-sk-set")
+        print_json(api(
+            "POST",
+            "/v1/safekeeper/timeline-migrate",
+            {
+                "tenant_id": tenant_id,
+                "timeline_id": args.timeline_id,
+                "new_sk_set": new_sk_set,
+            },
+            timeout=args.timeout,
+        ))
+
+
+def cmd_branch(args):
+    if args.branch_cmd in {"diff", "merge"}:
+        body = {
+            "source_endpoint": args.source_endpoint,
+            "target_endpoint": args.target_endpoint,
+            "source_schema": args.source_schema,
+            "target_schema": args.target_schema,
+            "database": args.database,
+            "incremental_oggit": getattr(args, "incremental_oggit", False),
+            "keep_fdw": getattr(args, "keep_fdw", False),
+        }
+        if args.branch_cmd == "merge":
+            body["strategy"] = args.strategy
+        print_json(api("POST", f"/v1/branch/{args.branch_cmd}", body, timeout=900))
+    else:
+        body = {
+            "tenant_id": getattr(args, "tenant_id", None),
+            "target_branch": getattr(args, "target_branch", None),
+            "target_endpoint": getattr(args, "target_endpoint", None),
+            "target_connstr": getattr(args, "target_connstr", None),
+            "database": args.database,
+            "user": getattr(args, "user", "branch_merge"),
+        }
+        if args.branch_cmd == "resolve":
+            body["conflict_id"] = args.conflict_id
+            if args.custom_sql:
+                body["custom_sql"] = args.custom_sql
+            else:
+                body["resolution"] = args.resolution
+        if args.branch_cmd in {"merge-status", "conflicts"}:
+            query = {
+                key: value
+                for key, value in body.items()
+                if value is not None
+            }
+            path = (
+                f"/v1/branch/merge/{args.merge_id}/{args.branch_cmd.replace('merge-', '')}?"
+                + urllib.parse.urlencode(query)
+            )
+            print_json(api("GET", path, timeout=900))
+        else:
+            print_json(api("POST", f"/v1/branch/merge/{args.merge_id}/{args.branch_cmd}", body, timeout=900))
+
+
+def cmd_oggit(args):
+    if args.oggit_cmd == "gc":
+        print_json(api("POST", "/v1/oggit/gc", {
+            "retention_lsn_distance": args.retention_lsn_distance,
+        }, timeout=args.timeout))
+
+
+def add_service_parser(sub, command_name, service_name, aliases=None):
+    svc = sub.add_parser(command_name, aliases=aliases or [])
+    svc_sub = svc.add_subparsers(dest="service_cmd", required=True)
+    for action in ["start", "stop", "restart", "status"]:
+        p = svc_sub.add_parser(action)
+        p.add_argument("-t", "--timeout", type=int, default=120)
+        if action in {"stop", "restart"}:
+            p.add_argument("-m", "--mode", choices=["fast", "immediate"], default="fast")
+        if command_name == "storage-controller":
+            p.add_argument("--instance-id", type=int, default=1)
+        if command_name == "storage-controller" and action == "start":
+            p.add_argument("--base-port", type=int)
+            p.add_argument("--handle-ps-local-disk-loss", type=parse_bool)
+        p.set_defaults(func=cmd_service, service_name=service_name)
+    p = svc_sub.add_parser("logs")
+    p.add_argument("--tail", default="120")
+    if command_name == "storage-controller":
+        p.add_argument("--instance-id", type=int, default=1)
+    p.set_defaults(func=cmd_service, service_name=service_name)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="docker_local")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init")
+    p.add_argument("--compose-project", default=DEFAULT_COMPOSE_PROJECT)
+    p.add_argument("--og-version", default=DEFAULT_OG_VERSION)
+    p.add_argument("--storage-image", default=DEFAULT_STORAGE_IMAGE)
+    p.add_argument("--compute-image", default=DEFAULT_COMPUTE_IMAGE)
+    p.add_argument("--num-pageservers", type=int)
+    p.add_argument("--num-safekeepers", type=int)
+    p.add_argument("--config")
+    p.add_argument(
+        "--force",
+        nargs="?",
+        const="remove-all-contents",
+        default="must-not-exist",
+        choices=["must-not-exist", "empty-dir-ok", "remove-all-contents"],
+    )
+    p.add_argument("-t", "--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("start")
+    p.add_argument("--service", action="append", default=[])
+    p.add_argument("-t", "--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_start)
+    p = sub.add_parser("stop")
+    p.add_argument("--include-control-plane", action="store_true")
+    p.add_argument("--service", action="append", default=[])
+    p.add_argument("-m", "--mode", choices=["fast", "immediate"], default="fast")
+    p.add_argument("--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_stop)
+    p = sub.add_parser("status")
+    p.set_defaults(func=cmd_status)
+    p = sub.add_parser("ps")
+    p.add_argument("service", nargs="*")
+    p.add_argument("--all", "-a", action="store_true")
+    p.add_argument("--format", choices=["table", "json"], default=None)
+    p.set_defaults(func=cmd_ps)
+    p = sub.add_parser("logs")
+    p.add_argument("service", nargs="*")
+    p.add_argument("--tail", default="120")
+    p.add_argument("--follow", "-f", action="store_true")
+    p.set_defaults(func=cmd_logs)
+
+    tenant = sub.add_parser("tenant")
+    tenant_sub = tenant.add_subparsers(dest="tenant_cmd", required=True)
+    p = tenant_sub.add_parser("list")
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("describe")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("create")
+    p.add_argument("--tenant-id")
+    p.add_argument("--timeline-id")
+    p.add_argument("--branch-name", default="main")
+    p.add_argument("--set-default", action="store_true")
+    p.add_argument("--pg-version", type=parse_pg_version, default=14)
+    p.add_argument("--shard-count", type=int)
+    p.add_argument("--shard-stripe-size", type=int)
+    p.add_argument("--placement-policy", type=parse_placement_policy)
+    p.add_argument("-c", "--config", action="append", default=[])
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("locate")
+    p.add_argument("tenant_id")
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("delete")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("policy")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.add_argument("--placement", type=parse_storcon_placement)
+    p.add_argument("--scheduling", type=parse_shard_scheduling)
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("shard-split")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.add_argument("--shard-count", type=int, required=True)
+    p.add_argument("--stripe-size", type=int)
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("set-preferred-az")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.add_argument("--preferred-az")
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("set-default")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("config")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.add_argument("-c", "--config", "--set", action="append", default=[])
+    p.set_defaults(func=cmd_tenant)
+    p = tenant_sub.add_parser("import")
+    p.add_argument("tenant_id_pos", nargs="?")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_tenant)
+
+    timeline = sub.add_parser("timeline")
+    timeline_sub = timeline.add_subparsers(dest="timeline_cmd", required=True)
+    p = timeline_sub.add_parser("list")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_timeline)
+    p = timeline_sub.add_parser("branch")
+    p.add_argument("branch_name_pos", nargs="?")
+    p.add_argument("--branch-name")
+    p.add_argument("--tenant-id")
+    p.add_argument("--ancestor-branch-name")
+    p.add_argument("--ancestor-timeline-id")
+    p.add_argument("--ancestor-start-lsn")
+    p.add_argument("--timeline-id")
+    p.set_defaults(func=cmd_timeline)
+    p = timeline_sub.add_parser("create")
+    p.add_argument("branch_name_pos", nargs="?")
+    p.add_argument("--branch-name")
+    p.add_argument("--tenant-id")
+    p.add_argument("--timeline-id")
+    p.add_argument("--pg-version", type=parse_pg_version, default=14)
+    p.set_defaults(func=cmd_timeline)
+    p = timeline_sub.add_parser("delete")
+    p.add_argument("timeline_id")
+    p.add_argument("--tenant-id")
+    p.add_argument("-t", "--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_timeline)
+    p = timeline_sub.add_parser("import")
+    p.add_argument("branch_name_pos", nargs="?")
+    p.add_argument("--branch-name")
+    p.add_argument("--tenant-id")
+    p.add_argument("--timeline-id", required=True)
+    p.add_argument("--base-tarfile", required=True)
+    p.add_argument("--base-lsn", required=True)
+    p.add_argument("--wal-tarfile")
+    p.add_argument("--end-lsn")
+    p.add_argument("--pg-version", type=parse_pg_version, default=14)
+    p.add_argument("--pageserver-id", type=int)
+    p.add_argument("--timeout", type=int, default=900)
+    p.set_defaults(func=cmd_timeline)
+
+    mappings = sub.add_parser("mappings")
+    mappings_sub = mappings.add_subparsers(dest="mappings_cmd", required=True)
+    p = mappings_sub.add_parser("list")
+    p.set_defaults(func=cmd_mappings)
+    p = mappings_sub.add_parser("map")
+    p.add_argument("branch_name")
+    p.add_argument("--tenant-id", required=True)
+    p.add_argument("--timeline-id", required=True)
+    p.set_defaults(func=cmd_mappings)
+
+    endpoint = sub.add_parser("endpoint")
+    endpoint_sub = endpoint.add_subparsers(dest="endpoint_cmd", required=True)
+    p = endpoint_sub.add_parser("list")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_endpoint)
+    p = endpoint_sub.add_parser("status")
+    p.add_argument("endpoint_id")
+    p.set_defaults(func=cmd_endpoint)
+    p = endpoint_sub.add_parser("create")
+    p.add_argument("endpoint_id", nargs="?")
+    p.add_argument("--tenant-id")
+    p.add_argument("--timeline-id")
+    p.add_argument("--branch-name", default="main")
+    p.add_argument("--pg-port", type=int, default=55434)
+    p.add_argument("--http-port", type=int)
+    p.add_argument("--external-http-port", type=int)
+    p.add_argument("--internal-http-port", type=int)
+    p.add_argument("--service-name")
+    p.add_argument("--lsn")
+    p.add_argument("--static-lsn")
+    p.add_argument("--pageserver-id", type=int)
+    p.add_argument("--config-only", action="store_true")
+    p.add_argument("--enable-oggit", action="store_true")
+    p.add_argument("--oggit-database")
+    p.add_argument("--pg-version", type=parse_pg_version, default=14)
+    p.add_argument("--grpc", action="store_true")
+    p.add_argument("--hot-standby", action="store_true")
+    p.add_argument("--update-catalog", action="store_true")
+    p.add_argument("--allow-multiple", action="store_true")
+    p.add_argument("--privileged-role-name")
+    p.add_argument("--autoprewarm", action="store_true")
+    p.add_argument("--offload-lfc-interval-seconds", type=int)
+    p.add_argument("--config", action="append", default=[])
+    p.set_defaults(func=cmd_endpoint)
+    for name in ["start", "restart"]:
+        p = endpoint_sub.add_parser(name)
+        p.add_argument("endpoint_id")
+        p.add_argument("--pageserver-id", type=int)
+        p.add_argument("--safekeepers-generation", type=int)
+        p.add_argument("--safekeepers")
+        p.add_argument("--remote-ext-base-url", "--remote-ext-config")
+        p.add_argument("--create-test-user", action="store_true")
+        p.add_argument("--enable-oggit", action="store_true")
+        p.add_argument("--oggit-database")
+        p.add_argument("--allow-multiple", action="store_true")
+        p.add_argument("--autoprewarm", action="store_true")
+        p.add_argument("--offload-lfc-interval-seconds", type=int)
+        p.add_argument("--dev", action="store_true")
+        p.add_argument("-t", "--timeout", type=int, default=180)
+        p.set_defaults(func=cmd_endpoint)
+    for name in ["stop", "refresh-configuration"]:
+        p = endpoint_sub.add_parser(name)
+        p.add_argument("endpoint_id")
+        if name == "stop":
+            p.add_argument("--destroy", action="store_true")
+            p.add_argument("--mode", choices=["fast", "immediate"], default="fast")
+        p.set_defaults(func=cmd_endpoint)
+    p = endpoint_sub.add_parser("reconfigure")
+    p.add_argument("endpoint_id")
+    p.add_argument("--tenant-id")
+    p.add_argument("--pageserver-id", type=int)
+    p.add_argument("--safekeepers")
+    p.set_defaults(func=cmd_endpoint)
+    p = endpoint_sub.add_parser("update-pageservers")
+    p.add_argument("endpoint_id")
+    p.add_argument("-p", "--pageserver-id", type=int)
+    p.set_defaults(func=cmd_endpoint)
+    p = endpoint_sub.add_parser("generate-jwt")
+    p.add_argument("endpoint_id")
+    p.add_argument("-s", "--scope")
+    p.set_defaults(func=cmd_endpoint)
+    p = endpoint_sub.add_parser("destroy")
+    p.add_argument("endpoint_id")
+    p.add_argument("--remove-data", action="store_true")
+    p.set_defaults(func=cmd_endpoint)
+
+    pageserver = sub.add_parser("pageserver")
+    pageserver_sub = pageserver.add_subparsers(dest="pageserver_cmd", required=True)
+    p = pageserver_sub.add_parser("list")
+    p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("status")
+    p.add_argument("ref", nargs="?")
+    p.add_argument("--id", dest="pageserver_id", type=int)
+    p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("add")
+    p.add_argument("ordinal")
+    p.add_argument("--node-id", type=int)
+    p.add_argument("--http-port", type=int)
+    p.add_argument("--pg-port", type=int)
+    p.add_argument("--image", default=DEFAULT_STORAGE_IMAGE)
+    p.add_argument("--og-version", default=DEFAULT_OG_VERSION)
+    p.add_argument("--storage-controller-http", default=os.environ.get("STORAGE_CONTROLLER_HTTP", "http://storage_controller:1234"))
+    p.add_argument("--broker-endpoint", default=os.environ.get("BROKER_ENDPOINT", "http://storage_broker:50051"))
+    p.add_argument("--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_pageserver)
+    for name in ["start", "restart"]:
+        p = pageserver_sub.add_parser(name)
+        p.add_argument("ref", nargs="?")
+        p.add_argument("--id", dest="pageserver_id", type=int)
+        p.add_argument("-t", "--timeout", type=int, default=120)
+        if name == "restart":
+            p.add_argument("-m", "--stop-mode", "--mode", choices=["fast", "immediate"], default="fast")
+        p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("stop")
+    p.add_argument("ref", nargs="?")
+    p.add_argument("--id", dest="pageserver_id", type=int)
+    p.add_argument("-m", "--stop-mode", "--mode", choices=["fast", "immediate"], default="fast")
+    p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("remove")
+    p.add_argument("ref")
+    p.add_argument("--dest-node-id", type=int)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--remove-data", action="store_true")
+    p.add_argument("--allow-remove-primary", action="store_true")
+    p.add_argument("-t", "--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_pageserver)
+    for name in ["fill", "drain"]:
+        p = pageserver_sub.add_parser(name)
+        p.add_argument("node_id", type=int)
+        p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("migrate")
+    p.add_argument("tenant_shard_id")
+    p.add_argument("node_id", type=int)
+    p.add_argument("--origin-node-id", type=int)
+    p.add_argument("--prewarm", action="store_true", default=None)
+    p.add_argument("--override-scheduler", action="store_true")
+    p.add_argument("-t", "--timeout", type=int, default=900)
+    p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("migrate-secondary")
+    p.add_argument("tenant_shard_id")
+    p.add_argument("node_id", type=int)
+    p.add_argument("--origin-node-id", type=int)
+    p.add_argument("--prewarm", action="store_true", default=None)
+    p.add_argument("--override-scheduler", action="store_true")
+    p.add_argument("-t", "--timeout", type=int, default=900)
+    p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("cancel-reconcile")
+    p.add_argument("tenant_shard_id")
+    p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("bulk-migrate")
+    p.add_argument("--nodes", required=True)
+    p.add_argument("--concurrency", type=int)
+    p.add_argument("--max-shards", type=int)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--override-scheduler", action="store_true")
+    p.add_argument("-t", "--timeout", type=int, default=900)
+    p.set_defaults(func=cmd_pageserver)
+    for name in ["cancel-drain", "cancel-fill"]:
+        p = pageserver_sub.add_parser(name)
+        p.add_argument("node_id", type=int)
+        p.add_argument("-t", "--timeout", type=int, default=120)
+        p.set_defaults(func=cmd_pageserver)
+    p = pageserver_sub.add_parser("shards")
+    p.add_argument("--tenant-id")
+    p.set_defaults(func=cmd_pageserver)
+
+    safekeeper = sub.add_parser("safekeeper")
+    safekeeper_sub = safekeeper.add_subparsers(dest="safekeeper_cmd", required=True)
+    p = safekeeper_sub.add_parser("list")
+    p.set_defaults(func=cmd_safekeeper)
+    p = safekeeper_sub.add_parser("status")
+    p.add_argument("id", nargs="?", type=int, default=1)
+    p.set_defaults(func=cmd_safekeeper)
+    for name in ["start", "stop", "restart"]:
+        p = safekeeper_sub.add_parser(name)
+        p.add_argument("id", nargs="?", type=int, default=1)
+        p.add_argument("-t", "--timeout", type=int, default=120)
+        if name in {"start", "restart"}:
+            p.add_argument("-e", "--safekeeper-extra-opt", action="append", default=[])
+        if name in {"stop", "restart"}:
+            p.add_argument("-m", "--stop-mode", "--mode", choices=["fast", "immediate"], default="fast")
+        p.set_defaults(func=cmd_safekeeper)
+    p = safekeeper_sub.add_parser("add")
+    p.add_argument("id", type=int)
+    p.add_argument("--http-port", type=int)
+    p.add_argument("--image", default=DEFAULT_STORAGE_IMAGE)
+    p.add_argument("--og-version", default=DEFAULT_OG_VERSION)
+    p.add_argument("--broker-endpoint", default=os.environ.get("BROKER_ENDPOINT", "http://storage_broker:50051"))
+    p.add_argument("--timeout", type=int, default=120)
+    p.set_defaults(func=cmd_safekeeper)
+    p = safekeeper_sub.add_parser("remove")
+    p.add_argument("id", type=int)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--remove-data", action="store_true")
+    p.set_defaults(func=cmd_safekeeper)
+    p = safekeeper_sub.add_parser("scheduling")
+    p.add_argument("id", type=int)
+    p.add_argument("--scheduling-policy", required=True, type=parse_safekeeper_scheduling)
+    p.set_defaults(func=cmd_safekeeper)
+    p = safekeeper_sub.add_parser("migrate")
+    p.add_argument("--tenant-id")
+    p.add_argument("--timeline-id", required=True)
+    p.add_argument("--new-sk-set", required=True)
+    p.add_argument("-t", "--timeout", type=int, default=900)
+    p.set_defaults(func=cmd_safekeeper)
+
+    add_service_parser(sub, "endpoint-storage", "endpoint_storage", aliases=["endpoint_storage"])
+    add_service_parser(sub, "storage-controller", "storage_controller", aliases=["storage_controller"])
+    add_service_parser(sub, "storage-broker", "storage_broker", aliases=["storage_broker"])
+
+    branch = sub.add_parser("branch")
+    branch_sub = branch.add_subparsers(dest="branch_cmd", required=True)
+    for name in ["diff", "merge"]:
+        p = branch_sub.add_parser(name)
+        p.add_argument("--source-endpoint", required=True)
+        p.add_argument("--target-endpoint", required=True)
+        p.add_argument("--source-schema", default="public")
+        p.add_argument("--target-schema", default="public")
+        p.add_argument("--database", required=True)
+        p.add_argument("--incremental-oggit", action="store_true")
+        p.add_argument("--keep-fdw", action="store_true")
+        if name == "merge":
+            p.add_argument("--strategy", default="fail", choices=["fail", "ours", "theirs", "manual"])
+        p.set_defaults(func=cmd_branch)
+    for name in ["merge-status", "conflicts", "continue", "abort"]:
+        p = branch_sub.add_parser(name)
+        p.add_argument("--tenant-id")
+        p.add_argument("--target-branch")
+        p.add_argument("--target-endpoint")
+        p.add_argument("--target-connstr")
+        p.add_argument("--merge-id", required=True)
+        p.add_argument("--database", required=True)
+        p.add_argument("--user", default="branch_merge")
+        p.set_defaults(func=cmd_branch)
+    p = branch_sub.add_parser("resolve")
+    p.add_argument("--tenant-id")
+    p.add_argument("--target-branch")
+    p.add_argument("--target-endpoint")
+    p.add_argument("--target-connstr")
+    p.add_argument("--merge-id", required=True)
+    p.add_argument("--conflict-id", type=int, required=True)
+    p.add_argument("--resolution", choices=["ours", "theirs", "skip"], default="theirs")
+    p.add_argument("--custom-sql")
+    p.add_argument("--database", required=True)
+    p.add_argument("--user", default="branch_merge")
+    p.set_defaults(func=cmd_branch)
+
+    oggit = sub.add_parser("oggit")
+    oggit_sub = oggit.add_subparsers(dest="oggit_cmd", required=True)
+    p = oggit_sub.add_parser("gc")
+    p.add_argument("--retention-lsn-distance", type=int, default=16 * 1024 * 1024)
+    p.add_argument("-t", "--timeout", type=int, default=900)
+    p.set_defaults(func=cmd_oggit)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
