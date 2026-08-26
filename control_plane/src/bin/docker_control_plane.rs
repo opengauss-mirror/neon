@@ -2667,3 +2667,732 @@ async fn load_status(state: &AppState) -> Result<Value> {
         "tenants": tenants,
     }))
 }
+
+fn default_branch_name() -> String {
+    "main".to_string()
+}
+
+fn default_pg_version() -> PgMajorVersion {
+    PgMajorVersion::PG14
+}
+
+fn docker_safekeeper_service_name(id: u64) -> String {
+    if id == 1 {
+        "safekeeper".to_string()
+    } else {
+        format!("safekeeper{id}")
+    }
+}
+
+fn env_u64(env: &Value, key: &str, default: u64) -> u64 {
+    env.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+fn write_env(state: &AppState, req: InitRequest) -> Result<Value> {
+    ensure_auth_keys(&state.state_dir)?;
+    let compose_project = req
+        .compose_project
+        .unwrap_or_else(|| state.compose_project.clone());
+    let env = json!({
+        "compose_project": compose_project,
+        "compose_file": "docker-compose.yml",
+        "runtime_override_file": ".neon/control_plane/overrides/runtime.yml",
+        "network_name": format!("{compose_project}_default"),
+        "og_version": req.og_version.unwrap_or_else(|| state.og_version.clone()),
+        "storage_image": req.storage_image.unwrap_or_else(|| state.storage_image.clone()),
+        "compute_image": req.compute_image.unwrap_or_else(|| state.compute_image.clone()),
+        "num_pageservers": req.num_pageservers.unwrap_or(1),
+        "num_safekeepers": req.num_safekeepers.unwrap_or(1),
+        "default_tenant_id": Value::Null,
+        "remote_storage": {
+            "type": "local_fs",
+            "path": ".neon/shared_remote_storage"
+        },
+        "storage_controller_url": state.storage_controller_url,
+        "storage_controller_host_url": state.host_storage_controller_url,
+        "endpoint_storage_addr": "endpoint_storage:9993",
+        "auth_private_key_path": ".neon/control_plane/auth_private_key.pem",
+        "auth_public_key_path": ".neon/control_plane/auth_public_key.pem"
+    });
+    write_json_file(&state.state_dir.join("env.json"), &env)?;
+    render_runtime_override(state)?;
+    Ok(env)
+}
+
+fn read_or_write_default_env(state: &AppState) -> Result<Value> {
+    let path = state.state_dir.join("env.json");
+    if path.exists() {
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        return serde_json::from_reader(file)
+            .with_context(|| format!("decoding {}", path.display()));
+    }
+    write_env(state, InitRequest::default())
+}
+
+async fn handle_endpoint_create(
+    state: &AppState,
+    req: EndpointCreateRequest,
+) -> Result<EndpointRecord> {
+    validate_id(&req.endpoint_id)?;
+    let service_name = req
+        .service_name
+        .unwrap_or_else(|| sanitize_service_name(&req.endpoint_id));
+    validate_id(&service_name)?;
+    let static_lsn = req
+        .static_lsn
+        .as_deref()
+        .map(utils::lsn::Lsn::from_str)
+        .transpose()
+        .context("parsing static_lsn")?;
+    compute_mode_from_options(static_lsn, req.hot_standby.unwrap_or(false))?;
+
+    let branch_name = req.branch_name.unwrap_or_else(default_branch_name);
+    let mut store = DockerStateStore::new(&state.state_dir);
+    let requested_tenant_id = req
+        .tenant_id
+        .as_deref()
+        .map(TenantId::from_str)
+        .transpose()
+        .context("parsing tenant_id")?;
+    let tenant_id = resolve_tenant(&store, requested_tenant_id)
+        .or_else(|_| {
+            docker_branch_tenant_id(&state.state_dir, &branch_name)?
+                .context("tenant_id is required when branch mapping is absent")
+        })
+        .context("resolving tenant_id for endpoint")?;
+    let timeline_id = req
+        .timeline_id
+        .as_deref()
+        .map(TimelineId::from_str)
+        .transpose()
+        .context("parsing timeline_id")?
+        .or_else(|| resolve_timeline(&store, &branch_name, tenant_id).ok())
+        .context("timeline_id is required when branch mapping is absent")?;
+
+    let endpoint_dir = state.state_dir.join("endpoints").join(&req.endpoint_id);
+    std::fs::create_dir_all(&endpoint_dir)
+        .with_context(|| format!("creating {}", endpoint_dir.display()))?;
+    let neon_dir = neon_data_dir(state)?;
+    let endpoint_data_dir = neon_dir.join(&service_name);
+    std::fs::create_dir_all(&endpoint_data_dir)
+        .with_context(|| format!("creating {}", endpoint_data_dir.display()))?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(endpoint_data_dir.join("postgresql_extend.conf"))
+        .with_context(|| {
+            format!(
+                "creating {}",
+                endpoint_data_dir.join("postgresql_extend.conf").display()
+            )
+        })?;
+    let previous_endpoint = load_endpoint(&state.state_dir, &req.endpoint_id).ok();
+    let host_pg_port = req.host_pg_port.unwrap_or(55433);
+    let host_http_port = req.host_http_port.unwrap_or(3080);
+    let internal_http_port = req.internal_http_port.unwrap_or(3080);
+    let compose_project = read_or_write_default_env(state)?
+        .get("compose_project")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.compose_project)
+        .to_string();
+    let mut endpoint = EndpointRecord {
+        endpoint_id: req.endpoint_id.clone(),
+        tenant_id: tenant_id.to_string(),
+        timeline_id: timeline_id.to_string(),
+        branch_name,
+        service_name: service_name.clone(),
+        container_name: Some(format!("{compose_project}-{service_name}-1")),
+        compute_http: format!("http://{service_name}:{internal_http_port}"),
+        compute_pg: Some(format!("{service_name}:55433")),
+        host_pg_port: Some(host_pg_port),
+        host_http_port: Some(host_http_port),
+        internal_http_port: Some(internal_http_port),
+        endpoint_pageserver_id: req.endpoint_pageserver_id,
+        data_dir: Some(format!(".neon/{service_name}")),
+        config_path: format!("/control_plane/endpoints/{}/config.json", req.endpoint_id),
+        postgresql_conf_path: Some(format!(
+            ".neon/control_plane/endpoints/{}/postgresql.conf",
+            req.endpoint_id
+        )),
+        last_lsn: None,
+        static_lsn: req.static_lsn,
+        hot_standby: req.hot_standby.unwrap_or(false),
+        autoprewarm: req.autoprewarm.unwrap_or(false),
+        offload_lfc_interval_seconds: req.offload_lfc_interval_seconds,
+        pg_version: req.pg_version.unwrap_or(PgMajorVersion::PG14),
+        grpc: req.grpc.unwrap_or(false),
+        config_only: req.config_only.unwrap_or(false),
+        enable_oggit: req.enable_oggit.unwrap_or(false),
+        oggit_database: req.oggit_database.unwrap_or_else(default_oggit_database),
+        skip_pg_catalog_updates: !req.update_catalog.unwrap_or(false),
+        create_test_user: req.create_test_user.unwrap_or(false),
+        remote_ext_base_url: req.remote_ext_base_url,
+        privileged_role_name: req.privileged_role_name,
+        safekeepers_generation: req.safekeepers_generation,
+        safekeeper_connstrings: req.safekeeper_connstrings,
+        extra_config: req.extra_config,
+        auth_token: None,
+        endpoint_storage_addr: Some("endpoint_storage:9993".to_string()),
+        endpoint_storage_token: None,
+        status: "Created".to_string(),
+    };
+    if let Some(previous_endpoint) = previous_endpoint {
+        endpoint.status = previous_endpoint.status;
+        endpoint.last_lsn = previous_endpoint.last_lsn;
+        endpoint.auth_token = previous_endpoint.auth_token;
+        endpoint.endpoint_storage_token = previous_endpoint.endpoint_storage_token;
+    }
+
+    map_branch(
+        &mut store,
+        endpoint.branch_name.clone(),
+        tenant_id,
+        timeline_id,
+    )?;
+    write_endpoint_record(&state.state_dir, &endpoint)?;
+    render_endpoint_config(state, &endpoint).await?;
+    render_endpoint_override(state, &endpoint)?;
+    Ok(endpoint)
+}
+
+async fn handle_endpoint_start(state: &AppState, endpoint_id: &str) -> Result<PlanResponse> {
+    let mut endpoint = load_endpoint(&state.state_dir, endpoint_id)?;
+    render_endpoint_config(state, &endpoint).await?;
+    render_endpoint_override(state, &endpoint)?;
+    endpoint.status = "Starting".to_string();
+    write_endpoint_record(&state.state_dir, &endpoint)?;
+    Ok(PlanResponse {
+        status: "planned".to_string(),
+        compose_files: vec![
+            "docker-compose.yml".to_string(),
+            format!(".neon/control_plane/overrides/endpoints/{endpoint_id}.yml"),
+        ],
+        services: vec![endpoint.service_name],
+    })
+}
+
+async fn handle_endpoint_reconfigure(
+    state: &AppState,
+    endpoint_id: &str,
+) -> Result<EndpointRecord> {
+    let endpoint = load_endpoint(&state.state_dir, endpoint_id)?;
+    render_endpoint_config(state, &endpoint).await?;
+    if endpoint.status == "Running" {
+        post_configure(state, &endpoint).await?;
+    }
+    Ok(endpoint)
+}
+
+async fn handle_tenant_create(state: &AppState, req: TenantCreateRequest) -> Result<Value> {
+    let branch_name = req.branch_name.unwrap_or_else(default_branch_name);
+    let tenant_id = req
+        .tenant_id
+        .as_deref()
+        .map(TenantId::from_str)
+        .transpose()
+        .context("parsing tenant_id")?;
+    let timeline_id = req
+        .timeline_id
+        .as_deref()
+        .map(TimelineId::from_str)
+        .transpose()
+        .context("parsing timeline_id")?;
+    let storage_controller = HttpStorageControllerApi::new(
+        state
+            .storage_controller_url
+            .parse()
+            .context("parsing storage_controller_url")?,
+        state.client.clone(),
+    );
+    let mut store = DockerStateStore::new(&state.state_dir);
+    let output = create_tenant(
+        &storage_controller,
+        &mut store,
+        TenantCreateOptions {
+            tenant_id,
+            timeline_id,
+            branch_name,
+            set_default: req.set_default.unwrap_or(false),
+            pg_version: req.pg_version.unwrap_or(PgMajorVersion::PG14),
+            shard_count: req.shard_count.unwrap_or(0),
+            shard_stripe_size: req.shard_stripe_size,
+            placement_policy: req.placement_policy,
+            config: req.config.unwrap_or_default(),
+        },
+    )
+    .await?;
+    if let Some(safekeepers) = &output.safekeepers {
+        save_timeline_safekeepers_info(&state.state_dir, safekeepers)?;
+    }
+    let mappings = load_mappings(&state.state_dir)?;
+    Ok(json!({
+        "tenant_id": output.tenant_id,
+        "timeline_id": output.timeline_id,
+        "branch_name": output.branch_name,
+        "last_record_lsn": output.timeline_info.last_record_lsn,
+        "safekeepers": output.safekeepers,
+        "mappings": mappings,
+    }))
+}
+
+async fn handle_timeline_branch(state: &AppState, req: TimelineBranchRequest) -> Result<Value> {
+    let mappings = load_mappings(&state.state_dir)?;
+    let main = mappings.get("main");
+    let tenant_id = req
+        .tenant_id
+        .or_else(|| {
+            main.and_then(|v| {
+                v.get("tenant_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .context("tenant_id is required when main mapping is absent")?;
+    let ancestor_timeline_id = req
+        .ancestor_timeline_id
+        .or_else(|| {
+            main.and_then(|v| {
+                v.get("timeline_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .context("ancestor_timeline_id is required when main mapping is absent")?;
+    let ancestor_start_lsn = match req.ancestor_start_lsn {
+        Some(lsn) => lsn,
+        None => {
+            let storage_controller = docker_storage_controller_api(state)?;
+            let tenant_id = TenantId::from_str(&tenant_id).context("parsing tenant_id")?;
+            let ancestor_timeline_id = TimelineId::from_str(&ancestor_timeline_id)
+                .context("parsing ancestor_timeline_id")?;
+            timeline_last_record_lsn(&storage_controller, tenant_id, ancestor_timeline_id)
+                .await?
+                .to_string()
+        }
+    };
+    let tenant_id = TenantId::from_str(&tenant_id).context("parsing tenant_id")?;
+    let ancestor_timeline_id =
+        TimelineId::from_str(&ancestor_timeline_id).context("parsing ancestor_timeline_id")?;
+    let timeline_id = req
+        .timeline_id
+        .as_deref()
+        .map(TimelineId::from_str)
+        .transpose()
+        .context("parsing timeline_id")?;
+    let ancestor_start_lsn =
+        utils::lsn::Lsn::from_str(&ancestor_start_lsn).context("parsing ancestor_start_lsn")?;
+    let storage_controller = HttpStorageControllerApi::new(
+        state
+            .storage_controller_url
+            .parse()
+            .context("parsing storage_controller_url")?,
+        state.client.clone(),
+    );
+    let mut store = DockerStateStore::new(&state.state_dir);
+    let output = branch_timeline(
+        &storage_controller,
+        &mut store,
+        TimelineBranchOptions {
+            tenant_id,
+            timeline_id,
+            branch_name: req.branch_name,
+            ancestor_timeline_id,
+            ancestor_start_lsn: Some(ancestor_start_lsn),
+        },
+    )
+    .await?;
+    if let Some(safekeepers) = &output.safekeepers {
+        save_timeline_safekeepers_info(&state.state_dir, safekeepers)?;
+    }
+    let mappings = load_mappings(&state.state_dir)?;
+    Ok(json!({
+        "tenant_id": output.tenant_id,
+        "timeline_id": output.timeline_id,
+        "branch_name": output.branch_name,
+        "ancestor_timeline_id": ancestor_timeline_id,
+        "ancestor_start_lsn": ancestor_start_lsn,
+        "last_record_lsn": output.timeline_info.last_record_lsn,
+        "safekeepers": output.safekeepers,
+        "mappings": mappings,
+    }))
+}
+
+async fn handle_timeline_create(state: &AppState, req: TimelineCreateRequest) -> Result<Value> {
+    let mappings = load_mappings(&state.state_dir)?;
+    let main = mappings.get("main");
+    let tenant_id = req
+        .tenant_id
+        .or_else(|| {
+            main.and_then(|v| {
+                v.get("tenant_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .context("tenant_id is required when main mapping is absent")?;
+    let tenant_id = TenantId::from_str(&tenant_id).context("parsing tenant_id")?;
+    let timeline_id = req
+        .timeline_id
+        .as_deref()
+        .map(TimelineId::from_str)
+        .transpose()
+        .context("parsing timeline_id")?;
+    let storage_controller = HttpStorageControllerApi::new(
+        state
+            .storage_controller_url
+            .parse()
+            .context("parsing storage_controller_url")?,
+        state.client.clone(),
+    );
+    let mut store = DockerStateStore::new(&state.state_dir);
+    let output = create_timeline(
+        &storage_controller,
+        &mut store,
+        TimelineCreateOptions {
+            tenant_id,
+            timeline_id,
+            branch_name: req.branch_name,
+            pg_version: req.pg_version.unwrap_or(PgMajorVersion::PG14),
+        },
+    )
+    .await?;
+    if let Some(safekeepers) = &output.safekeepers {
+        save_timeline_safekeepers_info(&state.state_dir, safekeepers)?;
+    }
+    let mappings = load_mappings(&state.state_dir)?;
+    Ok(json!({
+        "tenant_id": output.tenant_id,
+        "timeline_id": output.timeline_id,
+        "branch_name": output.branch_name,
+        "last_record_lsn": output.timeline_info.last_record_lsn,
+        "safekeepers": output.safekeepers,
+        "mappings": mappings,
+    }))
+}
+
+async fn handle_timeline_delete(
+    state: &AppState,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+) -> Result<Value> {
+    let storage_controller = docker_storage_controller_api(state)?;
+    let nodes = load_pageserver_nodes(state).await?;
+    let tenant = storage_controller.tenant_describe(tenant_id).await?;
+    let mut deleted_shards = Vec::new();
+
+    for shard in tenant.shards {
+        let Some(node_id) = shard.node_attached else {
+            continue;
+        };
+        let Some(node) = nodes.get(&node_id.0) else {
+            continue;
+        };
+        let timelines = list_pageserver_timelines(state, node, shard.tenant_shard_id).await?;
+        if timelines
+            .iter()
+            .any(|timeline| timeline.timeline_id == timeline_id)
+        {
+            delete_pageserver_timeline(state, node, shard.tenant_shard_id, timeline_id).await?;
+            deleted_shards.push(json!({
+                "tenant_shard_id": shard.tenant_shard_id.to_string(),
+                "pageserver_id": node_id.to_string(),
+            }));
+        }
+    }
+
+    if deleted_shards.is_empty() {
+        bail!("timeline {tenant_id}/{timeline_id} was not found on attached pageservers");
+    }
+
+    let cleanup = cleanup_deleted_timeline_state(&state.state_dir, tenant_id, timeline_id)?;
+    Ok(json!({
+        "tenant_id": tenant_id,
+        "timeline_id": timeline_id,
+        "deleted_shards": deleted_shards,
+        "cleanup": cleanup,
+    }))
+}
+
+async fn handle_timeline_import(state: &AppState, req: TimelineImportRequest) -> Result<Value> {
+    let tenant_id = TenantId::from_str(&req.tenant_id).context("parsing tenant_id")?;
+    let timeline_id = TimelineId::from_str(&req.timeline_id).context("parsing timeline_id")?;
+    let end_lsn = Lsn::from_str(&req.end_lsn).context("parsing end_lsn")?;
+    let pg_version = req.pg_version.unwrap_or(PgMajorVersion::PG14);
+    let safekeeper_ids = req
+        .safekeepers
+        .unwrap_or_else(|| configured_safekeeper_ids(state));
+    let generation = SafekeeperGeneration::new(req.safekeepers_generation.unwrap_or(1));
+    let members = safekeeper_ids
+        .iter()
+        .map(|id| SafekeeperId {
+            host: docker_safekeeper_service_name(*id),
+            id: NodeId(*id),
+            pg_port: 5454,
+        })
+        .collect::<Vec<_>>();
+    let mconf = Configuration {
+        generation,
+        members: safekeeper_api::membership::MemberSet { m: members },
+        new_members: None,
+    };
+
+    for id in &safekeeper_ids {
+        create_safekeeper_timeline(
+            state,
+            *id,
+            &SafekeeperTimelineCreateRequest {
+                tenant_id,
+                timeline_id,
+                mconf: mconf.clone(),
+                pg_version: PgVersionId::from(pg_version),
+                system_id: None,
+                wal_seg_size: None,
+                start_lsn: end_lsn,
+                commit_lsn: None,
+            },
+        )
+        .await?;
+    }
+    let safekeeper_infos = safekeeper_ids
+        .iter()
+        .map(|id| SafekeeperInfo {
+            id: *id,
+            hostname: Some(docker_safekeeper_service_name(*id)),
+        })
+        .collect::<Vec<_>>();
+    save_timeline_safekeepers_value(
+        &state.state_dir,
+        &req.tenant_id,
+        &req.timeline_id,
+        generation.into_inner(),
+        &safekeeper_infos,
+    )?;
+
+    let mut store = DockerStateStore::new(&state.state_dir);
+    map_branch(&mut store, req.branch_name.clone(), tenant_id, timeline_id)?;
+    let mappings = load_mappings(&state.state_dir)?;
+    Ok(json!({
+        "tenant_id": tenant_id,
+        "timeline_id": timeline_id,
+        "branch_name": req.branch_name,
+        "end_lsn": end_lsn,
+        "safekeepers": safekeeper_ids,
+        "safekeepers_generation": generation.into_inner(),
+        "mappings": mappings,
+    }))
+}
+
+fn configured_safekeeper_ids(state: &AppState) -> Vec<u64> {
+    let env = read_or_write_default_env(state).unwrap_or_else(|_| json!({}));
+    let num_safekeepers = env_u64(&env, "num_safekeepers", 1).max(1);
+    (1..=num_safekeepers).collect()
+}
+
+async fn create_safekeeper_timeline(
+    state: &AppState,
+    safekeeper_id: u64,
+    req: &SafekeeperTimelineCreateRequest,
+) -> Result<()> {
+    let service_name = docker_safekeeper_service_name(safekeeper_id);
+    let url = format!("http://{service_name}:7676/v1/tenant/timeline");
+    state
+        .client
+        .post(&url)
+        .json(req)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("creating timeline on {service_name}"))?;
+    Ok(())
+}
+
+fn neon_data_dir(state: &AppState) -> Result<PathBuf> {
+    state
+        .state_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .context("control-plane state_dir has no parent .neon directory")
+}
+
+fn handle_pageserver_add(
+    state: &AppState,
+    req: PageServerAddRequest,
+) -> Result<PageServerAddResponse> {
+    validate_id(&req.service_name)?;
+    let og_version = req.og_version.unwrap_or_else(|| state.og_version.clone());
+    let storage_image = req
+        .storage_image
+        .unwrap_or_else(|| state.storage_image.clone());
+    let storage_controller_http = req
+        .storage_controller_http
+        .unwrap_or_else(|| state.storage_controller_url.clone());
+    let broker_endpoint = req
+        .broker_endpoint
+        .unwrap_or_else(|| "http://storage_broker:50051".to_string());
+    let neon_dir = neon_data_dir(state)?;
+    let data_dir = neon_dir.join(&req.service_name);
+    let config_dir = neon_dir.join(format!("{}_config", req.service_name));
+    let override_path = state
+        .state_dir
+        .join("overrides/pageservers")
+        .join(format!("{}.yml", req.service_name));
+
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("creating {}", data_dir.display()))?;
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("creating {}", config_dir.display()))?;
+    std::fs::create_dir_all(neon_dir.join("shared_remote_storage")).with_context(|| {
+        format!(
+            "creating shared remote storage under {}",
+            neon_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(override_path.parent().unwrap())
+        .with_context(|| format!("creating {}", override_path.parent().unwrap().display()))?;
+
+    let rendered = render_pageserver_config(PageServerConfigOptions {
+        service_name: req.service_name.clone(),
+        node_id: utils::id::NodeId(req.node_id),
+        og_version: og_version.clone(),
+        storage_controller_http,
+        broker_endpoint,
+    })?;
+    std::fs::write(config_dir.join("identity.toml"), rendered.identity_toml)
+        .with_context(|| format!("writing {}/identity.toml", config_dir.display()))?;
+    std::fs::write(config_dir.join("pageserver.toml"), rendered.pageserver_toml)
+        .with_context(|| format!("writing {}/pageserver.toml", config_dir.display()))?;
+    std::fs::write(config_dir.join("metadata.json"), rendered.metadata_json)
+        .with_context(|| format!("writing {}/metadata.json", config_dir.display()))?;
+
+    let service_name = &req.service_name;
+    let content = format!(
+        r#"services:
+  {service_name}:
+    restart: "no"
+    image: ${{NEON_IMAGE:-{storage_image}}}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${{OG_VERSION:-{og_version}}}
+      - PATH=/usr/local/${{OG_VERSION:-{og_version}}}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    ports:
+      - {host_http_port}:9898
+      - {host_pg_port}:6400
+    volumes:
+      - ./.neon/{service_name}:/data/.neon/pageserver
+      - ./.neon/shared_remote_storage:/data/.neon/shared_remote_storage
+      - ./.neon/{service_name}_config/identity.toml:/data/.neon/pageserver/identity.toml:ro
+      - ./.neon/{service_name}_config/pageserver.toml:/data/.neon/pageserver/pageserver.toml:ro
+      - ./.neon/{service_name}_config/metadata.json:/data/.neon/pageserver/metadata.json:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        exec pageserver -D /data/.neon/pageserver
+    depends_on:
+      - storage_broker
+      - storage_controller
+"#,
+        host_http_port = req.host_http_port,
+        host_pg_port = req.host_pg_port,
+    );
+    std::fs::write(&override_path, content)
+        .with_context(|| format!("writing {}", override_path.display()))?;
+
+    Ok(PageServerAddResponse {
+        status: "planned".to_string(),
+        service_name: req.service_name.clone(),
+        node_id: req.node_id,
+        host_http: format!("http://127.0.0.1:{}", req.host_http_port),
+        host_pg: format!("127.0.0.1:{}", req.host_pg_port),
+        override_file: format!(
+            ".neon/control_plane/overrides/pageservers/{}.yml",
+            req.service_name
+        ),
+        compose_files: vec![
+            "docker-compose.yml".to_string(),
+            format!(
+                ".neon/control_plane/overrides/pageservers/{}.yml",
+                req.service_name
+            ),
+        ],
+        services: vec![req.service_name],
+    })
+}
+
+async fn load_pageserver_nodes(state: &AppState) -> Result<HashMap<u64, NodeDescribeResponse>> {
+    let nodes = state
+        .client
+        .get(format!("{}/control/v1/node", state.storage_controller_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<NodeDescribeResponse>>()
+        .await
+        .context("decoding storage_controller node list")?;
+
+    Ok(nodes.into_iter().map(|node| (node.id, node)).collect())
+}
+
+async fn tenant_pageserver_connstring(
+    state: &AppState,
+    tenant_id: &str,
+    endpoint_pageserver_id: Option<u64>,
+    grpc: bool,
+) -> Result<String> {
+    if let Some(node_id) = endpoint_pageserver_id {
+        let nodes = load_pageserver_nodes(state).await?;
+        let node = nodes
+            .get(&node_id)
+            .ok_or_else(|| anyhow!("pageserver node {node_id} is not registered"))?;
+        if grpc {
+            let host = node
+                .listen_grpc_addr
+                .as_deref()
+                .context("selected pageserver has no listen_grpc_addr")?;
+            let port = node
+                .listen_grpc_port
+                .context("selected pageserver has no listen_grpc_port")?;
+            return Ok(format!("grpc://no_user@{host}:{port}"));
+        }
+        return Ok(format!(
+            "host={} port={}",
+            node.listen_pg_addr, node.listen_pg_port
+        ));
+    }
+
+    let value = proxy_get_json(state, &format!("/debug/v1/tenant/{tenant_id}/locate")).await?;
+    let shards = value
+        .get("shards")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("tenant {tenant_id} has no located shards"))?;
+    if shards.is_empty() {
+        bail!("tenant {tenant_id} has no located shards");
+    }
+
+    let mut parts = Vec::with_capacity(shards.len());
+    for shard in shards {
+        if grpc {
+            let host = shard
+                .get("listen_grpc_addr")
+                .and_then(Value::as_str)
+                .context("locate response missing listen_grpc_addr")?;
+            let port = shard
+                .get("listen_grpc_port")
+                .and_then(Value::as_u64)
+                .context("locate response missing listen_grpc_port")?;
+            parts.push(format!("grpc://no_user@{host}:{port}"));
+        } else {
+            let host = shard
+                .get("listen_pg_addr")
+                .and_then(Value::as_str)
+                .context("locate response missing listen_pg_addr")?;
+            let port = shard
+                .get("listen_pg_port")
+                .and_then(Value::as_u64)
+                .context("locate response missing listen_pg_port")?;
+            parts.push(format!("host={host} port={port}"));
+        }
+    }
+
+    Ok(parts.join(","))
+}
