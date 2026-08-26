@@ -4100,3 +4100,364 @@ fn branch_target_request_options(
         custom_sql: req.custom_sql,
     })
 }
+
+fn write_endpoint_record(state_dir: &Path, endpoint: &EndpointRecord) -> Result<()> {
+    let dir = state_dir.join("endpoints").join(&endpoint.endpoint_id);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    write_json_file(&dir.join("endpoint.json"), endpoint)
+}
+
+fn delete_endpoint_record(state_dir: &Path, endpoint_id: &str) -> Result<Value> {
+    validate_id(endpoint_id)?;
+    let endpoint = load_endpoint(state_dir, endpoint_id)?;
+    let endpoint_dir = state_dir.join("endpoints").join(endpoint_id);
+    let override_path = state_dir
+        .join("overrides/endpoints")
+        .join(format!("{endpoint_id}.yml"));
+    if endpoint_dir.exists() {
+        std::fs::remove_dir_all(&endpoint_dir)
+            .with_context(|| format!("removing {}", endpoint_dir.display()))?;
+    }
+    if override_path.exists() {
+        std::fs::remove_file(&override_path)
+            .with_context(|| format!("removing {}", override_path.display()))?;
+    }
+    Ok(json!({
+        "endpoint_id": endpoint_id,
+        "service_name": endpoint.service_name,
+        "removed": true
+    }))
+}
+
+fn update_endpoint_status(
+    state_dir: &Path,
+    endpoint_id: &str,
+    status: &str,
+    last_lsn: Option<String>,
+) -> Result<EndpointRecord> {
+    let mut endpoint = load_endpoint(state_dir, endpoint_id)?;
+    endpoint.status = status.to_string();
+    if last_lsn.is_some() {
+        endpoint.last_lsn = last_lsn;
+    }
+    write_endpoint_record(state_dir, &endpoint)?;
+    Ok(endpoint)
+}
+
+fn load_mappings(state_dir: &Path) -> Result<Value> {
+    let path = state_dir.join("branches.json");
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    serde_json::from_reader(file).with_context(|| format!("decoding {}", path.display()))
+}
+
+fn upsert_mapping(
+    state_dir: &Path,
+    branch_name: &str,
+    tenant_id: &str,
+    timeline_id: &str,
+) -> Result<Value> {
+    upsert_mapping_with_extra(state_dir, branch_name, tenant_id, timeline_id, json!({}))
+}
+
+fn upsert_mapping_with_extra(
+    state_dir: &Path,
+    branch_name: &str,
+    tenant_id: &str,
+    timeline_id: &str,
+    extra: Value,
+) -> Result<Value> {
+    let mut mappings = load_mappings(state_dir)?;
+    let object = mappings
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("branches.json root is not an object"))?;
+    let mut mapping = object
+        .get(branch_name)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(mapping_obj) = mapping.as_object_mut() {
+        if let (Some(existing_tenant_id), Some(existing_timeline_id)) = (
+            mapping_obj.get("tenant_id").and_then(Value::as_str),
+            mapping_obj.get("timeline_id").and_then(Value::as_str),
+        ) {
+            if existing_tenant_id != tenant_id {
+                bail!(
+                    "branch '{branch_name}' is already mapped for tenant {existing_tenant_id}, cannot map it for another tenant {tenant_id}"
+                );
+            }
+            if existing_timeline_id != timeline_id {
+                bail!(
+                    "branch '{branch_name}' is already mapped to timeline {existing_timeline_id}, cannot map to another timeline {timeline_id}"
+                );
+            }
+        }
+        mapping_obj.insert(
+            "tenant_id".to_string(),
+            Value::String(tenant_id.to_string()),
+        );
+        mapping_obj.insert(
+            "timeline_id".to_string(),
+            Value::String(timeline_id.to_string()),
+        );
+        if let Some(extra_obj) = extra.as_object() {
+            for (key, value) in extra_obj {
+                mapping_obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    object.insert(branch_name.to_string(), mapping);
+    write_json_file(&state_dir.join("branches.json"), &mappings)?;
+    Ok(mappings)
+}
+
+fn timeline_safekeepers_path(state_dir: &Path, tenant_id: &str, timeline_id: &str) -> PathBuf {
+    state_dir
+        .join("timeline_safekeepers")
+        .join(format!("{tenant_id}_{timeline_id}.json"))
+}
+
+fn save_timeline_safekeepers_info(state_dir: &Path, info: &SafekeepersInfo) -> Result<()> {
+    write_json_file(
+        &timeline_safekeepers_path(
+            state_dir,
+            &info.tenant_id.to_string(),
+            &info.timeline_id.to_string(),
+        ),
+        info,
+    )
+}
+
+fn save_timeline_safekeepers_value(
+    state_dir: &Path,
+    tenant_id: &str,
+    timeline_id: &str,
+    generation: u32,
+    safekeepers: &[SafekeeperInfo],
+) -> Result<()> {
+    write_json_file(
+        &timeline_safekeepers_path(state_dir, tenant_id, timeline_id),
+        &json!({
+            "tenant_id": tenant_id,
+            "timeline_id": timeline_id,
+            "generation": generation,
+            "safekeepers": safekeepers,
+        }),
+    )
+}
+
+fn load_timeline_safekeepers_value(
+    state_dir: &Path,
+    tenant_id: &str,
+    timeline_id: &str,
+) -> Result<Option<Value>> {
+    let path = timeline_safekeepers_path(state_dir, tenant_id, timeline_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    serde_json::from_reader(file)
+        .map(Some)
+        .with_context(|| format!("decoding {}", path.display()))
+}
+
+fn safekeeper_host_from_id(id: u64) -> String {
+    docker_safekeeper_service_name(id)
+}
+
+fn timeline_safekeeper_connstrings_from_value(value: &Value) -> Option<(Vec<String>, u32)> {
+    let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let safekeepers = value.get("safekeepers")?.as_array()?;
+    let connstrings = safekeepers
+        .iter()
+        .filter_map(|sk| {
+            let id = sk.get("id").and_then(Value::as_u64)?;
+            let host = sk
+                .get("hostname")
+                .and_then(Value::as_str)
+                .filter(|host| !host.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| safekeeper_host_from_id(id));
+            Some(format!("{host}:5454"))
+        })
+        .collect::<Vec<_>>();
+    (!connstrings.is_empty()).then_some((connstrings, generation))
+}
+
+async fn proxy_get_json(state: &AppState, path: &str) -> Result<Value> {
+    state
+        .client
+        .get(format!("{}{}", state.storage_controller_url, path))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .with_context(|| format!("decoding storage_controller GET {path}"))
+}
+
+fn write_json_file<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+fn validate_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        bail!("invalid id {id:?}; use only ASCII letters, digits, '-' and '_'");
+    }
+    Ok(())
+}
+
+fn sanitize_service_name(id: &str) -> String {
+    id.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                b as char
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn load_endpoints(state_dir: &Path) -> Result<Vec<EndpointRecord>> {
+    let endpoints_dir = state_dir.join("endpoints");
+    if !endpoints_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut endpoints = Vec::new();
+    for entry in std::fs::read_dir(&endpoints_dir)
+        .with_context(|| format!("reading {}", endpoints_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path().join("endpoint.json");
+        if !path.exists() {
+            continue;
+        }
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let endpoint: EndpointRecord = serde_json::from_reader(file)
+            .with_context(|| format!("decoding {}", path.display()))?;
+        endpoints.push(endpoint);
+    }
+    Ok(endpoints)
+}
+
+fn update_endpoint_config<F>(
+    state_dir: &Path,
+    endpoint: &EndpointRecord,
+    mut update: F,
+) -> Result<()>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    let config_path = resolve_state_path(state_dir, &endpoint.config_path);
+    let file = std::fs::File::open(&config_path)
+        .with_context(|| format!("opening {}", config_path.display()))?;
+    let mut config: Value = serde_json::from_reader(file)
+        .with_context(|| format!("decoding {}", config_path.display()))?;
+    let spec = config
+        .get_mut("spec")
+        .ok_or_else(|| anyhow!("{} has no spec field", config_path.display()))?;
+    update(spec)?;
+
+    let tmp_path = config_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &config_path).with_context(|| {
+        format!(
+            "renaming {} to {}",
+            tmp_path.display(),
+            config_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn resolve_state_path(state_dir: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        if let Ok(stripped) = path.strip_prefix("/control_plane") {
+            return state_dir.join(stripped);
+        }
+        if let Ok(stripped) = path.strip_prefix("/data/.neon/control_plane") {
+            return state_dir.join(stripped);
+        }
+        path
+    } else if let Ok(stripped) = path.strip_prefix(".neon/control_plane") {
+        state_dir.join(stripped)
+    } else {
+        state_dir.join(path)
+    }
+}
+
+fn upsert_setting(spec: &mut Value, name: &str, value: &str, vartype: &str) -> Result<()> {
+    let settings = spec
+        .get_mut("cluster")
+        .and_then(|cluster| cluster.get_mut("settings"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow!("spec.cluster.settings is missing or not an array"))?;
+
+    settings.retain(|setting| setting.get("name").and_then(Value::as_str) != Some(name));
+    settings.push(json!({
+        "name": name,
+        "value": value,
+        "vartype": vartype,
+    }));
+    Ok(())
+}
+
+async fn post_configure(state: &AppState, endpoint: &EndpointRecord) -> Result<()> {
+    let config_path = resolve_state_path(&state.state_dir, &endpoint.config_path);
+    let config: Value = serde_json::from_reader(
+        std::fs::File::open(&config_path)
+            .with_context(|| format!("opening {}", config_path.display()))?,
+    )
+    .with_context(|| format!("decoding {}", config_path.display()))?;
+
+    let response = state
+        .client
+        .post(format!(
+            "{}/configure",
+            endpoint.compute_http.trim_end_matches('/')
+        ))
+        .json(&config)
+        .send()
+        .await
+        .with_context(|| format!("posting /configure to {}", endpoint.compute_http))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "compute {} rejected /configure with {}: {}",
+            endpoint.endpoint_id,
+            status,
+            body
+        );
+    }
+    Ok(())
+}
+
+fn error_response(status: StatusCode, err: anyhow::Error) -> Response {
+    let causes = err.chain().map(ToString::to_string).collect::<Vec<_>>();
+    let error = causes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "unknown error".to_string());
+    (status, Json(json!({ "error": error, "causes": causes }))).into_response()
+}
