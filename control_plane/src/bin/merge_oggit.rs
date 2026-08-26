@@ -4012,3 +4012,564 @@ async fn oggit_find_latest_applied_merge_bounds(
 
     Ok(latest)
 }
+
+pub(crate) async fn oggit_merge_from_meta(
+    client: &tokio_opengauss::Client,
+    source_meta_schema: &str,
+    strategy: BranchMergeStrategy,
+    include_tables: Option<&[String]>,
+    from_lsn: Option<&str>,
+    source_to_lsn: Option<&str>,
+    target_to_lsn: Option<&str>,
+) -> Result<OggitMergeResult> {
+    oggit_lock_branch_merge(client).await?;
+    oggit_require_no_active_merge(client).await?;
+    oggit_ensure_merge_history_direction_column(client).await?;
+    let strategy_text = strategy.as_str();
+    let bounds = oggit_validate_merge_inputs(
+        client,
+        source_meta_schema,
+        from_lsn,
+        source_to_lsn,
+        target_to_lsn,
+    )
+    .await?;
+
+    // Idempotency: if this exact child increment was already applied, return it
+    // instead of re-planning (design doc §16).
+    if let Some(existing_merge_id) = oggit_find_applied_merge(
+        client,
+        &bounds.child_state.timeline_id,
+        &bounds.parent_state.timeline_id,
+        &bounds.child_to_lsn,
+        &bounds.parent_to_lsn,
+        bounds.direction,
+    )
+    .await?
+    {
+        return Ok(OggitMergeResult {
+            merge_id: existing_merge_id,
+            status: "applied".to_string(),
+            conflict_count: 0,
+            applied_count: 0,
+            skipped_details: Vec::new(),
+        });
+    }
+
+    let merge_id = Uuid::new_v4().to_string();
+
+    client
+        .execute(
+            "INSERT INTO oggit.merge_history (
+                merge_id, child_timeline_id, parent_timeline_id, base_timeline_id,
+                child_meta_schema, base_lsn, child_from_lsn, child_to_lsn,
+                parent_from_lsn, parent_to_lsn, strategy, status, merge_direction
+             )
+             VALUES (
+                $1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'planning', $12
+             )",
+            &[
+                &merge_id,
+                &bounds.child_state.timeline_id,
+                &bounds.parent_state.timeline_id,
+                &bounds
+                    .child_state
+                    .ancestor_timeline_id
+                    .clone()
+                    .unwrap_or_else(|| bounds.parent_state.timeline_id.clone()),
+                &source_meta_schema,
+                &bounds.base_lsn,
+                &bounds.child_from_lsn,
+                &bounds.child_to_lsn,
+                &bounds.parent_from_lsn,
+                &bounds.parent_to_lsn,
+                &strategy_text,
+                &bounds.direction.as_str(),
+            ],
+        )
+        .await
+        .context("failed to insert oggit merge history")?;
+
+    let mut conflicts = 0_i64;
+    let mut object_conflicts = 0_i64;
+    let mut blocking_conflicts = 0_i64;
+    let mut applied = 0_i64;
+    let mut auto_objects = Vec::new();
+    let mut planned_dml = Vec::new();
+
+    let source_objects = oggit_read_object_change(
+        client,
+        source_meta_schema,
+        bounds.source_from_lsn(),
+        bounds.source_to_lsn(),
+    )
+    .await?;
+    let target_objects = oggit_read_object_change(
+        client,
+        "oggit",
+        bounds.target_from_lsn(),
+        bounds.target_to_lsn(),
+    )
+    .await?
+    .into_iter()
+    .filter(|object| !oggit_object_change_is_internal(object))
+    .collect::<Vec<_>>();
+    let target_objects_by_key = target_objects
+        .iter()
+        .map(|object| (oggit_object_change_merge_key(object), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut recorded_object_conflict_keys = BTreeSet::new();
+
+    for object in &source_objects {
+        if oggit_object_change_is_internal(object) {
+            continue;
+        }
+        let object_key = oggit_object_change_merge_key(object);
+        if let Some(target_object) = target_objects_by_key.get(&object_key) {
+            if oggit_object_change_diff_key(object) == oggit_object_change_diff_key(target_object) {
+                continue;
+            }
+            if recorded_object_conflict_keys.insert(object_key) {
+                object_conflicts += 1;
+                conflicts += 1;
+                if matches!(strategy, BranchMergeStrategy::Fail) {
+                    oggit_update_merge_history_status(client, &merge_id, "failed", conflicts)
+                        .await?;
+                    return Ok(OggitMergeResult {
+                        merge_id,
+                        status: "failed".to_string(),
+                        conflict_count: conflicts,
+                        applied_count: 0,
+                        skipped_details: Vec::new(),
+                    });
+                }
+                if !matches!(strategy, BranchMergeStrategy::Ours) {
+                    oggit_insert_merge_conflict(
+                        client,
+                        &merge_id,
+                        oggit_merge_conflict_scope(&object.object_type),
+                        "object_conflict",
+                        object.schema_name.as_deref(),
+                        None,
+                        object.object_name.as_deref(),
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        &None,
+                        &Some(target_object.change_json.clone()),
+                        &Some(object.change_json.clone()),
+                        "source and target changed the same object in this merge range",
+                    )
+                    .await?;
+                }
+            }
+            if !matches!(strategy, BranchMergeStrategy::Ours) {
+                continue;
+            }
+        }
+        let validation_error = if object.safety_class == "requires_validation" {
+            oggit_validate_object_change(client, object)
+                .await
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            None
+        };
+        if oggit_object_change_can_auto_apply(object, bounds.direction)
+            && validation_error.is_none()
+        {
+            auto_objects.push(object.clone());
+            continue;
+        }
+
+        let blocked_reason =
+            validation_error.unwrap_or_else(|| oggit_object_change_review_reason(object));
+        object_conflicts += 1;
+        conflicts += 1;
+        if matches!(strategy, BranchMergeStrategy::Fail) {
+            oggit_update_merge_history_status(client, &merge_id, "failed", conflicts).await?;
+            return Ok(OggitMergeResult {
+                merge_id,
+                status: "failed".to_string(),
+                conflict_count: conflicts,
+                applied_count: 0,
+                skipped_details: Vec::new(),
+            });
+        }
+
+        if matches!(strategy, BranchMergeStrategy::Ours) {
+            continue;
+        }
+
+        oggit_insert_merge_conflict(
+            client,
+            &merge_id,
+            oggit_merge_conflict_scope(&object.object_type),
+            &object.object_type.to_lowercase(),
+            object.schema_name.as_deref(),
+            None,
+            object.object_name.as_deref(),
+            None,
+            None,
+            &[],
+            &[],
+            &None,
+            &None,
+            &Some(object.change_json.clone()),
+            &blocked_reason,
+        )
+        .await?;
+    }
+
+    if object_conflicts > 0 && matches!(strategy, BranchMergeStrategy::Ours) {
+        oggit_update_merge_history_status(client, &merge_id, "applied", conflicts).await?;
+        return Ok(OggitMergeResult {
+            merge_id,
+            status: "applied".to_string(),
+            conflict_count: conflicts,
+            applied_count: applied,
+            skipped_details: Vec::new(),
+        });
+    }
+
+    let ours_delta = oggit_compact_change_log(
+        client,
+        "oggit",
+        bounds.target_from_lsn(),
+        bounds.target_to_lsn(),
+        include_tables,
+    )
+    .await?;
+    let theirs_delta = oggit_compact_change_log(
+        client,
+        source_meta_schema,
+        bounds.source_from_lsn(),
+        bounds.source_to_lsn(),
+        include_tables,
+    )
+    .await?;
+    let ours_by_key = oggit_delta_map_by_key(&ours_delta);
+
+    for rec in &theirs_delta {
+        let key = format!(
+            "{}.{}:{}",
+            rec.schema_name,
+            rec.table_name,
+            oggit_json_text(&rec.key_json)
+        );
+        let ours = ours_by_key.get(&key).copied();
+        let projected_ours = oggit_projected_update_delta(ours);
+        let ours_for_compare = projected_ours.as_ref().or(ours);
+        let mut projected_rec = rec.clone();
+        oggit_project_update_to_changed_cols(&mut projected_rec);
+        let target_object_conflict = target_objects.iter().any(|object| {
+            oggit_object_change_affects_table(object, &rec.schema_name, &rec.table_name)
+                && !oggit_target_object_change_is_dml_compatible(object)
+        });
+        let replica_full_match_conflict =
+            oggit_replica_full_match_conflict(client, rec, ours).await?;
+        let conflict_type = rec
+            .unsupported_reason
+            .clone()
+            .map(|_| "unsupported_row".to_string())
+            .or(replica_full_match_conflict)
+            .or_else(|| target_object_conflict.then(|| "parent_object_change".to_string()))
+            .or_else(|| {
+                oggit_row_conflict_type(
+                    ours_for_compare.map(|d| d.final_op.as_str()),
+                    ours_for_compare.and_then(|d| d.new_row.as_ref()),
+                    ours_for_compare
+                        .map(|d| d.changed_cols.as_slice())
+                        .unwrap_or(&[]),
+                    Some(projected_rec.final_op.as_str()),
+                    projected_rec.new_row.as_ref(),
+                    &projected_rec.changed_cols,
+                )
+            });
+
+        if let Some(conflict_type) = conflict_type {
+            conflicts += 1;
+            if matches!(strategy, BranchMergeStrategy::Fail) {
+                oggit_update_merge_history_status(client, &merge_id, "failed", conflicts).await?;
+                return Ok(OggitMergeResult {
+                    merge_id,
+                    status: "failed".to_string(),
+                    conflict_count: conflicts,
+                    applied_count: 0,
+                    skipped_details: Vec::new(),
+                });
+            } else if matches!(strategy, BranchMergeStrategy::Manual) {
+                oggit_insert_merge_conflict(
+                    client,
+                    &merge_id,
+                    "row",
+                    &conflict_type,
+                    Some(&rec.schema_name),
+                    Some(&rec.table_name),
+                    None,
+                    ours_for_compare.map(|d| d.final_op.as_str()),
+                    Some(&projected_rec.final_op),
+                    ours_for_compare
+                        .map(|d| d.changed_cols.as_slice())
+                        .unwrap_or(&[]),
+                    &projected_rec.changed_cols,
+                    &rec.key_json,
+                    &ours_for_compare.and_then(|d| d.new_row.clone()),
+                    &projected_rec.new_row,
+                    rec.unsupported_reason.as_deref().unwrap_or(&conflict_type),
+                )
+                .await?;
+                continue;
+            } else if matches!(strategy, BranchMergeStrategy::Theirs)
+                && matches!(
+                    conflict_type.as_str(),
+                    "unsupported_row" | "parent_object_change"
+                )
+            {
+                blocking_conflicts += 1;
+                oggit_insert_merge_conflict(
+                    client,
+                    &merge_id,
+                    "unsupported",
+                    &conflict_type,
+                    Some(&rec.schema_name),
+                    Some(&rec.table_name),
+                    None,
+                    ours_for_compare.map(|d| d.final_op.as_str()),
+                    Some(&projected_rec.final_op),
+                    ours_for_compare
+                        .map(|d| d.changed_cols.as_slice())
+                        .unwrap_or(&[]),
+                    &projected_rec.changed_cols,
+                    &rec.key_json,
+                    &ours_for_compare.and_then(|d| d.new_row.clone()),
+                    &projected_rec.new_row,
+                    rec.unsupported_reason.as_deref().unwrap_or(&conflict_type),
+                )
+                .await?;
+                continue;
+            } else if matches!(strategy, BranchMergeStrategy::Ours) {
+                continue;
+            }
+        }
+
+        if ours_for_compare.is_some_and(|ours| {
+            ours.final_op == projected_rec.final_op
+                && oggit_json_object_or_empty(ours.new_row.clone())
+                    == oggit_json_object_or_empty(projected_rec.new_row.clone())
+        }) {
+            continue;
+        }
+        let mut planned_rec = projected_rec;
+        oggit_rebase_replica_identity_full_key(&mut planned_rec, ours);
+        planned_dml.push(planned_rec);
+    }
+
+    if conflicts > 0
+        && (matches!(strategy, BranchMergeStrategy::Manual)
+            || (matches!(strategy, BranchMergeStrategy::Theirs)
+                && (object_conflicts > 0 || blocking_conflicts > 0)))
+    {
+        let barrier_reason = if object_conflicts > 0 {
+            "blocked object conflict"
+        } else {
+            "blocked row conflict"
+        };
+        oggit_enable_write_barrier(client, &merge_id, barrier_reason).await?;
+        oggit_update_merge_history_status(client, &merge_id, "blocked", conflicts).await?;
+        return Ok(OggitMergeResult {
+            merge_id,
+            status: "blocked".to_string(),
+            conflict_count: conflicts,
+            applied_count: 0,
+            skipped_details: Vec::new(),
+        });
+    }
+
+    if conflicts > 0 && matches!(strategy, BranchMergeStrategy::Theirs) {
+        let conflicts_i32 =
+            i32::try_from(conflicts).context("oggit conflict count exceeds integer range")?;
+        client
+            .execute(
+                "UPDATE oggit.merge_history SET conflict_count = $2::integer WHERE merge_id = $1::text::uuid",
+                &[&merge_id, &conflicts_i32],
+            )
+            .await
+            .context("failed to update oggit conflict count")?;
+    }
+
+    oggit_set_merge_apply_session(client, &merge_id).await?;
+    let mut execution_plan = auto_objects
+        .into_iter()
+        .enumerate()
+        .map(|(segment_id, change)| OggitPlanEvent::Object {
+            segment_id: i64::try_from(segment_id).unwrap_or(i64::MAX),
+            change,
+        })
+        .chain(planned_dml.into_iter().map(OggitPlanEvent::Dml))
+        .collect::<Vec<_>>();
+    execution_plan.sort_by_key(OggitPlanEvent::order);
+
+    let mut sequence_key_mappings = BTreeMap::new();
+    let mut foreign_key_cache = BTreeMap::new();
+    let mut skipped_details = Vec::new();
+    oggit_begin_apply_savepoint(client).await?;
+    for event in execution_plan {
+        let original_rec = match event {
+            OggitPlanEvent::Object { change: object, .. } => {
+                match oggit_apply_object_change(client, &object, bounds.direction).await {
+                    Ok(status) => {
+                        if status == "applied" {
+                            applied += 1;
+                            foreign_key_cache.clear();
+                        }
+                    }
+                    Err(error) => {
+                        oggit_rollback_apply_savepoint(client).await?;
+                        if matches!(strategy, BranchMergeStrategy::Fail) {
+                            return Err(error);
+                        }
+                        if oggit_record_object_apply_error(client, &merge_id, &object, None, &error)
+                            .await?
+                        {
+                            conflicts += 1;
+                        }
+                        oggit_enable_write_barrier(
+                            client,
+                            &merge_id,
+                            "blocked database apply error",
+                        )
+                        .await?;
+                        oggit_update_merge_history_status(client, &merge_id, "blocked", conflicts)
+                            .await?;
+                        return Ok(OggitMergeResult {
+                            merge_id,
+                            status: "blocked".to_string(),
+                            conflict_count: conflicts,
+                            applied_count: 0,
+                            skipped_details: Vec::new(),
+                        });
+                    }
+                }
+                continue;
+            }
+            OggitPlanEvent::Dml(rec) => rec,
+        };
+
+        let mut rec = original_rec;
+        let key = format!(
+            "{}.{}:{}",
+            rec.schema_name,
+            rec.table_name,
+            oggit_json_text(&rec.key_json)
+        );
+        let ours = ours_by_key.get(&key).copied();
+        let apply_result = match async {
+            oggit_rewrite_sequence_references(
+                client,
+                &mut rec,
+                &sequence_key_mappings,
+                &mut foreign_key_cache,
+            )
+            .await?;
+            if let Some(reason) = oggit_missing_delta_target_dependency_reason(client, &rec).await?
+            {
+                skipped_details.push(format!("{} key={}", reason, oggit_json_text(&rec.key_json)));
+                return Ok(None);
+            }
+
+            oggit_apply_delta_locked(
+                client,
+                Some(source_meta_schema),
+                &rec.schema_name,
+                &rec.table_name,
+                &rec.final_op,
+                &rec.key_json,
+                &rec.old_row,
+                &rec.new_row,
+                true,
+            )
+            .await
+            .map(Some)
+        }
+        .await
+        {
+            Ok(Some(apply_result)) => apply_result,
+            Ok(None) => continue,
+            Err(error) => {
+                oggit_rollback_apply_savepoint(client).await?;
+                if matches!(strategy, BranchMergeStrategy::Fail) {
+                    return Err(error);
+                }
+                if oggit_record_dml_apply_error(client, &merge_id, &rec, ours, None, &error).await?
+                {
+                    conflicts += 1;
+                }
+                oggit_enable_write_barrier(client, &merge_id, "blocked database apply error")
+                    .await?;
+                oggit_update_merge_history_status(client, &merge_id, "blocked", conflicts).await?;
+                return Ok(OggitMergeResult {
+                    merge_id,
+                    status: "blocked".to_string(),
+                    conflict_count: conflicts,
+                    applied_count: 0,
+                    skipped_details: Vec::new(),
+                });
+            }
+        };
+        if apply_result.status != "skipped" {
+            applied += 1;
+        }
+        if rec.final_op == "INSERT" {
+            if let (Some(JsonValue::Object(old_key)), Some(JsonValue::Object(new_key))) =
+                (&rec.key_json, apply_result.generated_key)
+            {
+                for (column, old_value) in old_key {
+                    if let Some(new_value) = new_key.get(column) {
+                        sequence_key_mappings.insert(
+                            (
+                                rec.schema_name.clone(),
+                                rec.table_name.clone(),
+                                column.clone(),
+                                old_value.to_string(),
+                            ),
+                            new_value.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    match oggit_repair_owned_sequences(client, &theirs_delta).await {
+        Ok(repaired) => applied += repaired,
+        Err(error) => {
+            oggit_rollback_apply_savepoint(client).await?;
+            if matches!(strategy, BranchMergeStrategy::Fail) {
+                return Err(error);
+            }
+            oggit_record_sequence_apply_error(client, &merge_id, &error).await?;
+            conflicts += 1;
+            oggit_enable_write_barrier(client, &merge_id, "blocked database apply error").await?;
+            oggit_update_merge_history_status(client, &merge_id, "blocked", conflicts).await?;
+            return Ok(OggitMergeResult {
+                merge_id,
+                status: "blocked".to_string(),
+                conflict_count: conflicts,
+                applied_count: 0,
+                skipped_details: Vec::new(),
+            });
+        }
+    }
+    oggit_release_apply_savepoint(client).await?;
+    oggit_disable_write_barrier(client, &merge_id).await?;
+    oggit_update_merge_history_status(client, &merge_id, "applied", conflicts).await?;
+    Ok(OggitMergeResult {
+        merge_id,
+        status: "applied".to_string(),
+        conflict_count: conflicts,
+        applied_count: applied,
+        skipped_details,
+    })
+}
