@@ -1084,6 +1084,9 @@ def write_safekeeper_override(sk_id, host_http_port, image=DEFAULT_STORAGE_IMAGE
       - SAFEKEEPER_ID={sk_id}
       - BROKER_ENDPOINT={broker_endpoint}
       - SAFEKEEPER_EXTRA_OPT=${{SAFEKEEPER_EXTRA_OPT:-}}
+      - AWS_ACCESS_KEY_ID=${{AWS_ACCESS_KEY_ID:-}}
+      - AWS_SECRET_ACCESS_KEY=${{AWS_SECRET_ACCESS_KEY:-}}
+      - AWS_SESSION_TOKEN=${{AWS_SESSION_TOKEN:-}}
     ports:
       - {host_http_port}:7676
     volumes:

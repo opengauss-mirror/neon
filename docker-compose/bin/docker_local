@@ -1,3 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$(dirname "$0")/docker_local.py" "$@"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+COMPOSE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEPLOY_DIR="$(cd "${COMPOSE_DIR}/.." && pwd)"
+RUNTIME_ENV="${COMPOSE_DIR}/deployment.runtime.env"
+
+if [[ -f "${RUNTIME_ENV}" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "${RUNTIME_ENV}"
+    set +a
+fi
+
+if [[ -n "${OBJECT_STORAGE_CREDENTIALS_FILE:-}" ]]; then
+    credentials_file="${OBJECT_STORAGE_CREDENTIALS_FILE}"
+    if [[ "${credentials_file}" != /* ]]; then
+        credentials_file="${DEPLOY_DIR}/${credentials_file#./}"
+    fi
+    [[ -f "${credentials_file}" ]] || {
+        echo "object storage credentials file not found: ${credentials_file}" >&2
+        exit 1
+    }
+    set -a
+    # shellcheck source=/dev/null
+    source "${credentials_file}"
+    set +a
+fi
+
+exec python3 "${SCRIPT_DIR}/docker_local.py" "$@"

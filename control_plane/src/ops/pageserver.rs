@@ -15,6 +15,7 @@ pub struct PageServerConfigOptions {
     pub og_version: String,
     pub storage_controller_http: String,
     pub broker_endpoint: String,
+    pub remote_storage: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,7 +44,7 @@ pub fn render_pageserver_config(opts: PageServerConfigOptions) -> Result<PageSer
             format!("pg_distrib_dir='/usr/local/{}'", opts.og_version),
             "listen_pg_addr='0.0.0.0:6400'".to_string(),
             "listen_http_addr='0.0.0.0:9898'".to_string(),
-            "remote_storage={local_path='/data/.neon/shared_remote_storage'}".to_string(),
+            format!("remote_storage={}", opts.remote_storage),
             format!(
                 "control_plane_api='{}/upcall/v1/'",
                 opts.storage_controller_http.trim_end_matches('/')
@@ -143,4 +144,27 @@ pub async fn start_pageserver_delete(
     force: bool,
 ) -> Result<()> {
     storage_controller.node_start_delete(node_id, force).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_pageserver_config_uses_configured_remote_storage() {
+        let remote_storage = "{bucket_name='neon',bucket_region='us-east-1',prefix_in_bucket='pageserver',endpoint='http://minio:9000',concurrency_limit=20}";
+        let rendered = render_pageserver_config(PageServerConfigOptions {
+            service_name: "pageserver2".to_string(),
+            node_id: NodeId(1002),
+            og_version: "V702".to_string(),
+            storage_controller_http: "http://storage_controller:1234".to_string(),
+            broker_endpoint: "http://storage_broker:50051".to_string(),
+            remote_storage: remote_storage.to_string(),
+        })
+        .unwrap();
+
+        assert!(rendered
+            .pageserver_toml
+            .contains(&format!("remote_storage={remote_storage}")));
+    }
 }

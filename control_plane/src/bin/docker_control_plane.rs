@@ -88,6 +88,7 @@ struct AppState {
     og_version: String,
     storage_image: String,
     compute_image: String,
+    pageserver_remote_storage: String,
     client: Client,
     oggit_worker_lock: Arc<tokio::sync::Mutex<()>>,
     oggit_gc_scheduler: Arc<oggit_gc_scheduler::OggitGcScheduler>,
@@ -676,6 +677,10 @@ async fn main() -> Result<()> {
         std::env::var("NEON_IMAGE").unwrap_or_else(|_| "og_storage:latest".to_string());
     let compute_image =
         std::env::var("COMPUTE_IMAGE").unwrap_or_else(|_| "og_compute:latest".to_string());
+    let pageserver_remote_storage = std::env::var("PAGESERVER_REMOTE_STORAGE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "{local_path='/data/.neon/shared_remote_storage'}".to_string());
 
     for dir in [
         state_dir.join("endpoints"),
@@ -692,6 +697,7 @@ async fn main() -> Result<()> {
         og_version,
         storage_image,
         compute_image,
+        pageserver_remote_storage,
         client: Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -3502,6 +3508,7 @@ fn handle_pageserver_add(
         og_version: og_version.clone(),
         storage_controller_http,
         broker_endpoint,
+        remote_storage: state.pageserver_remote_storage.clone(),
     })?;
     std::fs::write(config_dir.join("identity.toml"), rendered.identity_toml)
         .with_context(|| format!("writing {}/identity.toml", config_dir.display()))?;
@@ -3520,6 +3527,9 @@ fn handle_pageserver_add(
     environment:
       - OG_VERSION=${{OG_VERSION:-{og_version}}}
       - PATH=/usr/local/${{OG_VERSION:-{og_version}}}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - AWS_ACCESS_KEY_ID=${{AWS_ACCESS_KEY_ID:-}}
+      - AWS_SECRET_ACCESS_KEY=${{AWS_SECRET_ACCESS_KEY:-}}
+      - AWS_SESSION_TOKEN=${{AWS_SESSION_TOKEN:-}}
     ports:
       - {host_http_port}:9898
       - {host_pg_port}:6400
