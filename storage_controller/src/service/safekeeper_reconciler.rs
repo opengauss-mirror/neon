@@ -21,7 +21,7 @@ use utils::{
 
 use crate::{
     metrics::{METRICS_REGISTRY, SafekeeperReconcilerLabelGroup},
-    persistence::SafekeeperTimelineOpKind,
+    persistence::{SafekeeperTimelineOpKind, is_tenant_global_pending_op_timeline_id},
     safekeeper::Safekeeper,
     safekeeper_client::SafekeeperClient,
 };
@@ -110,10 +110,10 @@ pub(crate) async fn load_schedule_requests(
         };
         let sk = Box::new(sk.clone());
         let tenant_id = TenantId::from_str(&op_persist.tenant_id)?;
-        let timeline_id = if !op_persist.timeline_id.is_empty() {
-            Some(TimelineId::from_str(&op_persist.timeline_id)?)
-        } else {
+        let timeline_id = if is_tenant_global_pending_op_timeline_id(&op_persist.timeline_id) {
             None
+        } else {
+            Some(TimelineId::from_str(&op_persist.timeline_id)?)
         };
         let host_list = match op_persist.op_kind {
             SafekeeperTimelineOpKind::Delete => Vec::new(),

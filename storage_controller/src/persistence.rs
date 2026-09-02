@@ -63,6 +63,21 @@ const UPSERT_PENDING_OP_SQL: &str = r#"
         END
 "#;
 
+/// Sentinel stored in `safekeeper_timeline_pending_ops.timeline_id` for tenant-wide
+/// safekeeper operations. PostgreSQL allowed the historical empty-string sentinel,
+/// but openGauss treats empty strings as NULL, which violates the NOT NULL column.
+pub(crate) const TENANT_GLOBAL_PENDING_OP_TIMELINE_ID: &str = "__tenant_global__";
+
+pub(crate) fn pending_op_timeline_id(timeline_id: Option<TimelineId>) -> String {
+    timeline_id
+        .map(|timeline_id| timeline_id.to_string())
+        .unwrap_or_else(|| TENANT_GLOBAL_PENDING_OP_TIMELINE_ID.to_string())
+}
+
+pub(crate) fn is_tenant_global_pending_op_timeline_id(timeline_id: &str) -> bool {
+    timeline_id.is_empty() || timeline_id == TENANT_GLOBAL_PENDING_OP_TIMELINE_ID
+}
+
 /// ## What do we store?
 ///
 /// The storage controller service does not store most of its state durably.
@@ -1933,15 +1948,27 @@ impl Persistence {
         let tenant_id = &tenant_id;
         let timeline_id = &timeline_id;
         self.with_measured_conn(DatabaseOperation::RemoveTimelineReconcile, move |conn| {
-            let timeline_id_str = timeline_id.map(|tid| tid.to_string()).unwrap_or_default();
+            let timeline_id_str = pending_op_timeline_id(*timeline_id);
             Box::pin(async move {
-                diesel::delete(dsl::safekeeper_timeline_pending_ops)
+                let query = diesel::delete(dsl::safekeeper_timeline_pending_ops)
                     .filter(dsl::tenant_id.eq(tenant_id.to_string()))
-                    .filter(dsl::timeline_id.eq(timeline_id_str))
                     .filter(dsl::sk_id.eq(sk_id.0 as i64))
-                    .filter(dsl::generation.eq(generation as i32))
-                    .execute(conn)
-                    .await?;
+                    .filter(dsl::generation.eq(generation as i32));
+                if timeline_id.is_some() {
+                    query
+                        .filter(dsl::timeline_id.eq(timeline_id_str))
+                        .execute(conn)
+                        .await?;
+                } else {
+                    query
+                        .filter(
+                            dsl::timeline_id
+                                .eq(timeline_id_str)
+                                .or(dsl::timeline_id.eq("")),
+                        )
+                        .execute(conn)
+                        .await?;
+                }
                 Ok(())
             })
         })
@@ -2001,6 +2028,7 @@ impl Persistence {
                             .filter(
                                 dsl::timeline_id
                                     .eq(timeline_id.to_string())
+                                    .or(dsl::timeline_id.eq(TENANT_GLOBAL_PENDING_OP_TIMELINE_ID))
                                     .or(dsl::timeline_id.eq("")),
                             )
                             .load(conn)
@@ -2026,13 +2054,25 @@ impl Persistence {
         let tenant_id = &tenant_id;
         let timeline_id = &timeline_id;
         self.with_measured_conn(DatabaseOperation::RemoveTimelineReconcile, move |conn| {
-            let timeline_id_str = timeline_id.map(|tid| tid.to_string()).unwrap_or_default();
+            let timeline_id_str = pending_op_timeline_id(*timeline_id);
             Box::pin(async move {
-                diesel::delete(dsl::safekeeper_timeline_pending_ops)
-                    .filter(dsl::tenant_id.eq(tenant_id.to_string()))
-                    .filter(dsl::timeline_id.eq(timeline_id_str))
-                    .execute(conn)
-                    .await?;
+                let query = diesel::delete(dsl::safekeeper_timeline_pending_ops)
+                    .filter(dsl::tenant_id.eq(tenant_id.to_string()));
+                if timeline_id.is_some() {
+                    query
+                        .filter(dsl::timeline_id.eq(timeline_id_str))
+                        .execute(conn)
+                        .await?;
+                } else {
+                    query
+                        .filter(
+                            dsl::timeline_id
+                                .eq(timeline_id_str)
+                                .or(dsl::timeline_id.eq("")),
+                        )
+                        .execute(conn)
+                        .await?;
+                }
                 Ok(())
             })
         })

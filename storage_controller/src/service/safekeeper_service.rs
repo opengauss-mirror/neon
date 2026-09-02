@@ -10,7 +10,7 @@ use crate::id_lock_map::trace_shared_lock;
 use crate::metrics;
 use crate::persistence::{
     DatabaseError, SafekeeperTimelineOpKind, TimelinePendingOpPersistence, TimelinePersistence,
-    TimelineUpdate,
+    TimelineUpdate, pending_op_timeline_id,
 };
 use crate::safekeeper::Safekeeper;
 use crate::safekeeper_client::SafekeeperClient;
@@ -644,11 +644,12 @@ impl Service {
             sk_list.extend(sk_iter);
         }
 
+        let tenant_delete_generation = i32::MAX;
         for &sk_id in sk_list.iter() {
             let pending_op = TimelinePendingOpPersistence {
                 tenant_id: tenant_id.to_string(),
-                timeline_id: String::new(),
-                generation: i32::MAX,
+                timeline_id: pending_op_timeline_id(None),
+                generation: tenant_delete_generation,
                 op_kind: SafekeeperTimelineOpKind::Delete,
                 sk_id: sk_id.0 as i64,
             };
@@ -666,13 +667,6 @@ impl Service {
             }
         }
 
-        // unwrap is safe: we return above for an empty timeline list
-        let max_generation = timeline_list
-            .iter()
-            .map(|(_tl_id, tl)| tl.generation as u32)
-            .max()
-            .unwrap();
-
         for sk_id in sk_list {
             let Some(safekeeper) = locked.safekeepers.get(&sk_id) else {
                 tracing::warn!("Couldn't find safekeeper with id {sk_id}");
@@ -680,7 +674,7 @@ impl Service {
             };
             // Add pending op for tenant deletion
             let req = ScheduleRequest {
-                generation: max_generation,
+                generation: tenant_delete_generation as u32,
                 host_list: Vec::new(),
                 kind: SafekeeperTimelineOpKind::Delete,
                 safekeeper: Box::new(safekeeper.clone()),
