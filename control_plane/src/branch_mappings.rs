@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use utils::id::{TenantId, TenantTimelineId, TimelineId};
@@ -40,7 +40,9 @@ impl BranchMappings {
             if old_timeline_id == &timeline_id {
                 Ok(())
             } else {
-                bail!("branch '{branch_name}' is already mapped to timeline {old_timeline_id}, cannot map to another timeline {timeline_id}");
+                bail!(
+                    "branch '{branch_name}' is already mapped to timeline {old_timeline_id}, cannot map to another timeline {timeline_id}"
+                );
             }
         } else {
             existing_values.push((tenant_id, timeline_id));

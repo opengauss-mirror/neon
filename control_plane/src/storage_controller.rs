@@ -14,12 +14,15 @@ use camino::{Utf8Path, Utf8PathBuf};
 use hyper0::Uri;
 use nix::unistd::Pid;
 use pageserver_api::controller_api::{
-    NodeConfigureRequest, NodeDescribeResponse, NodeRegisterRequest,
-    SafekeeperSchedulingPolicyRequest, SkSchedulingPolicy, TenantCreateRequest,
-    TenantCreateResponse, TenantLocateResponse,
+    NodeConfigureRequest, NodeDescribeResponse, NodeRegisterRequest, SafekeeperDescribeResponse,
+    SafekeeperSchedulingPolicyRequest, ShardsPreferredAzsRequest, ShardsPreferredAzsResponse,
+    SkSchedulingPolicy, TenantCreateRequest, TenantCreateResponse, TenantDescribeResponse,
+    TenantLocateResponse, TenantPolicyRequest, TenantShardMigrateRequest,
+    TenantShardMigrateResponse, TenantTimelineDescribeResponse, TimelineSafekeeperMigrateRequest,
 };
 use pageserver_api::models::{
-    TenantConfig, TenantConfigRequest, TenantWaitLsnRequest, TimelineCreateRequest, TimelineInfo,
+    TenantConfig, TenantConfigRequest, TenantShardSplitRequest, TenantShardSplitResponse,
+    TenantWaitLsnRequest, TimelineCreateRequest, TimelineCreateResponseStorcon, TimelineInfo,
 };
 use pageserver_api::shard::TenantShardId;
 use pageserver_client::mgmt_api::ResponseErrorMessageExt;
@@ -64,9 +67,7 @@ fn opengauss_user() -> String {
 
 fn opengauss_conninfo(postgres_port: u16, dbname: &str) -> String {
     let opengauss_user = opengauss_user();
-    format!(
-        "host={OPENGAUSS_HOST} port={postgres_port} user={opengauss_user} dbname={dbname}"
-    )
+    format!("host={OPENGAUSS_HOST} port={postgres_port} user={opengauss_user} dbname={dbname}")
 }
 
 pub struct NeonStorageControllerStartArgs {
@@ -988,6 +989,115 @@ impl StorageController {
         .await
     }
 
+    #[instrument(skip(self))]
+    pub async fn tenant_list(
+        &self,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<TenantDescribeResponse>> {
+        let path = match limit {
+            Some(limit) => format!("control/v1/tenant?limit={limit}"),
+            None => "control/v1/tenant".to_string(),
+        };
+        self.dispatch::<(), _>(Method::GET, path, None).await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn tenant_describe(
+        &self,
+        tenant_id: TenantId,
+    ) -> anyhow::Result<TenantDescribeResponse> {
+        self.dispatch::<(), _>(Method::GET, format!("control/v1/tenant/{tenant_id}"), None)
+            .await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn tenant_delete(&self, tenant_id: TenantId) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(Method::DELETE, format!("v1/tenant/{tenant_id}"), None)
+            .await
+    }
+
+    #[instrument(skip_all, fields(%tenant_id))]
+    pub async fn tenant_policy(
+        &self,
+        tenant_id: TenantId,
+        req: TenantPolicyRequest,
+    ) -> anyhow::Result<()> {
+        self.dispatch(
+            Method::PUT,
+            format!("control/v1/tenant/{tenant_id}/policy"),
+            Some(req),
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(%tenant_id))]
+    pub async fn tenant_shard_split(
+        &self,
+        tenant_id: TenantId,
+        req: TenantShardSplitRequest,
+    ) -> anyhow::Result<TenantShardSplitResponse> {
+        self.dispatch(
+            Method::PUT,
+            format!("control/v1/tenant/{tenant_id}/shard_split"),
+            Some(req),
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(%tenant_shard_id, node_id=%req.node_id))]
+    pub async fn tenant_shard_migrate(
+        &self,
+        tenant_shard_id: TenantShardId,
+        req: TenantShardMigrateRequest,
+    ) -> anyhow::Result<TenantShardMigrateResponse> {
+        self.dispatch(
+            Method::PUT,
+            format!("control/v1/tenant/{tenant_shard_id}/migrate"),
+            Some(req),
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(%tenant_shard_id, node_id=%req.node_id))]
+    pub async fn tenant_shard_migrate_secondary(
+        &self,
+        tenant_shard_id: TenantShardId,
+        req: TenantShardMigrateRequest,
+    ) -> anyhow::Result<TenantShardMigrateResponse> {
+        self.dispatch(
+            Method::PUT,
+            format!("control/v1/tenant/{tenant_shard_id}/migrate_secondary"),
+            Some(req),
+        )
+        .await
+    }
+
+    #[instrument(skip(self), fields(%tenant_shard_id))]
+    pub async fn tenant_shard_cancel_reconcile(
+        &self,
+        tenant_shard_id: TenantShardId,
+    ) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(
+            Method::PUT,
+            format!("control/v1/tenant/{tenant_shard_id}/cancel_reconcile"),
+            None,
+        )
+        .await
+    }
+
+    #[instrument(skip_all)]
+    pub async fn update_preferred_azs(
+        &self,
+        req: ShardsPreferredAzsRequest,
+    ) -> anyhow::Result<ShardsPreferredAzsResponse> {
+        self.dispatch(
+            Method::PUT,
+            "control/v1/preferred_azs".to_string(),
+            Some(req),
+        )
+        .await
+    }
+
     #[instrument(skip_all, fields(node_id=%req.node_id))]
     pub async fn node_register(&self, req: NodeRegisterRequest) -> anyhow::Result<()> {
         self.dispatch::<_, ()>(Method::POST, "control/v1/node".to_string(), Some(req))
@@ -1013,6 +1123,66 @@ impl StorageController {
         .await
     }
 
+    pub async fn node_drain(&self, node_id: NodeId) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(
+            Method::PUT,
+            format!("control/v1/node/{node_id}/drain"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn node_cancel_drain(&self, node_id: NodeId) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(
+            Method::DELETE,
+            format!("control/v1/node/{node_id}/drain"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn node_fill(&self, node_id: NodeId) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(Method::PUT, format!("control/v1/node/{node_id}/fill"), None)
+            .await
+    }
+
+    pub async fn node_cancel_fill(&self, node_id: NodeId) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(
+            Method::DELETE,
+            format!("control/v1/node/{node_id}/fill"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn node_start_delete(&self, node_id: NodeId, force: bool) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(
+            Method::PUT,
+            format!("control/v1/node/{node_id}/delete?force={force}"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn safekeeper_list(&self) -> anyhow::Result<Vec<SafekeeperDescribeResponse>> {
+        self.dispatch::<(), _>(Method::GET, "control/v1/safekeeper".to_string(), None)
+            .await
+    }
+
+    pub async fn timeline_safekeeper_migrate(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: utils::id::TimelineId,
+        req: TimelineSafekeeperMigrateRequest,
+    ) -> anyhow::Result<()> {
+        self.dispatch(
+            Method::POST,
+            format!("v1/tenant/{tenant_id}/timeline/{timeline_id}/safekeeper_migrate"),
+            Some(req),
+        )
+        .await
+    }
+
     #[instrument(skip(self))]
     pub async fn ready(&self) -> anyhow::Result<()> {
         self.dispatch::<(), ()>(Method::GET, "ready".to_string(), None)
@@ -1024,13 +1194,32 @@ impl StorageController {
         &self,
         tenant_id: TenantId,
         req: TimelineCreateRequest,
-    ) -> anyhow::Result<TimelineInfo> {
+    ) -> anyhow::Result<TimelineCreateResponseStorcon> {
         self.dispatch(
             Method::POST,
             format!("v1/tenant/{tenant_id}/timeline"),
             Some(req),
         )
         .await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn tenant_timeline_detail(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: utils::id::TimelineId,
+    ) -> anyhow::Result<TimelineInfo> {
+        let response: TenantTimelineDescribeResponse = self
+            .dispatch::<(), _>(
+                Method::GET,
+                format!("control/v1/tenant/{tenant_id}/timeline/{timeline_id}"),
+                None,
+            )
+            .await?;
+
+        response.shards.into_iter().next().with_context(|| {
+            format!("timeline {tenant_id}/{timeline_id} describe response has no shards")
+        })
     }
 
     pub async fn set_tenant_config(&self, req: &TenantConfigRequest) -> anyhow::Result<()> {
@@ -1053,6 +1242,6 @@ impl StorageController {
             format!("v1/tenant/{tenant_shard_id}/wait_lsn"),
             Some(req),
         )
-            .await
+        .await
     }
 }

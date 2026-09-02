@@ -1,5 +1,20 @@
 \echo Use "CREATE EXTENSION neon" to load this file. \quit
 
+CREATE FUNCTION neon_start_oggit_worker()
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'neon_start_oggit_worker'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION neon_oggit_worker_is_ready()
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'neon_oggit_worker_is_ready'
+LANGUAGE C STRICT;
+
+REVOKE ALL ON FUNCTION neon_start_oggit_worker() FROM PUBLIC;
+REVOKE ALL ON FUNCTION neon_oggit_worker_is_ready() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION neon_start_oggit_worker() TO cloud_admin;
+GRANT EXECUTE ON FUNCTION neon_oggit_worker_is_ready() TO cloud_admin;
+
 CREATE FUNCTION pg_cluster_size()
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'pg_cluster_size'
@@ -155,6 +170,198 @@ BEGIN
     END IF;
 END;
 $$;
+
+CREATE SCHEMA IF NOT EXISTS oggit;
+
+CREATE TABLE IF NOT EXISTS oggit.state (
+    id boolean PRIMARY KEY DEFAULT true,
+    tenant_id text NOT NULL,
+    timeline_id text NOT NULL,
+    database_name text,
+    database_oid oid,
+    ancestor_timeline_id text,
+    branch_start_lsn text NOT NULL,
+    slot_name text,
+    required_lsn text NOT NULL,
+    decode_lsn text NOT NULL,
+    scanned_lsn text NOT NULL,
+    confirmed_lsn text,
+    status text NOT NULL DEFAULT 'active',
+    last_error text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (id),
+    CHECK (status IN ('active', 'paused', 'failed'))
+);
+
+ALTER TABLE oggit.state ADD COLUMN IF NOT EXISTS database_name text;
+ALTER TABLE oggit.state ADD COLUMN IF NOT EXISTS database_oid oid;
+
+CREATE TABLE IF NOT EXISTS oggit.change_log (
+    id bigserial PRIMARY KEY,
+    commit_lsn text NOT NULL,
+    record_lsn text,
+    xid text,
+    merge_id uuid,
+    ordinal integer NOT NULL,
+    op text NOT NULL,
+    schema_name text,
+    table_name text,
+    relid oid,
+    identity_kind text NOT NULL,
+    key_json jsonb,
+    old_row jsonb,
+    new_row jsonb,
+    changed_cols text[],
+    unsupported_reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (op IN (
+        'INSERT',
+        'UPDATE',
+        'DELETE',
+        'UNSUPPORTED'
+    )),
+    CHECK (identity_kind IN (
+        'primary_key',
+        'unique_key',
+        'replica_identity_full',
+        'unsupported'
+    ))
+);
+
+ALTER TABLE oggit.change_log ADD COLUMN IF NOT EXISTS merge_id uuid;
+
+CREATE INDEX IF NOT EXISTS change_log_commit_lsn_idx
+    ON oggit.change_log (commit_lsn, ordinal);
+
+CREATE INDEX IF NOT EXISTS change_log_table_key_idx
+    ON oggit.change_log (schema_name, table_name);
+
+CREATE INDEX IF NOT EXISTS change_log_merge_id_idx
+    ON oggit.change_log (merge_id);
+
+CREATE TABLE IF NOT EXISTS oggit.object_change (
+    id bigserial PRIMARY KEY,
+    commit_lsn text NOT NULL,
+    merge_id uuid,
+    ordinal integer NOT NULL,
+    object_type text NOT NULL,
+    schema_name text,
+    object_name text,
+    action text NOT NULL,
+    change_json jsonb NOT NULL,
+    safety_class text NOT NULL,
+    unsupported_reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (object_type IN (
+        'TABLE',
+        'COLUMN',
+        'INDEX',
+        'CONSTRAINT',
+        'SEQUENCE',
+        'TRIGGER',
+        'FUNCTION',
+        'VIEW',
+        'SCHEMA',
+        'TRUNCATE',
+        'OTHER'
+    )),
+    CHECK (safety_class IN (
+        'safe_additive',
+        'requires_validation',
+        'destructive',
+        'semantic',
+        'unsupported'
+    ))
+);
+
+ALTER TABLE oggit.object_change ADD COLUMN IF NOT EXISTS merge_id uuid;
+
+ALTER TABLE oggit.object_change
+    DROP CONSTRAINT IF EXISTS object_change_object_type_check;
+ALTER TABLE oggit.object_change
+    ADD CONSTRAINT object_change_object_type_check CHECK (object_type IN (
+        'TABLE',
+        'COLUMN',
+        'INDEX',
+        'CONSTRAINT',
+        'SEQUENCE',
+        'TRIGGER',
+        'FUNCTION',
+        'VIEW',
+        'SCHEMA',
+        'TRUNCATE',
+        'OTHER'
+    ));
+
+CREATE INDEX IF NOT EXISTS object_change_commit_lsn_idx
+    ON oggit.object_change (commit_lsn, ordinal);
+
+CREATE INDEX IF NOT EXISTS object_change_merge_id_idx
+    ON oggit.object_change (merge_id);
+
+CREATE TABLE IF NOT EXISTS oggit.merge_event_marker (
+    id bigserial PRIMARY KEY,
+    merge_id uuid NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS oggit.merge_history (
+    merge_id uuid PRIMARY KEY,
+    child_timeline_id text NOT NULL,
+    parent_timeline_id text NOT NULL,
+    base_timeline_id text NOT NULL,
+    child_meta_schema text,
+    base_lsn text NOT NULL,
+    child_from_lsn text NOT NULL,
+    child_to_lsn text NOT NULL,
+    parent_from_lsn text NOT NULL,
+    parent_to_lsn text NOT NULL,
+    strategy text NOT NULL,
+    status text NOT NULL,
+    merge_direction text NOT NULL DEFAULT 'child_to_parent',
+    merge_commit_lsn text,
+    conflict_count integer NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    finished_at timestamptz,
+    CHECK (strategy IN ('fail', 'ours', 'theirs', 'manual')),
+    CHECK (status IN ('planning', 'blocked', 'failed', 'applied', 'aborted')),
+    CHECK (merge_direction IN ('child_to_parent', 'parent_to_child'))
+);
+
+ALTER TABLE oggit.merge_history ADD COLUMN IF NOT EXISTS child_meta_schema text;
+ALTER TABLE oggit.merge_history ADD COLUMN IF NOT EXISTS merge_direction text NOT NULL DEFAULT 'child_to_parent';
+
+CREATE TABLE IF NOT EXISTS oggit.merge_conflict (
+    conflict_id bigserial PRIMARY KEY,
+    merge_id uuid NOT NULL REFERENCES oggit.merge_history(merge_id),
+    conflict_scope text NOT NULL,
+    conflict_type text NOT NULL,
+    schema_name text,
+    table_name text,
+    object_name text,
+    ours_op text,
+    theirs_op text,
+    ours_cols text[],
+    theirs_cols text[],
+    key_json jsonb,
+    base_json jsonb,
+    ours_json jsonb,
+    theirs_json jsonb,
+    reason text NOT NULL,
+    resolution text,
+    custom_sql text,
+    status text NOT NULL DEFAULT 'pending',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (conflict_scope IN ('row', 'ddl', 'sequence', 'truncate', 'unsupported')),
+    CHECK (status IN ('pending', 'resolved', 'skipped'))
+);
+
+ALTER TABLE oggit.merge_conflict ADD COLUMN IF NOT EXISTS ours_op text;
+ALTER TABLE oggit.merge_conflict ADD COLUMN IF NOT EXISTS theirs_op text;
+ALTER TABLE oggit.merge_conflict ADD COLUMN IF NOT EXISTS ours_cols text[];
+ALTER TABLE oggit.merge_conflict ADD COLUMN IF NOT EXISTS theirs_cols text[];
+ALTER TABLE oggit.merge_conflict ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 
 CREATE OR REPLACE FUNCTION neon_branch_cleanup_source(
     fdw_schema name,

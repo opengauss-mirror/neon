@@ -58,8 +58,8 @@ use compute_api::responses::{
     TlsConfig,
 };
 use compute_api::spec::{
-    Cluster, ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, Database, PageserverProtocol,
-    PgIdent, RemoteExtSpec, Role,
+    Cluster, ComputeAudit, ComputeFeature, ComputeMode, ComputeSpec, Database, GenericOption,
+    PageserverProtocol, PgIdent, RemoteExtSpec, Role,
 };
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm, KeyOperations,
@@ -81,7 +81,11 @@ use utils::id::{NodeId, TenantId, TimelineId};
 use utils::shard::ShardStripeSize;
 
 use crate::local_env::LocalEnv;
+use crate::ops::endpoint::build_pageserver_connstr;
 use crate::postgresql_conf::PostgresConf;
+
+const POSTGRESQL_EXTEND_CONF: &str = "postgresql_extend.conf";
+const POSTGRESQL_EXTEND_CONF_INCLUDE_PATH: &str = "../postgresql_extend.conf";
 
 // contents of a endpoint.json file
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
@@ -102,6 +106,8 @@ pub struct EndpointConf {
     cluster: Option<Cluster>,
     compute_ctl_config: ComputeCtlConfig,
     privileged_role_name: Option<String>,
+    #[serde(default)]
+    oggit_database: Option<String>,
 }
 
 //
@@ -152,8 +158,15 @@ impl ComputeControlPlane {
         1 + self
             .endpoints
             .values()
-            .map(|ep| std::cmp::max(ep.pg_address.port(),
-            std::cmp::max(ep.internal_http_address.port(), ep.external_http_address.port())))
+            .map(|ep| {
+                std::cmp::max(
+                    ep.pg_address.port(),
+                    std::cmp::max(
+                        ep.internal_http_address.port(),
+                        ep.external_http_address.port(),
+                    ),
+                )
+            })
             .max()
             .unwrap_or(self.base_port)
     }
@@ -254,8 +267,20 @@ impl ComputeControlPlane {
         self.check_endpoint_id_available(endpoint_id)?;
 
         let pg_port = pg_port.unwrap_or_else(|| self.get_port());
-        let external_http_port = external_http_port.unwrap_or_else(|| self.get_port() + 1);
-        let internal_http_port = internal_http_port.unwrap_or_else(|| external_http_port + 1);
+        let external_http_port = match external_http_port {
+            Some(port) => port,
+            None => pg_port.checked_add(2).ok_or_else(|| {
+                anyhow!("cannot allocate external HTTP port for pg port {pg_port}")
+            })?,
+        };
+        let internal_http_port = match internal_http_port {
+            Some(port) => port,
+            None => external_http_port.checked_add(1).ok_or_else(|| {
+                anyhow!(
+                    "cannot allocate internal HTTP port for external HTTP port {external_http_port}"
+                )
+            })?,
+        };
         let compute_ctl_config = ComputeCtlConfig {
             jwks: Self::create_jwks_from_pem(&self.env.read_public_key()?)?,
             tls: None::<TlsConfig>,
@@ -290,6 +315,7 @@ impl ComputeControlPlane {
             cluster: None,
             compute_ctl_config: compute_ctl_config.clone(),
             privileged_role_name: privileged_role_name.clone(),
+            oggit_database: None,
         });
 
         ep.create_endpoint_dir()?;
@@ -312,12 +338,14 @@ impl ComputeControlPlane {
                 cluster: None,
                 compute_ctl_config,
                 privileged_role_name,
+                oggit_database: None,
             })?,
         )?;
         std::fs::write(
             ep.endpoint_path().join("postgresql.conf"),
             ep.setup_pg_conf()?.to_string(),
         )?;
+        std::fs::write(ep.endpoint_path().join(POSTGRESQL_EXTEND_CONF), "")?;
 
         self.endpoints
             .insert(ep.endpoint_id.clone(), Arc::clone(&ep));
@@ -330,13 +358,15 @@ impl ComputeControlPlane {
         mode: ComputeMode,
         tenant_id: TenantId,
         timeline_id: TimelineId,
+        exclude_endpoint_id: Option<&str>,
     ) -> Result<()> {
         if matches!(mode, ComputeMode::Primary) {
             // this check is not complete, as you could have a concurrent attempt at
             // creating another primary, both reading the state before checking it here,
             // but it's better than nothing.
-            let mut duplicates = self.endpoints.iter().filter(|(_k, v)| {
-                v.tenant_id == tenant_id
+            let mut duplicates = self.endpoints.iter().filter(|(k, v)| {
+                exclude_endpoint_id != Some(k.as_str())
+                    && v.tenant_id == tenant_id
                     && v.timeline_id == timeline_id
                     && v.mode == mode
                     && v.status() != EndpointStatus::Stopped
@@ -390,6 +420,9 @@ pub struct Endpoint {
 
     /// The name of the privileged role for the endpoint.
     privileged_role_name: Option<String>,
+
+    /// Database currently selected for the compute-side oggit worker.
+    pub oggit_database: Option<String>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -446,6 +479,115 @@ pub struct EndpointStartArgs {
     pub autoprewarm: bool,
     pub offload_lfc_interval_seconds: Option<std::num::NonZeroU64>,
     pub dev: bool,
+    /// Configuration for the compute-side oggit logical decoding worker.
+    /// When set (Primary openGauss endpoints), it is injected into the
+    /// generated postgresql.conf as neon.oggit_* GUCs so the in-compute
+    /// bgworker starts and decodes this branch's WAL.
+    pub oggit: Option<OggitEndpointConfig>,
+}
+
+/// Branch identity passed to the compute-side oggit worker via GUCs.
+#[derive(Clone, Debug)]
+pub struct OggitEndpointConfig {
+    pub tenant_id: String,
+    pub timeline_id: String,
+    pub ancestor_timeline_id: Option<String>,
+    pub branch_start_lsn: String,
+    pub database: String,
+    pub safekeeper_http_urls: Vec<String>,
+}
+
+impl OggitEndpointConfig {
+    /// Render the neon.oggit_* GUC lines for postgresql.conf.
+    fn to_conf_lines(&self) -> String {
+        // Values are simple hex ids / lsns / identifiers, but quote them to be
+        // safe against empty strings and to keep the parser happy.
+        let ancestor = self.ancestor_timeline_id.clone().unwrap_or_default();
+        let database_setting = if self.database == "postgres" {
+            String::new()
+        } else {
+            format!("neon.oggit_database = '{}'\n", self.database)
+        };
+        format!(
+            "\n\
+             # --- oggit logical decoding worker (managed by neon_local) ---\n\
+             neon.oggit_enabled = on\n\
+             {}\
+             neon.oggit_tenant_id = '{}'\n\
+             neon.oggit_timeline_id = '{}'\n\
+             neon.oggit_ancestor_timeline_id = '{}'\n\
+             neon.oggit_branch_start_lsn = '{}'\n\
+             neon.oggit_safekeeper_http_urls = '{}'\n",
+            database_setting,
+            self.tenant_id,
+            self.timeline_id,
+            ancestor,
+            self.branch_start_lsn,
+            self.safekeeper_http_urls.join(","),
+        )
+    }
+}
+
+fn remove_managed_oggit_config(config: &str) -> String {
+    const MANAGED_OGGIT_SETTINGS: [&str; 7] = [
+        "neon.oggit_enabled",
+        "neon.oggit_database",
+        "neon.oggit_tenant_id",
+        "neon.oggit_timeline_id",
+        "neon.oggit_ancestor_timeline_id",
+        "neon.oggit_branch_start_lsn",
+        "neon.oggit_safekeeper_http_urls",
+    ];
+
+    let mut cleaned = config
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed != "# --- oggit logical decoding worker (managed by neon_local) ---"
+                && trimmed
+                    .split_once('=')
+                    .map(|(name, _)| !MANAGED_OGGIT_SETTINGS.contains(&name.trim_end()))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
+    cleaned
+}
+
+#[cfg(test)]
+mod oggit_config_tests {
+    use super::remove_managed_oggit_config;
+
+    #[test]
+    fn removes_previous_managed_oggit_settings() {
+        let config = "port=55432\n\
+                      # --- oggit logical decoding worker (managed by neon_local) ---\n\
+                      neon.oggit_enabled = on\n\
+                      neon.oggit_database = 'test'\n\
+                      neon.oggit_tenant_id = 'tenant'\n\
+                      neon.oggit_timeline_id = 'timeline'\n\
+                      neon.oggit_ancestor_timeline_id = 'ancestor'\n\
+                      neon.oggit_branch_start_lsn = '0/16B6A50'\n\
+                      neon.oggit_safekeeper_http_urls = 'http://localhost:7676'\n\
+                      max_connections=100\n";
+
+        assert_eq!(
+            remove_managed_oggit_config(config),
+            "port=55432\nmax_connections=100\n"
+        );
+    }
+
+    #[test]
+    fn preserves_user_oggit_settings() {
+        let config = "neon.oggit_batch_max_events = 2\n\
+                      neon.oggit_batch_max_bytes = 0\n\
+                      neon.oggit_poll_interval_ms = 10\n";
+
+        assert_eq!(remove_managed_oggit_config(config), config);
+    }
 }
 
 impl Endpoint {
@@ -491,7 +633,20 @@ impl Endpoint {
             cluster: conf.cluster,
             compute_ctl_config: conf.compute_ctl_config,
             privileged_role_name: conf.privileged_role_name,
+            oggit_database: conf.oggit_database,
         })
+    }
+
+    pub fn persist_oggit_database(&self, database: &str) -> Result<()> {
+        let endpoint_json_path = self.endpoint_path().join("endpoint.json");
+        let mut endpoint_conf: EndpointConf =
+            serde_json::from_slice(&std::fs::read(&endpoint_json_path)?)?;
+        endpoint_conf.oggit_database = Some(database.to_string());
+        std::fs::write(
+            endpoint_json_path,
+            serde_json::to_string_pretty(&endpoint_conf)?,
+        )?;
+        Ok(())
     }
 
     fn create_endpoint_dir(&self) -> Result<()> {
@@ -521,6 +676,17 @@ impl Endpoint {
         conf.append("fsync", "off");
         conf.append("max_connections", "100");
         conf.append("wal_level", "logical");
+        if is_gaussdb {
+            conf.append("enable_subscription", "on");
+            // openGauss records every plpgsql function's source into
+            // dbe_pldeveloper.gs_source via an autonomous transaction on
+            // creation. On a Neon compute that autonomous transaction stalls in
+            // "wait wal sync", deadlocking CREATE EXTENSION neon (which creates
+            // several plpgsql functions). Skipping the gs_source insertion
+            // avoids the autonomous transaction entirely; functions are still
+            // created normally, only the developer-facing source copy is omitted.
+            conf.append("behavior_compat_options", "skip_insert_gs_source");
+        }
         // wal_sender_timeout is the maximum time to wait for WAL replication.
         // It also defines how often the walreceiver will send a feedback message to the wal sender.
         conf.append("wal_sender_timeout", "5s");
@@ -567,7 +733,8 @@ impl Endpoint {
                         .safekeepers
                         .iter()
                         .map(|sk| {
-                            let sk_node = crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
+                            let sk_node =
+                                crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
                             format!("{}:{}", sk_node.listen_addr, sk.get_compute_port())
                         })
                         .collect::<Vec<String>>()
@@ -657,6 +824,10 @@ impl Endpoint {
         self.endpoint_path().join("pgdata")
     }
 
+    pub fn pg_version(&self) -> PgMajorVersion {
+        self.pg_version
+    }
+
     pub fn status(&self) -> EndpointStatus {
         let timeout = Duration::from_millis(300);
         let has_pidfile = self.pgdata().join("postmaster.pid").exists();
@@ -743,12 +914,27 @@ impl Endpoint {
         }
     }
 
-    fn build_pageserver_connstr(pageservers: &[(PageserverProtocol, Host, u16)]) -> String {
-        pageservers
-            .iter()
-            .map(|(scheme, host, port)| format!("{scheme}://no_user@{host}:{port}"))
-            .collect::<Vec<_>>()
-            .join(",")
+    fn postgresql_extend_conf_path(&self) -> PathBuf {
+        self.endpoint_path().join(POSTGRESQL_EXTEND_CONF)
+    }
+
+    fn ensure_postgresql_extend_conf(&self) -> Result<()> {
+        let path = self.postgresql_extend_conf_path();
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::write(&path, "")?;
+                Ok(())
+            }
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "failed to create config file in {}",
+                path.display()
+            ))),
+        }
     }
 
     /// Map safekeepers ids to the actual connection strings.
@@ -763,7 +949,11 @@ impl Endpoint {
                     .find(|node| node.id == sk_id)
                     .ok_or_else(|| anyhow!("safekeeper {sk_id} does not exist"))?;
                 let sk_node = crate::safekeeper::SafekeeperNode::from_env(&self.env, sk);
-                safekeeper_connstrings.push(format!("{}:{}", sk_node.listen_addr, sk.get_compute_port()));
+                safekeeper_connstrings.push(format!(
+                    "{}:{}",
+                    sk_node.listen_addr,
+                    sk.get_compute_port()
+                ));
             }
         }
         Ok(safekeeper_connstrings)
@@ -790,7 +980,7 @@ impl Endpoint {
         }
 
         // Read postgresql.conf, or generate it if it doesn't exist
-        let postgresql_conf = {
+        let mut postgresql_conf = {
             let conf = self.read_postgresql_conf()?;
             if conf.is_empty() {
                 // If the config file doesn't exist or is empty, generate a default one
@@ -802,6 +992,20 @@ impl Endpoint {
                 conf
             }
         };
+        postgresql_conf = remove_managed_oggit_config(&postgresql_conf);
+
+        // Inject oggit worker GUCs so the compute-side bgworker starts and
+        // decodes this branch. compute_ctl writes postgresql_conf into the data
+        // directory's postgresql.conf, which gaussdb reads at startup.
+        if let Some(oggit) = &args.oggit {
+            postgresql_conf.push_str(&oggit.to_conf_lines());
+        }
+        std::fs::write(
+            self.endpoint_path().join("postgresql.conf"),
+            &postgresql_conf,
+        )?;
+
+        self.ensure_postgresql_extend_conf()?;
 
         // We always start the compute node from scratch, so if the Postgres
         // data dir exists from a previous launch, remove it first.
@@ -809,7 +1013,7 @@ impl Endpoint {
             std::fs::remove_dir_all(self.pgdata())?;
         }
 
-        let pageserver_connstring = Self::build_pageserver_connstr(&args.pageservers);
+        let pageserver_connstring = build_pageserver_connstr(&args.pageservers);
         assert!(!pageserver_connstring.is_empty());
 
         let safekeeper_connstrings = self.build_safekeepers_connstrs(args.safekeepers)?;
@@ -829,7 +1033,14 @@ impl Endpoint {
         // Create config file
         let config = {
             let mut spec = ComputeSpec {
-                skip_pg_catalog_updates: self.skip_pg_catalog_updates,
+                /*
+                 * The compute-side oggit worker persists into tables shipped by
+                 * the neon extension. Local endpoints normally skip catalog
+                 * updates on start, but oggit endpoints must let compute_ctl run
+                 * CreateSchemaNeon/HandleNeonExtension so oggit.state exists
+                 * before the worker leaves its startup wait loop.
+                 */
+                skip_pg_catalog_updates: self.skip_pg_catalog_updates && args.oggit.is_none(),
                 format_version: 1.0,
                 operation_uuid: None,
                 features: self.features.clone(),
@@ -913,6 +1124,19 @@ impl Endpoint {
                 }
                 spec.cluster.postgresql_conf = Some(postgresql_conf);
             }
+            let settings = spec.cluster.settings.get_or_insert_with(Vec::new);
+            settings.retain(|setting| {
+                !(setting.name == "include_if_exists"
+                    && setting
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| value.ends_with(POSTGRESQL_EXTEND_CONF)))
+            });
+            settings.push(GenericOption {
+                name: "include_if_exists".to_string(),
+                value: Some(POSTGRESQL_EXTEND_CONF_INCLUDE_PATH.to_string()),
+                vartype: "string".to_string(),
+            });
 
             ComputeConfig {
                 spec: Some(spec),
@@ -957,12 +1181,12 @@ impl Endpoint {
             pg_bin_dir.join("postgres")
         };
         cmd.args(["--pgbin", pg_binary.to_str().unwrap()])
-        // TODO: It would be nice if we generated compute IDs with the same
-        // algorithm as the real control plane.
-        .args(["--compute-id", &self.endpoint_id])
-        .stdin(std::process::Stdio::null())
-        .stderr(logfile.try_clone()?)
-        .stdout(logfile);
+            // TODO: It would be nice if we generated compute IDs with the same
+            // algorithm as the real control plane.
+            .args(["--compute-id", &self.endpoint_id])
+            .stdin(std::process::Stdio::null())
+            .stderr(logfile.try_clone()?)
+            .stdout(logfile);
 
         if let Some(remote_ext_base_url) = args.remote_ext_base_url {
             cmd.args(["--remote-ext-base-url", &remote_ext_base_url]);
@@ -972,7 +1196,14 @@ impl Endpoint {
             cmd.arg("--dev");
         }
 
-        if let Some(privileged_role_name) = self.privileged_role_name.clone() {
+        let privileged_role_name = self.privileged_role_name.clone().or_else(|| {
+            if args.oggit.is_some() && pg_binary.file_name().is_some_and(|name| name == "gaussdb") {
+                Some(String::from("cloud_admin"))
+            } else {
+                None
+            }
+        });
+        if let Some(privileged_role_name) = privileged_role_name {
             cmd.args(["--privileged-role-name", &privileged_role_name]);
         }
 
@@ -1078,7 +1309,7 @@ impl Endpoint {
             serde_json::from_reader(file)?
         };
 
-        let pageserver_connstring = Self::build_pageserver_connstr(&pageservers);
+        let pageserver_connstring = build_pageserver_connstr(&pageservers);
         assert!(!pageserver_connstring.is_empty());
         let mut spec = config.spec.unwrap();
         spec.pageserver_connstring = Some(pageserver_connstring);
@@ -1144,7 +1375,7 @@ impl Endpoint {
         if let Some(pageservers) = pageservers {
             anyhow::ensure!(!pageservers.is_empty(), "no pageservers provided");
 
-            let pageserver_connstr = Self::build_pageserver_connstr(&pageservers);
+            let pageserver_connstr = build_pageserver_connstr(&pageservers);
             spec.pageserver_connstring = Some(pageserver_connstr);
             if stripe_size.is_some() {
                 spec.shard_stripe_size = stripe_size.map(|s| s.0 as usize);

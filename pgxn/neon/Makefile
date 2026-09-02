@@ -17,6 +17,8 @@ OBJS = \
 	neon_perf_counters.o \
 	neon_utils.o \
 	neon_walreader.o \
+	oggit_merge_barrier.o \
+	oggit_worker.o \
 	pagestore_smgr.o \
 	relsize_cache.o \
 	unstable_extensions.o \

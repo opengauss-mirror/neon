@@ -270,7 +270,8 @@ impl PageServerNode {
 
         let (mut grpc_host, mut grpc_port) = (None, None);
         if let Some(grpc_addr) = &self.conf.listen_grpc_addr {
-            let (host, port) = parse_host_port(grpc_addr).expect("Unable to parse listen_grpc_addr");
+            let (host, port) =
+                parse_host_port(grpc_addr).expect("Unable to parse listen_grpc_addr");
             grpc_host = Some(host.to_string());
             grpc_port = Some(port.unwrap_or(DEFAULT_GRPC_LISTEN_PORT));
         }

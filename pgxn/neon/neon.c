@@ -8,8 +8,6 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-#include <pthread.h>
-
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "access/subtrans.h"
@@ -41,6 +39,8 @@
 #include "neon_lwlsncache.h"
 #include "neon_perf_counters.h"
 #include "logical_replication_monitor.h"
+#include "oggit_merge_barrier.h"
+#include "oggit_worker.h"
 #include "unstable_extensions.h"
 #include "walsender_hooks.h"
 #if PG_MAJORVERSION_NUM >= 16
@@ -53,13 +53,11 @@ void		_PG_init(void);
 
 bool lakebase_mode = false;
 
-static pthread_mutex_t neon_pg_init_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static int  running_xacts_overflow_policy;
 static bool monitor_query_exec_time = false;
 
-static ExecutorStart_hook_type prev_ExecutorStart = NULL;
-static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+static THR_LOCAL ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static THR_LOCAL ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static void neon_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void neon_ExecutorEnd(QueryDesc *queryDesc);
@@ -465,25 +463,32 @@ _PG_init(void)
 	if (!u_sess->misc_cxt.process_shared_preload_libraries_in_progress)
 		return;
 
-	pthread_mutex_lock(&neon_pg_init_mutex);
-
-	/* LFC GUCs live in session context, so register them on each preload pass. */
+	/* LFC, merge-barrier state, and executor hooks are session-local in openGauss. */
 	lfc_init();
 	pg_init_libpagestore();
 	relsize_hash_init();
 	pg_init_walproposer();
 	lwlc_register_gucs();
 	pg_init_extension_server();
+	pg_init_oggit_merge_barrier();
+	pg_init_oggit();
+	if (ExecutorStart_hook != neon_ExecutorStart)
+	{
+		prev_ExecutorStart = ExecutorStart_hook;
+		ExecutorStart_hook = neon_ExecutorStart;
+	}
+	if (ExecutorEnd_hook != neon_ExecutorEnd)
+	{
+		prev_ExecutorEnd = ExecutorEnd_hook;
+		ExecutorEnd_hook = neon_ExecutorEnd;
+	}
 
 	/*
 	 * Also load 'neon_rmgr'. This makes it unnecessary to list both 'neon'
 	 * and 'neon_rmgr' in shared_preload_libraries.
 	 */
 	if (g_instance.loadedNeonPlugin)
-	{
-		pthread_mutex_unlock(&neon_pg_init_mutex);
 		return;
-	}
 
 //	if (u_sess == NULL || u_sess->mcxt_group == NULL) {
 //		return;
@@ -666,13 +671,7 @@ _PG_init(void)
 	prev_shmem_startup_hook = t_thrd.storage_cxt.shmem_startup_hook;
 	t_thrd.storage_cxt.shmem_startup_hook = neon_shmem_startup_hook;
 
-	/* Other misc initialization */
-	prev_ExecutorStart = ExecutorStart_hook;
-	ExecutorStart_hook = neon_ExecutorStart;
-	prev_ExecutorEnd = ExecutorEnd_hook;
-	ExecutorEnd_hook = neon_ExecutorEnd;
-
-	pthread_mutex_unlock(&neon_pg_init_mutex);
+	/* Other misc initialization is registered per session above. */
 }
 
 PG_FUNCTION_INFO_V1(pg_cluster_size);
@@ -821,6 +820,14 @@ neon_shmem_startup_hook(void)
 //	 */
 //	walprop_register_bgworker();
 	//communicator_register_bgworker();
+
+	/*
+	 * The oggit logical decoding worker is started by the postmaster as a
+	 * dedicated OGGITWORKER kernel thread (mirroring WALPROPOSER), not via the
+	 * parallel-worker RegisterBackgroundWorker API. The kernel resolves its
+	 * entry point OggitWorkerMain through load_external_function, so there is
+	 * nothing to register here.
+	 */
 }
 
 /*
@@ -833,6 +840,8 @@ neon_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+
+	oggit_merge_barrier_check_executor(queryDesc);
 
 	if (monitor_query_exec_time)
 	{

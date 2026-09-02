@@ -532,12 +532,13 @@ void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
 	char		cwd[MAXPGPATH];
     InitNuma();
 
-    g_instance.attr.attr_storage.enableIncrementalCheckpoint = false;
-    
-    CalcMaxBackends();
+	g_instance.attr.attr_storage.enableIncrementalCheckpoint = false;
 
-    int numSemas;
-    Size size = 128 * 1024 * 1024;
+	CalcMaxBackends();
+	InitializeNumLwLockPartitions();
+
+	int numSemas;
+	Size size = 512 * 1024 * 1024;
     ereport(LOG, (errmsg("[neon-walredo] optimized shmem: %lu MB (CR Buffer disabled)", 
                          (unsigned long)(size/1024/1024))));
 
@@ -631,9 +632,8 @@ void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
         SSInitTxnStatusCache();
         // SSInitXminInfo();
     }
-	  if (!IsUnderPostmaster) {
-		InitializeNumLwLockPartitions();
-        InitProcGlobal();
+	if (!IsUnderPostmaster) {
+		InitProcGlobal();
         // InitBgworkerGlobal();
         CreateSharedProcArray();
         CreateProcXactHashTable();
@@ -1330,6 +1330,7 @@ GetPage(StringInfo input_message)
 
 	ReleaseBuffer(buf);
 	DropRelationAllLocalBuffers(rinfo);
+	AtEOXact_SMgr();
 	wal_redo_buffer = InvalidBuffer;
 	t_thrd.xlog_cxt.wal_redo_target_buf = InvalidBuffer;
 
