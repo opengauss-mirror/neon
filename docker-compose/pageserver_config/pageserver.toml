@@ -2,7 +2,8 @@ broker_endpoint='http://storage_broker:50051'
 pg_distrib_dir='/usr/local/V702'
 listen_pg_addr='0.0.0.0:6400'
 listen_http_addr='0.0.0.0:9898'
-remote_storage={local_path='/data/.neon/pageserver/remote_storage'}
-control_plane_api='http://storage_controller:1234'
-control_plane_emergency_mode=true
+remote_storage={local_path='/data/.neon/shared_remote_storage'}
+control_plane_api='http://storage_controller:1234/upcall/v1/'
+control_plane_emergency_mode=false
+availability_zone='local'
 virtual_file_io_mode="buffered"

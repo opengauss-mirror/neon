@@ -1,200 +1,228 @@
-# neon_docker Guest Compose 使用说明
+# docker_local 使用说明
 
-本文说明 `docker-compose.yml`、`neon:latest_opgs`、`compute-node-opengauss-v702` 的用途和启停方式。下面命令默认在 `neon_docker/docker-compose` 目录下执行。
+本目录通过 `bin/docker_local` 管理本地 Neon/openGauss PoC 环境。日常启停、扩缩容、创建 tenant/endpoint，都用这条命令。
 
-## 镜像说明
+默认在本目录执行：
 
-### `neon:latest_opgs`
+```bash
+cd neon_docker/docker-compose
+```
 
-`neon:latest_opgs` 是 Neon 存储侧和控制侧服务镜像。在当前 compose 里用于运行：
+## 前置条件
 
-- `storage_broker`
-- `storage_controller`
-- `pageserver`
-- `safekeeper1`、`safekeeper2`、`safekeeper3`
-- `endpoint_storage`
-- 一次性初始化目录权限的 `data_permissions`
+本机已有镜像：
 
-该镜像包含 Neon 存储相关二进制，以及 `/usr/local/${OG_VERSION}` 下的 openGauss 发行目录。`docker-compose.yml` 只使用这个镜像，不会构建它。
+- `og_storage:latest`：control plane、pageserver、safekeeper、storage_controller、endpoint_storage
+- `og_compute:latest`：compute endpoint、`storage_controller_db`
 
-### `compute-node-opengauss-v702:latest`
+可选环境变量（不设则用默认值）：
 
-`compute-node-opengauss-v702:latest` 是 openGauss 计算节点镜像，内置了 Neon 扩展、openGauss 兼容补丁、配置文件和启动脚本，用于运行：
-
-- `compute1`
-- `storage_controller_db`
-- `compute_is_ready`
-
+```bash
+export OG_VERSION=V702
+export NEON_IMAGE=og_storage:latest
+export COMPUTE_IMAGE=og_compute:latest
+export COMPOSE_PROJECT_NAME=neon_poc
+```
 
 ## 一键启停
 
-### 启动全部组件
+### 首次初始化并启动
 
 ```bash
-OG_VERSION=V702 \
-NEON_IMAGE=neon:latest_opgs \
-COMPUTE_IMAGE=compute-node-opengauss-v702:latest \
-docker compose -f docker-compose.yml up -d
+# 初始化本地状态，拉起 docker_control_plane
+# 已有 .neon 时用 --force=remove-all-contents 清空重建
+bin/docker_local init --force=remove-all-contents
+
+# 启动存储侧基础服务
+# 默认：1 个 pageserver + 1 个 safekeeper + storage_controller 等
+bin/docker_local start
 ```
 
-等待 compute 就绪：
+需要一开始就起多个节点时，在 `init` 指定数量：
 
 ```bash
-docker compose -f docker-compose.yml logs -f compute_is_ready
+bin/docker_local init \
+  --force=remove-all-contents \
+  --num-pageservers 2 \
+  --num-safekeepers 2
+
+bin/docker_local start
 ```
 
-看到下面日志说明 compute 已可连接：
+`init` 会把 `num_pageservers` / `num_safekeepers` 写入 `.neon/control_plane/docker_local.json`。之后 `start` / `stop` 按这份配置处理动态节点。
 
-```text
-All computes are started
-```
-
-### 停止全部组件
-
-停止并删除容器但保留数据目录：
+### 日常启停
 
 ```bash
-docker compose -f docker-compose.yml down
+# 启动（control plane 已在时，直接拉起存储组件）
+bin/docker_local start
+
+# 停止 endpoint + 存储组件；默认不停 docker_control_plane
+bin/docker_local stop
+
+# 连 control plane 一起停
+bin/docker_local stop --include-control-plane
+
 ```
 
-停止容器：
+### 创建可写 compute
+
+存储起来后，再创建 tenant 和 endpoint：
 
 ```bash
-docker compose -f docker-compose.yml stop
+bin/docker_local tenant create --set-default
+
+bin/docker_local endpoint create main \
+  --branch-name main
+
+bin/docker_local endpoint start main
 ```
 
-### 单独启停组件
-
-重启单个组件：
+连接：
 
 ```bash
-docker compose -f docker-compose.yml restart compute1
-docker compose -f docker-compose.yml restart pageserver
-docker compose -f docker-compose.yml restart safekeeper1
+
+docker compose -p neon_poc   -f docker-compose.yml exec  main   gsql -d postgres -U cloud_admin -p 55433 -h 127.0.0.1
 ```
 
-修改 YAML 里的 command/env/config 后，建议强制重建对应容器：
+容器名规则：`${COMPOSE_PROJECT_NAME}-${endpoint_id}-1`。上面示例里 endpoint_id 是 `main`，项目名默认 `neon_poc`。
+
+### 查看状态
 
 ```bash
-docker compose -f docker-compose.yml up -d --force-recreate pageserver
-docker compose -f docker-compose.yml up -d --force-recreate safekeeper1
-docker compose -f docker-compose.yml up -d --force-recreate compute1
+bin/docker_local status
+bin/docker_local ps
+bin/docker_local ps --all
+bin/docker_local logs pageserver -f
+bin/docker_local logs safekeeper --tail 200
 ```
 
-## SQL 写入验证
-
-`compute_is_ready` 打印 `All computes are started` 后，可执行：
+检查 pageserver 是否已注册到 storage_controller：
 
 ```bash
-docker compose -f docker-compose.yml exec -T compute1 /bin/bash <<'EOF'
-export GAUSSHOME=/usr/local/V702
-export LD_LIBRARY_PATH=/usr/lib64:/usr/local/V702/lib
-export LD_PRELOAD=/usr/lib64/liblapacke.so.3
-export PATH=/usr/local/V702/bin:$PATH
-/usr/local/V702/bin/gsql -d postgres -U cloud_admin -p 55433 -h localhost <<'SQL'
-DROP TABLE IF EXISTS guest_insert_test;
-CREATE TABLE guest_insert_test(id int primary key, note text);
-INSERT INTO guest_insert_test VALUES (1, 'ok');
-SELECT * FROM guest_insert_test ORDER BY id;
-SQL
-EOF
+curl -s http://127.0.0.1:1234/control/v1/node | jq
 ```
 
-## 配置修改和生效方式
+## 常用操作
 
 ### pageserver
 
-guest compose 中，pageserver 配置通过 bind mount 挂载：
-
-```
-docker-compose/pageserver_config/pageserver.toml
-docker-compose/pageserver_config/identity.toml
-```
-
-这些文件被挂载到容器内的：
-
-```
-/data/.neon/pageserver/pageserver.toml
-/data/.neon/pageserver/identity.toml
-```
-
-持久修改方式：直接编辑本地的配置文件，然后重启 pageserver：
-
 ```bash
-docker compose -f docker-compose.yml restart pageserver
+# 动态增加 pageserver2（node_id=1002）
+bin/docker_local pageserver add 2
+
+# 查看 / 启停 / 删除
+bin/docker_local pageserver list
+bin/docker_local pageserver stop 2
+bin/docker_local pageserver start 2
+bin/docker_local pageserver remove 2
+bin/docker_local pageserver remove 2 --remove-data
+
+# 往指定 node 填充 / 迁移 shard
+bin/docker_local pageserver fill 1002
+bin/docker_local pageserver migrate <tenant-shard-id> 1002
 ```
 
-或者强制重建：
+`pageserver add` 成功后会把 `num_pageservers` 至少提升到对应序号，保证全局 `bin/docker_local stop` 能停掉它。
 
-```bash
-docker compose -f docker-compose.yml up -d --force-recreate pageserver
-```
+默认静态 pageserver 是 ordinal `1` / node `1001`，端口默认 `9898`。动态节点从 `2` 开始，默认 HTTP 端口 `9897 + ordinal`。
 
 ### safekeeper
 
-safekeeper 主要通过 compose 里的环境变量和启动参数配置：
+```bash
+bin/docker_local safekeeper add 2
+bin/docker_local safekeeper list
+bin/docker_local safekeeper stop 2
+bin/docker_local safekeeper start 2
+bin/docker_local safekeeper remove 2
 
-- `SAFEKEEPER_ID`
-- `SAFEKEEPER_ADVERTISE_URL`
-- `BROKER_ENDPOINT`
-- `--listen-pg`
-- `--listen-http`
-- `-D /data/.neon/safekeeperN`
+# 把已有 timeline 迁到新的 safekeeper 集合
+bin/docker_local safekeeper migrate \
+  --tenant-id <tenant_id> \
+  --timeline-id <timeline_id> \
+  --new-sk-set 1,2
+```
 
-修改 `docker-compose.yml` 对应的 `safekeeperN` 服务后，重建该 safekeeper：
+`safekeeper add` 同样会更新 `num_safekeepers`，全局 `stop` 会带上这些动态节点。
+
+### endpoint / compute
+
+compute 全部通过 endpoint 动态创建，不再作为静态服务：
 
 ```bash
-docker compose -f docker-compose.yml up -d --force-recreate safekeeper1
+bin/docker_local endpoint create main --branch-name main --pg-port 55433 --http-port 3080
+bin/docker_local endpoint start main
+bin/docker_local endpoint stop main
+bin/docker_local endpoint list
+bin/docker_local endpoint status main
+bin/docker_local endpoint destroy main
 ```
 
-### compute
-
-compute 的参数来源主要是 `compute_ctl` 读取的 JSON 配置：
-
-```text
-/var/db/gaussdb/configs/config.json
-```
-
-在 `docker-compose.yml` 中，这个文件通过 bind mount 从项目目录挂载：
-
-```
-compute/gaussdb/configs/config.json
-```
-
-持久修改方式：编辑 `compute/gaussdb/configs/config.json`，然后重启或重建 compute：
+再建一个只读/分支 endpoint 示例：
 
 ```bash
-docker compose -f docker-compose.yml restart compute1
+bin/docker_local timeline branch --branch-name feature --ancestor-branch-name main
+bin/docker_local endpoint create feature --branch-name feature --pg-port 55434 --http-port 3081
+bin/docker_local endpoint start feature
 ```
 
-compute 启动时会生成实际的 openGauss 配置：
-
-```text
-/var/db/gaussdb/compute/postgresql.conf
-```
-
-所以 `shared_buffers` 这类参数不要只改生成后的 `postgresql.conf`，应改 `config.json`，然后重启 compute 进程。
-
-`shared_buffers` 属于 postmaster 级参数，不能只靠 `SELECT pg_reload_conf()` 生效，必须重启 compute 进程。
-
-### storage_controller_db
-
-guest compose 用 `compute-node-opengauss-v702` 启动 `storage_controller_db`，入口脚本为：
-
-```text
-/shell/storage_controller_db.sh
-```
-
-数据保存在 `.neon/storage_controller_db` 目录。如果修改脚本，需要重建基础镜像或增加 bind mount，然后 recreate `storage_controller_db`。
-
-## `data_permissions` 的作用
-
-`data_permissions` 是一次性 helper 服务。它以 root 用户运行，在其他服务启动前创建所需数据目录并设置权限。
-
-guest compose 用它初始化 `.neon` 目录下的各个子目录。
-
-如果某些目录由容器 root 创建，导致宿主机用户无法删除，可以在 `neon_docker/docker-compose` 下用 root 容器清理：
+### tenant / timeline
 
 ```bash
-docker run --rm -u 0:0 -v "$PWD:/work" neon:latest_opgs /bin/sh -ec 'rm -rf /work/.neon'
+bin/docker_local tenant create --set-default
+bin/docker_local tenant list
+bin/docker_local tenant describe
+
+bin/docker_local timeline list
+bin/docker_local timeline branch --branch-name feature --ancestor-branch-name main
+```
+
+### 单服务启停
+
+也可以只操作某一个基础服务：
+
+```bash
+bin/docker_local start --service pageserver
+bin/docker_local stop --service safekeeper
+bin/docker_local storage-controller restart
+bin/docker_local storage-broker logs -f
+```
+
+## 配置与数据
+
+| 路径 | 作用 |
+| --- | --- |
+| `bin/docker_local` | CLI 入口 |
+| `bin/docker_local.py` | 实现 |
+| `pageserver_config/` | 默认 pageserver（node 1001）配置 |
+| `ext-src/` | 构建 `og_compute` 镜像用，不参与运行时启停 |
+| `.neon/control_plane/docker_local.json` | CLI 本地配置（节点数量、镜像等） |
+| `.neon/pageserver` / `.neon/pageserverN` | pageserver 数据 |
+| `.neon/safekeeper` / `.neon/safekeeperN` | safekeeper 数据 |
+| `.neon/<endpoint>/` | endpoint 数据 |
+| `.neon/shared_remote_storage` | 共享 remote storage |
+| `.neon/control_plane/overrides/` | 动态服务 override（pageserver / safekeeper / endpoint） |
+
+动态服务不会手写进静态 compose 文件，而是由 `docker_local` / `docker_control_plane` 生成到 `.neon/control_plane/overrides/`。
+
+## 清理与重建
+
+只停容器、保留数据：
+
+```bash
+bin/docker_local stop --include-control-plane
+```
+
+清空状态并重新初始化：
+
+```bash
+bin/docker_local init --force=remove-all-contents
+bin/docker_local start
+```
+
+若宿主机删不掉 `.neon`（权限被容器改过），可在本目录执行：
+
+```bash
+docker run --rm -u 0:0 -v "$PWD:/work" og_storage:latest \
+  /bin/sh -ec 'rm -rf /work/.neon'
 ```

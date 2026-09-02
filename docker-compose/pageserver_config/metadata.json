@@ -1,0 +1,10 @@
+{
+  "host": "pageserver",
+  "port": 6400,
+  "http_host": "pageserver",
+  "http_port": 9898,
+  "https_port": null,
+  "grpc_host": null,
+  "grpc_port": null,
+  "availability_zone_id": "local"
+}
