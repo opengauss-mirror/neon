@@ -1762,3 +1762,908 @@ fn parse_placement_policy(value: &str) -> Result<PlacementPolicy> {
         }
     }
 }
+
+fn parse_shard_scheduling_policy(value: &str) -> Result<ShardSchedulingPolicy> {
+    match value {
+        "active" => Ok(ShardSchedulingPolicy::Active),
+        "essential" => Ok(ShardSchedulingPolicy::Essential),
+        "pause" => Ok(ShardSchedulingPolicy::Pause),
+        "stop" => Ok(ShardSchedulingPolicy::Stop),
+        _ => bail!(
+            "unknown shard scheduling policy {value}, expected active, essential, pause, or stop"
+        ),
+    }
+}
+
+fn cleanup_deleted_tenant_state(state_dir: &Path, tenant_id: TenantId) -> Result<Value> {
+    let tenant_id_string = tenant_id.to_string();
+    let mut removed_branches = Vec::new();
+    let mut mappings = load_mappings(state_dir)?;
+    if let Some(object) = mappings.as_object_mut() {
+        object.retain(|branch_name, mapping| {
+            let remove = mapping
+                .get("tenant_id")
+                .and_then(Value::as_str)
+                .is_some_and(|mapped_tenant| mapped_tenant == tenant_id_string);
+            if remove {
+                removed_branches.push(branch_name.clone());
+            }
+            !remove
+        });
+        write_json_file(&state_dir.join("branches.json"), &mappings)?;
+    }
+
+    let mut removed_timeline_safekeepers = Vec::new();
+    let dir = state_dir.join("timeline_safekeepers");
+    if dir.exists() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+        {
+            let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{tenant_id}_")))
+            {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                removed_timeline_safekeepers.push(path.display().to_string());
+            }
+        }
+    }
+
+    let env_path = state_dir.join("env.json");
+    let mut cleared_default = false;
+    if env_path.exists() {
+        let mut env: Value = serde_json::from_reader(
+            std::fs::File::open(&env_path)
+                .with_context(|| format!("opening {}", env_path.display()))?,
+        )
+        .with_context(|| format!("decoding {}", env_path.display()))?;
+        if env
+            .get("default_tenant_id")
+            .and_then(Value::as_str)
+            .is_some_and(|default_tenant| default_tenant == tenant_id_string)
+        {
+            if let Some(object) = env.as_object_mut() {
+                object.remove("default_tenant_id");
+            }
+            write_json_file(&env_path, &env)?;
+            cleared_default = true;
+        }
+    }
+
+    Ok(json!({
+        "tenant_id": tenant_id,
+        "deleted": true,
+        "removed_branches": removed_branches,
+        "removed_timeline_safekeepers": removed_timeline_safekeepers,
+        "cleared_default_tenant": cleared_default,
+    }))
+}
+
+fn cleanup_deleted_timeline_state(
+    state_dir: &Path,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+) -> Result<Value> {
+    let tenant_id_string = tenant_id.to_string();
+    let timeline_id_string = timeline_id.to_string();
+    let mut removed_branches = Vec::new();
+    let mut mappings = load_mappings(state_dir)?;
+    if let Some(object) = mappings.as_object_mut() {
+        object.retain(|branch_name, mapping| {
+            let remove = mapping
+                .get("tenant_id")
+                .and_then(Value::as_str)
+                .is_some_and(|mapped_tenant| mapped_tenant == tenant_id_string)
+                && mapping
+                    .get("timeline_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|mapped_timeline| mapped_timeline == timeline_id_string);
+            if remove {
+                removed_branches.push(branch_name.clone());
+            }
+            !remove
+        });
+        write_json_file(&state_dir.join("branches.json"), &mappings)?;
+    }
+
+    let mut removed_endpoints = Vec::new();
+    for endpoint in load_endpoints(state_dir)? {
+        if endpoint.tenant_id == tenant_id_string && endpoint.timeline_id == timeline_id_string {
+            let removed = delete_endpoint_record(state_dir, &endpoint.endpoint_id)?;
+            removed_endpoints.push(removed);
+        }
+    }
+
+    let safekeepers_path =
+        timeline_safekeepers_path(state_dir, &tenant_id_string, &timeline_id_string);
+    let removed_timeline_safekeepers = if safekeepers_path.exists() {
+        std::fs::remove_file(&safekeepers_path)
+            .with_context(|| format!("removing {}", safekeepers_path.display()))?;
+        true
+    } else {
+        false
+    };
+
+    Ok(json!({
+        "tenant_id": tenant_id,
+        "timeline_id": timeline_id,
+        "deleted": true,
+        "removed_branches": removed_branches,
+        "removed_endpoints": removed_endpoints,
+        "removed_timeline_safekeepers": removed_timeline_safekeepers,
+    }))
+}
+
+async fn set_tenant_preferred_az(
+    storage_controller: &dyn StorageControllerApi,
+    tenant_id: TenantId,
+    preferred_az: Option<String>,
+) -> Result<Value> {
+    let tenant = storage_controller.tenant_describe(tenant_id).await?;
+    if let Some(preferred_az) = &preferred_az {
+        let known_azs = storage_controller
+            .node_list()
+            .await?
+            .into_iter()
+            .map(|node| node.availability_zone_id)
+            .collect::<HashSet<_>>();
+        if !known_azs.contains(preferred_az) {
+            bail!("AZ {preferred_az} not found on any node: known AZs are {known_azs:?}");
+        }
+    }
+
+    let preferred_az_ids = tenant
+        .shards
+        .into_iter()
+        .map(|shard| {
+            (
+                shard.tenant_shard_id,
+                preferred_az.clone().map(AvailabilityZone),
+            )
+        })
+        .collect();
+    let response = storage_controller
+        .update_preferred_azs(ShardsPreferredAzsRequest { preferred_az_ids })
+        .await?;
+    let tenant = storage_controller.tenant_describe(tenant_id).await?;
+    Ok(json!({
+        "tenant_id": tenant_id,
+        "preferred_az": preferred_az,
+        "updated": response.updated,
+        "tenant": tenant,
+    }))
+}
+
+async fn wait_node_scheduling_policy<F>(
+    storage_controller: &dyn StorageControllerApi,
+    node_id: NodeId,
+    timeout_seconds: u64,
+    done: F,
+) -> Result<NodeSchedulingPolicy>
+where
+    F: Fn(NodeSchedulingPolicy) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let nodes = storage_controller.node_list().await?;
+        let node = nodes
+            .into_iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| anyhow!("node {node_id} not found"))?;
+        if done(node.scheduling) {
+            return Ok(node.scheduling);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for node {node_id} scheduling policy, current {:?}",
+                node.scheduling
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_tenant_shard<F>(
+    storage_controller: &dyn StorageControllerApi,
+    tenant_shard_id: TenantShardId,
+    timeout_seconds: u64,
+    done: F,
+) -> Result<TenantDescribeResponse>
+where
+    F: Fn(&pageserver_api::controller_api::TenantDescribeResponseShard) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        let tenant = storage_controller
+            .tenant_describe(tenant_shard_id.tenant_id)
+            .await?;
+        let shard = tenant
+            .shards
+            .iter()
+            .find(|shard| shard.tenant_shard_id == tenant_shard_id)
+            .ok_or_else(|| anyhow!("tenant shard {tenant_shard_id} not found"))?;
+        if done(shard) {
+            return Ok(tenant);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for tenant shard {tenant_shard_id}, last state {}",
+                serde_json::to_value(&tenant)?
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_tenant_shard_attached(
+    storage_controller: &dyn StorageControllerApi,
+    tenant_shard_id: TenantShardId,
+    node_id: NodeId,
+    timeout_seconds: u64,
+) -> Result<TenantDescribeResponse> {
+    wait_tenant_shard(
+        storage_controller,
+        tenant_shard_id,
+        timeout_seconds,
+        |shard| shard.node_attached == Some(node_id) && !shard.is_reconciling,
+    )
+    .await
+}
+
+async fn wait_tenant_shard_secondary(
+    storage_controller: &dyn StorageControllerApi,
+    tenant_shard_id: TenantShardId,
+    node_id: NodeId,
+    timeout_seconds: u64,
+) -> Result<TenantDescribeResponse> {
+    wait_tenant_shard(
+        storage_controller,
+        tenant_shard_id,
+        timeout_seconds,
+        |shard| shard.node_secondary.contains(&node_id) && !shard.is_reconciling,
+    )
+    .await
+}
+
+async fn bulk_migrate_pageservers(
+    storage_controller: &dyn StorageControllerApi,
+    req: PageServerBulkMigrateRequest,
+) -> Result<Value> {
+    let drain_ids = req
+        .nodes
+        .iter()
+        .copied()
+        .map(NodeId)
+        .collect::<HashSet<_>>();
+    if drain_ids.is_empty() {
+        bail!("bulk migrate requires at least one source node");
+    }
+
+    let nodes = storage_controller.node_list().await?;
+    let mut drain_nodes = Vec::new();
+    let mut fill_nodes = Vec::new();
+    for node in nodes {
+        if drain_ids.contains(&node.id) {
+            drain_nodes.push(node);
+        } else if matches!(node.availability, NodeAvailabilityWrapper::Active)
+            && matches!(
+                node.scheduling,
+                NodeSchedulingPolicy::Active | NodeSchedulingPolicy::Filling
+            )
+        {
+            fill_nodes.push(node);
+        }
+    }
+    if drain_nodes.len() != drain_ids.len() {
+        bail!("bulk migration requested away from a node that does not exist");
+    }
+    if fill_nodes.is_empty() {
+        bail!("there are no active destination nodes to migrate to");
+    }
+
+    for node in &drain_nodes {
+        storage_controller
+            .node_configure(NodeConfigureRequest {
+                node_id: node.id,
+                availability: None,
+                scheduling: Some(NodeSchedulingPolicy::Draining),
+            })
+            .await?;
+    }
+
+    let tenants = storage_controller.tenant_list(Some(10000)).await?;
+    let mut selected_node_idx = 0usize;
+    let mut moves = Vec::new();
+    for shard in tenants.into_iter().flat_map(|tenant| tenant.shards) {
+        if req
+            .max_shards
+            .is_some_and(|max_shards| moves.len() >= max_shards)
+        {
+            break;
+        }
+        let Some(from) = shard.node_attached else {
+            continue;
+        };
+        if !drain_ids.contains(&from) {
+            continue;
+        }
+        let to = fill_nodes[selected_node_idx].id;
+        selected_node_idx = (selected_node_idx + 1) % fill_nodes.len();
+        moves.push((shard.tenant_shard_id, from, to));
+    }
+
+    if req.dry_run.unwrap_or(false) {
+        return Ok(json!({
+            "dry_run": true,
+            "planned": moves.iter().map(|(tenant_shard_id, from, to)| {
+                json!({ "tenant_shard_id": tenant_shard_id, "from": from, "to": to })
+            }).collect::<Vec<_>>(),
+            "total": moves.len(),
+            "concurrency": req.concurrency.unwrap_or(8),
+        }));
+    }
+
+    let concurrency = req.concurrency.unwrap_or(8);
+    if concurrency == 0 {
+        bail!("bulk migrate concurrency must be greater than zero");
+    }
+    let override_scheduler = req.override_scheduler.unwrap_or(false);
+    let timeout_seconds = req.timeout_seconds.unwrap_or(900);
+    let mut stream = futures::stream::iter(moves)
+        .map(|(tenant_shard_id, from, to)| async move {
+            let result = async {
+                storage_controller
+                    .tenant_shard_migrate(
+                        tenant_shard_id,
+                        TenantShardMigrateRequest {
+                            node_id: to,
+                            origin_node_id: Some(from),
+                            migration_config: MigrationConfig {
+                                override_scheduler,
+                                ..Default::default()
+                            },
+                        },
+                    )
+                    .await?;
+                wait_tenant_shard_attached(storage_controller, tenant_shard_id, to, timeout_seconds)
+                    .await
+            }
+            .await;
+            (tenant_shard_id, from, to, result)
+        })
+        .buffer_unordered(concurrency);
+
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    while let Some((tenant_shard_id, from, to, result)) = stream.next().await {
+        match result {
+            Ok(tenant) => succeeded.push(json!({
+                "tenant_shard_id": tenant_shard_id,
+                "from": from,
+                "to": to,
+                "tenant": tenant,
+            })),
+            Err(err) => failed.push(json!({
+                "tenant_shard_id": tenant_shard_id,
+                "from": from,
+                "to": to,
+                "error": err.to_string(),
+            })),
+        }
+    }
+    let success = succeeded.len();
+    let failure = failed.len();
+
+    Ok(json!({
+        "dry_run": false,
+        "succeeded": succeeded,
+        "failed": failed,
+        "success": success,
+        "failure": failure,
+        "concurrency": concurrency,
+        "override_scheduler": override_scheduler,
+    }))
+}
+
+async fn handle_safekeeper_timeline_migrate(
+    state: &AppState,
+    req: SafekeeperTimelineMigrateRequest,
+) -> Result<Value> {
+    let tenant_id = TenantId::from_str(&req.tenant_id).context("parsing tenant_id")?;
+    let timeline_id = TimelineId::from_str(&req.timeline_id).context("parsing timeline_id")?;
+    let new_sk_set = req.new_sk_set.into_iter().map(NodeId).collect::<Vec<_>>();
+    let storage_controller = docker_storage_controller_api(state)?;
+    storage_controller
+        .timeline_safekeeper_migrate(
+            tenant_id,
+            timeline_id,
+            TimelineSafekeeperMigrateRequest {
+                new_sk_set: new_sk_set.clone(),
+            },
+        )
+        .await?;
+
+    let locate_value = proxy_get_json(
+        state,
+        &format!("/debug/v1/tenant/{tenant_id}/timeline/{timeline_id}/locate"),
+    )
+    .await?;
+    let locate: SafekeeperTimelineLocateResponse = serde_json::from_value(locate_value.clone())
+        .context("decoding storage-controller timeline locate response")?;
+    let safekeepers = storage_controller.safekeeper_list().await?;
+    let host_by_id = safekeepers
+        .into_iter()
+        .map(|sk| (sk.id, sk.host))
+        .collect::<HashMap<_, _>>();
+    let saved_safekeepers = locate
+        .sk_set
+        .iter()
+        .map(|node_id| SafekeeperInfo {
+            id: node_id.0,
+            hostname: host_by_id.get(node_id).cloned(),
+        })
+        .collect::<Vec<_>>();
+    save_timeline_safekeepers_value(
+        &state.state_dir,
+        &tenant_id.to_string(),
+        &timeline_id.to_string(),
+        locate.generation.into_inner(),
+        &saved_safekeepers,
+    )?;
+
+    Ok(json!({
+        "tenant_id": tenant_id,
+        "timeline_id": timeline_id,
+        "requested_new_sk_set": new_sk_set,
+        "locate": locate_value,
+        "saved_safekeepers": saved_safekeepers,
+    }))
+}
+
+async fn oggit_gc(State(state): State<Arc<AppState>>, body: String) -> Response {
+    let req = if body.trim().is_empty() {
+        OggitGcRequest {
+            retention_lsn_distance: default_oggit_gc_retention_lsn_distance(),
+        }
+    } else {
+        match serde_json::from_str::<OggitGcRequest>(&body) {
+            Ok(req) => req,
+            Err(err) => return error_response(StatusCode::BAD_REQUEST, anyhow!(err)),
+        }
+    };
+    match handle_oggit_gc(&state, req).await {
+        Ok(results) => Json(json!({ "results": results })).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+fn min_child_ancestor_lsn(parent_id: TimelineId, timelines: &[TimelineInfo]) -> Option<String> {
+    timelines
+        .iter()
+        .filter(|timeline| timeline.ancestor_timeline_id == Some(parent_id))
+        .filter_map(|timeline| timeline.ancestor_lsn)
+        .min()
+        .map(|lsn| lsn.to_string())
+}
+
+async fn run_oggit_gc_on_connstr(
+    connstr: &str,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+    floor_lsn: String,
+    retention_lsn_distance: u128,
+) -> Result<OggitGcParentResult> {
+    let (client, connection) = tokio_opengauss::connect(connstr, NoTls)
+        .await
+        .with_context(|| format!("failed to connect to oggit parent endpoint at {connstr}"))?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    oggit_gc_parent(
+        &client,
+        OggitGcParentRequest {
+            tenant_id: tenant_id.to_string(),
+            timeline_id: timeline_id.to_string(),
+            floor_lsn,
+            retention_lsn_distance,
+        },
+    )
+    .await
+}
+
+async fn handle_oggit_gc(
+    state: &AppState,
+    req: OggitGcRequest,
+) -> Result<Vec<OggitGcParentResult>> {
+    let storage_controller = docker_storage_controller_api(state)?;
+    let nodes = load_pageserver_nodes(state).await?;
+    let tenants = storage_controller.tenant_list(Some(10000)).await?;
+    let endpoints = load_endpoints(&state.state_dir)?;
+    let mut results = Vec::new();
+
+    for tenant in tenants {
+        for shard in tenant.shards {
+            let Some(node_id) = shard.node_attached else {
+                continue;
+            };
+            let Some(node) = nodes.get(&node_id.0) else {
+                continue;
+            };
+            let timelines = list_pageserver_timelines(state, node, shard.tenant_shard_id).await?;
+            for timeline in timelines
+                .iter()
+                .filter(|timeline| timeline.ancestor_timeline_id.is_none())
+            {
+                let tenant_id = timeline.tenant_id.tenant_id;
+                let floor_lsn = min_child_ancestor_lsn(timeline.timeline_id, &timelines)
+                    .unwrap_or_else(|| "0/0".to_string());
+                let running = endpoints
+                    .iter()
+                    .filter(|endpoint| {
+                        endpoint.tenant_id == tenant_id.to_string()
+                            && endpoint.timeline_id == timeline.timeline_id.to_string()
+                            && endpoint.status == "Running"
+                    })
+                    .collect::<Vec<_>>();
+
+                if running.is_empty() {
+                    results.push(OggitGcParentResult {
+                        tenant_id: tenant_id.to_string(),
+                        timeline_id: timeline.timeline_id.to_string(),
+                        status: "skipped".to_string(),
+                        floor_lsn,
+                        deleted_change_log: 0,
+                        deleted_object_change: 0,
+                        skipped_reason: Some(
+                            "no running endpoint for root parent timeline".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+                if running.len() > 1 {
+                    results.push(OggitGcParentResult {
+                        tenant_id: tenant_id.to_string(),
+                        timeline_id: timeline.timeline_id.to_string(),
+                        status: "skipped".to_string(),
+                        floor_lsn,
+                        deleted_change_log: 0,
+                        deleted_object_change: 0,
+                        skipped_reason: Some(
+                            "multiple running endpoints for root parent timeline".to_string(),
+                        ),
+                    });
+                    continue;
+                }
+
+                let endpoint = running[0];
+                let connstr = branch_endpoint_connstr(endpoint, "branch_merge", "postgres")?;
+                let mut result = run_oggit_gc_on_connstr(
+                    &connstr,
+                    tenant_id,
+                    timeline.timeline_id,
+                    floor_lsn,
+                    u128::from(req.retention_lsn_distance),
+                )
+                .await
+                .with_context(|| format!("failed to GC endpoint {}", endpoint.endpoint_id))?;
+                if result.status == "deleted"
+                    && result.deleted_change_log == 0
+                    && result.deleted_object_change == 0
+                {
+                    result.status = "ok".to_string();
+                }
+                results.push(result);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+async fn branch_diff(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BranchRunRequest>,
+) -> Response {
+    match branch_run_endpoint_refs(&state, &req).and_then(|(source_endpoint, target_endpoint)| {
+        Ok(BranchDiffOptions {
+            source_endpoint,
+            target_endpoint,
+            source_schema: req.source_schema.unwrap_or_else(|| "public".to_string()),
+            target_schema: req.target_schema.unwrap_or_else(|| "public".to_string()),
+            fdw_server: "neon_merge_src".to_string(),
+            keep_fdw: req.keep_fdw.unwrap_or(false),
+            incremental_oggit: req.incremental_oggit.unwrap_or(false),
+        })
+    }) {
+        Ok(opts) => match diff_branch(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn branch_merge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BranchRunRequest>,
+) -> Response {
+    match branch_run_endpoint_refs(&state, &req).and_then(|(source_endpoint, target_endpoint)| {
+        let strategy = BranchMergeStrategy::from_str(
+            &req.strategy.clone().unwrap_or_else(|| "fail".to_string()),
+        )?;
+        Ok(BranchMergeOptions {
+            source_endpoint,
+            target_endpoint,
+            source_schema: req.source_schema.unwrap_or_else(|| "public".to_string()),
+            target_schema: req.target_schema.unwrap_or_else(|| "public".to_string()),
+            strategy,
+            fdw_server: "neon_merge_src".to_string(),
+            copy_source_only_tables: true,
+            keep_fdw: req.keep_fdw.unwrap_or(false),
+            incremental_oggit: req.incremental_oggit.unwrap_or(false),
+        })
+    }) {
+        Ok(opts) => match merge_branch(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn branch_status(
+    State(state): State<Arc<AppState>>,
+    AxumPath(merge_id): AxumPath<String>,
+    Query(query): Query<BranchTargetQuery>,
+) -> Response {
+    match branch_target_endpoint_ref_from_selector(
+        &state,
+        query.tenant_id.as_deref(),
+        query.target_branch.as_deref(),
+        query.target_endpoint.as_deref(),
+        query.target_connstr.as_deref(),
+        query.user.as_deref(),
+        query.database.as_deref(),
+    )
+    .map(|target_endpoint| BranchTargetOptions {
+        target_endpoint,
+        merge_id,
+    }) {
+        Ok(opts) => match merge_status(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn branch_conflicts(
+    State(state): State<Arc<AppState>>,
+    AxumPath(merge_id): AxumPath<String>,
+    Query(query): Query<BranchTargetQuery>,
+) -> Response {
+    match branch_target_endpoint_ref_from_selector(
+        &state,
+        query.tenant_id.as_deref(),
+        query.target_branch.as_deref(),
+        query.target_endpoint.as_deref(),
+        query.target_connstr.as_deref(),
+        query.user.as_deref(),
+        query.database.as_deref(),
+    )
+    .map(|target_endpoint| BranchTargetOptions {
+        target_endpoint,
+        merge_id,
+    }) {
+        Ok(opts) => match conflicts(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn branch_resolve(
+    State(state): State<Arc<AppState>>,
+    AxumPath(merge_id): AxumPath<String>,
+    Json(req): Json<BranchTargetRequest>,
+) -> Response {
+    match branch_target_request_options(&state, merge_id, req) {
+        Ok(opts) => match resolve_conflict(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn branch_continue(
+    State(state): State<Arc<AppState>>,
+    AxumPath(merge_id): AxumPath<String>,
+    Json(req): Json<BranchTargetRequest>,
+) -> Response {
+    match branch_target_endpoint_ref_from_request(&state, &req).map(|target_endpoint| {
+        BranchTargetOptions {
+            target_endpoint,
+            merge_id,
+        }
+    }) {
+        Ok(opts) => match continue_merge(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn branch_abort(
+    State(state): State<Arc<AppState>>,
+    AxumPath(merge_id): AxumPath<String>,
+    Json(req): Json<BranchTargetRequest>,
+) -> Response {
+    match branch_target_endpoint_ref_from_request(&state, &req).map(|target_endpoint| {
+        BranchTargetOptions {
+            target_endpoint,
+            merge_id,
+        }
+    }) {
+        Ok(opts) => match abort_merge(opts).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err),
+    }
+}
+
+async fn notify_attach(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NotifyAttachRequest>,
+) -> Response {
+    match handle_notify_attach(&state, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn notify_safekeepers(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NotifySafekeepersRequest>,
+) -> Response {
+    match handle_notify_safekeepers(&state, req).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn handle_notify_attach(
+    state: &AppState,
+    req: NotifyAttachRequest,
+) -> Result<NotifyResponse> {
+    let endpoints = running_endpoints_for_tenant(&state.state_dir, &req.tenant_id)?;
+    if endpoints.is_empty() {
+        return Ok(NotifyResponse {
+            reconfigured: Vec::new(),
+            skipped: 0,
+        });
+    }
+
+    let nodes = load_pageserver_nodes(state).await?;
+    let mut ordered_shards = req.shards;
+    ordered_shards.sort_by_key(|shard| shard.shard_number);
+
+    let mut pageserver_parts = Vec::with_capacity(ordered_shards.len());
+    for shard in ordered_shards {
+        let node = nodes
+            .get(&shard.node_id)
+            .ok_or_else(|| anyhow!("pageserver node {} not found", shard.node_id))?;
+        pageserver_parts.push(format!(
+            "host={} port={}",
+            node.listen_pg_addr, node.listen_pg_port
+        ));
+    }
+    let pageserver_connstring = pageserver_parts.join(",");
+
+    let mut reconfigured = Vec::new();
+    for endpoint in endpoints {
+        update_endpoint_config(&state.state_dir, &endpoint, |spec| {
+            spec["pageserver_connstring"] = Value::String(pageserver_connstring.clone());
+            upsert_setting(
+                spec,
+                "neon.pageserver_connstring",
+                &pageserver_connstring,
+                "string",
+            )?;
+            if let Some(stripe_size) = req.stripe_size {
+                spec["shard_stripe_size"] = json!(stripe_size);
+            }
+            Ok(())
+        })?;
+
+        post_configure(state, &endpoint).await?;
+        reconfigured.push(endpoint.endpoint_id);
+    }
+
+    Ok(NotifyResponse {
+        reconfigured,
+        skipped: 0,
+    })
+}
+
+async fn handle_notify_safekeepers(
+    state: &AppState,
+    req: NotifySafekeepersRequest,
+) -> Result<NotifyResponse> {
+    save_timeline_safekeepers_value(
+        &state.state_dir,
+        &req.tenant_id,
+        &req.timeline_id,
+        req.generation,
+        &req.safekeepers,
+    )?;
+
+    let endpoints = running_endpoints_for_tenant(&state.state_dir, &req.tenant_id)?
+        .into_iter()
+        .filter(|endpoint| endpoint.timeline_id == req.timeline_id)
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Ok(NotifyResponse {
+            reconfigured: Vec::new(),
+            skipped: 0,
+        });
+    }
+
+    let connstrings = req
+        .safekeepers
+        .iter()
+        .map(|sk| {
+            let host = sk
+                .hostname
+                .clone()
+                .unwrap_or_else(|| safekeeper_host_from_id(sk.id));
+            format!("{host}:5454")
+        })
+        .collect::<Vec<_>>();
+    let connstrings_setting = connstrings.join(",");
+
+    let mut reconfigured = Vec::new();
+    for endpoint in endpoints {
+        update_endpoint_config(&state.state_dir, &endpoint, |spec| {
+            spec["safekeeper_connstrings"] = json!(connstrings);
+            spec["safekeepers_generation"] = json!(req.generation);
+            upsert_setting(spec, "neon.safekeepers", &connstrings_setting, "string")?;
+            Ok(())
+        })?;
+
+        post_configure(state, &endpoint).await?;
+        reconfigured.push(endpoint.endpoint_id);
+    }
+
+    Ok(NotifyResponse {
+        reconfigured,
+        skipped: 0,
+    })
+}
+
+async fn load_status(state: &AppState) -> Result<Value> {
+    let endpoints = load_endpoints(&state.state_dir)?;
+    let env = read_or_write_default_env(state)?;
+    let pageservers = proxy_get_json(state, "/control/v1/node")
+        .await
+        .unwrap_or(json!([]));
+    let tenants = proxy_get_json(state, "/control/v1/tenant?limit=10000")
+        .await
+        .unwrap_or(json!([]));
+    Ok(json!({
+        "status": "ok",
+        "env": env,
+        "endpoints": endpoints,
+        "pageservers": pageservers,
+        "tenants": tenants,
+    }))
+}
