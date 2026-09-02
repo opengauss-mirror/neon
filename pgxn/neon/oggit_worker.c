@@ -965,3 +965,750 @@ static XLogRecPtr oggit_batch_max_decode_lsn = InvalidXLogRecPtr;
 static XLogRecPtr oggit_batch_max_confirmed_lsn = InvalidXLogRecPtr;
 
 static bool
+oggit_batch_limit_reached(void)
+{
+	bool		event_limit_reached;
+	bool		byte_limit_reached;
+
+	event_limit_reached = oggit_batch_max_events > 0 &&
+		oggit_batch_event_count >= (uint64) oggit_batch_max_events;
+	byte_limit_reached = oggit_batch_max_bytes > 0 &&
+		oggit_batch_payload_bytes >= (uint64) oggit_batch_max_bytes;
+
+	return event_limit_reached || byte_limit_reached;
+}
+
+static void
+oggit_reset_batch(void)
+{
+	if (oggit_batch_cxt != NULL)
+		MemoryContextReset(oggit_batch_cxt);
+
+	oggit_event_buf = NIL;
+	oggit_batch_event_count = 0;
+	oggit_batch_payload_bytes = 0;
+	oggit_batch_max_decode_lsn = InvalidXLogRecPtr;
+	oggit_batch_max_confirmed_lsn = InvalidXLogRecPtr;
+}
+
+static void
+oggit_note_batch_commit_lsn(const char *decode_lsn_str, const char *confirmed_lsn_str)
+{
+	bool		have_error = false;
+	XLogRecPtr	decode_lsn;
+	XLogRecPtr	confirmed_lsn;
+
+	if (decode_lsn_str != NULL && decode_lsn_str[0] != '\0')
+	{
+		have_error = false;
+		decode_lsn = pg_lsn_in_internal(decode_lsn_str, &have_error);
+		if (!have_error &&
+			(XLByteEQ(oggit_batch_max_decode_lsn, InvalidXLogRecPtr) ||
+			 XLByteLT(oggit_batch_max_decode_lsn, decode_lsn)))
+			oggit_batch_max_decode_lsn = decode_lsn;
+	}
+
+	if (confirmed_lsn_str != NULL && confirmed_lsn_str[0] != '\0')
+	{
+		have_error = false;
+		confirmed_lsn = pg_lsn_in_internal(confirmed_lsn_str, &have_error);
+		if (!have_error &&
+			(XLByteEQ(oggit_batch_max_confirmed_lsn, InvalidXLogRecPtr) ||
+			 XLByteLT(oggit_batch_max_confirmed_lsn, confirmed_lsn)))
+			oggit_batch_max_confirmed_lsn = confirmed_lsn;
+	}
+}
+
+static void
+oggit_release_resource_owner(ResourceOwner owner, ResourceOwner parent,
+							 bool is_commit)
+{
+	if (owner == NULL)
+		return;
+
+	Assert(t_thrd.utils_cxt.CurrentResourceOwner == owner);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, is_commit, true);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, is_commit, true);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, is_commit, true);
+	t_thrd.utils_cxt.CurrentResourceOwner = parent;
+	ResourceOwnerDelete(owner);
+}
+
+static void
+oggit_prepare_write(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+					TransactionId xid, bool last_write)
+{
+	resetStringInfo(ctx->out);
+}
+
+static void
+oggit_do_write(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+			   TransactionId xid, bool last_write)
+{
+	MemoryContext old;
+
+	if (ctx->out->len == 0)
+		return;
+
+	old = MemoryContextSwitchTo(oggit_batch_cxt);
+	oggit_event_buf = lappend(oggit_event_buf, pstrdup(ctx->out->data));
+	MemoryContextSwitchTo(old);
+
+	oggit_batch_event_count++;
+	oggit_batch_payload_bytes += (uint64) ctx->out->len;
+}
+
+/* ------------------------------------------------------------------------
+ * Event persistence (moved from the Rust oggit_record_event)
+ * ------------------------------------------------------------------------ */
+
+static const char *
+oggit_json_str(const cJSON *obj, const char *field)
+{
+	const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, field);
+
+	if (item != NULL && cJSON_IsString(item))
+		return item->valuestring;
+	return NULL;
+}
+
+static bool
+oggit_json_bool_or_false(cJSON *obj, const char *field)
+{
+	cJSON	   *item = cJSON_GetObjectItemCaseSensitive(obj, field);
+
+	return item != NULL && cJSON_IsTrue(item);
+}
+
+static char *
+oggit_truncate_replay_sql(cJSON *event, const char **first_schema,
+						  const char **first_table)
+{
+	cJSON	   *relations = cJSON_GetObjectItemCaseSensitive(event, "relations");
+	cJSON	   *rel;
+	StringInfoData sql;
+	bool		have_relation = false;
+
+	if (first_schema != NULL)
+		*first_schema = NULL;
+	if (first_table != NULL)
+		*first_table = NULL;
+	if (relations == NULL || !cJSON_IsArray(relations))
+		return NULL;
+
+	initStringInfo(&sql);
+	appendStringInfoString(&sql, "TRUNCATE TABLE ");
+	cJSON_ArrayForEach(rel, relations)
+	{
+		const char *schema = oggit_json_str(rel, "schema");
+		const char *table = oggit_json_str(rel, "table");
+
+		if (schema == NULL || table == NULL || oggit_is_internal_schema(schema))
+			continue;
+
+		if (!have_relation)
+		{
+			if (first_schema != NULL)
+				*first_schema = schema;
+			if (first_table != NULL)
+				*first_table = table;
+		}
+		else
+			appendStringInfoString(&sql, ", ");
+
+		appendStringInfo(&sql, "%s.%s", quote_identifier(schema),
+						 quote_identifier(table));
+		have_relation = true;
+	}
+
+	if (!have_relation)
+	{
+		pfree(sql.data);
+		return NULL;
+	}
+
+	if (oggit_json_bool_or_false(event, "restart_seqs"))
+		appendStringInfoString(&sql, " RESTART IDENTITY");
+	if (oggit_json_bool_or_false(event, "cascade"))
+		appendStringInfoString(&sql, " CASCADE");
+
+	return sql.data;
+}
+
+/*
+ * Extract the commit-ish LSN string from an event, matching the Rust
+ * oggit_event_lsn() precedence.
+ */
+static const char *
+oggit_event_lsn(const cJSON *event)
+{
+	static const char *const keys[] = {
+		"commit_lsn", "change_lsn", "message_lsn", "callback_commit_lsn"
+	};
+	int			i;
+
+	for (i = 0; i < (int) (sizeof(keys) / sizeof(keys[0])); i++)
+	{
+		const char *v = oggit_json_str(event, keys[i]);
+
+		if (v != NULL)
+			return v;
+	}
+	return "0/0";
+}
+
+/*
+ * Copy an event's commit grouping key without retaining any cJSON-owned
+ * memory. Malformed events use the same fallback key as oggit_event_lsn().
+ */
+static void
+oggit_event_commit_lsn(const char *json, char *commit_lsn, size_t size)
+{
+	cJSON	   *event;
+	const char *event_lsn = "0/0";
+
+	event = cJSON_Parse(json);
+	if (event != NULL)
+		event_lsn = oggit_event_lsn(event);
+
+	strlcpy(commit_lsn, event_lsn, size);
+
+	if (event != NULL)
+		cJSON_Delete(event);
+}
+
+static bool
+oggit_is_internal_schema(const char *schema)
+{
+	return schema != NULL &&
+		(strcmp(schema, "oggit") == 0 ||
+		 strcmp(schema, "_oggit") == 0 ||
+		 strcmp(schema, "neon") == 0 ||
+		 strcmp(schema, "coverage") == 0 ||
+		 strcmp(schema, "oggit_fdw") == 0 ||
+		 strncmp(schema, "neon_", 5) == 0);
+}
+
+static bool
+oggit_identifier_mentions_internal_schema(const char *raw)
+{
+	char	   *copy;
+	char	   *start;
+	char	   *end;
+	char	   *dot;
+	bool		matches;
+
+	if (raw == NULL)
+		return false;
+
+	copy = pstrdup(raw);
+	start = copy;
+	while (*start && isspace((unsigned char) *start))
+		start++;
+	while (*start == '"' || *start == '\'' || *start == '`')
+		start++;
+
+	end = start + strlen(start);
+	while (end > start &&
+		   (isspace((unsigned char) end[-1]) ||
+			end[-1] == '"' || end[-1] == '\'' || end[-1] == '`' ||
+			end[-1] == ';' || end[-1] == ',' || end[-1] == ')'))
+		*--end = '\0';
+
+	dot = strchr(start, '.');
+	if (dot != NULL)
+		*dot = '\0';
+
+	matches = oggit_is_internal_schema(start);
+	pfree(copy);
+	return matches;
+}
+
+static bool
+oggit_sql_mentions_internal_schema_ddl(const char *sql)
+{
+	char	   *copy;
+	char	   *token;
+	char	   *saveptr = NULL;
+	const char *schema_name = NULL;
+	bool		seen_create_or_drop = false;
+	bool		seen_schema = false;
+	bool		matches = false;
+
+	if (sql == NULL)
+		return false;
+
+	copy = pstrdup(sql);
+	for (token = strtok_r(copy, " \t\r\n(", &saveptr);
+		 token != NULL;
+		 token = strtok_r(NULL, " \t\r\n(", &saveptr))
+	{
+		if (!seen_create_or_drop)
+		{
+			if (pg_strcasecmp(token, "CREATE") == 0 ||
+				pg_strcasecmp(token, "DROP") == 0)
+				seen_create_or_drop = true;
+			else
+				break;
+			continue;
+		}
+		if (!seen_schema)
+		{
+			if (pg_strcasecmp(token, "SCHEMA") != 0)
+				break;
+			seen_schema = true;
+			continue;
+		}
+		if (pg_strcasecmp(token, "IF") == 0 ||
+			pg_strcasecmp(token, "NOT") == 0 ||
+			pg_strcasecmp(token, "EXISTS") == 0)
+			continue;
+		schema_name = token;
+		break;
+	}
+
+	if (schema_name != NULL)
+		matches = oggit_identifier_mentions_internal_schema(schema_name);
+	pfree(copy);
+	return matches;
+}
+
+static bool
+oggit_json_mentions_internal_schema(const cJSON *value)
+{
+	const cJSON *child;
+	const char *fmt;
+	const char *objtype;
+	const char *name;
+	bool		describes_schema = false;
+
+	if (value == NULL)
+		return false;
+	if (cJSON_IsString(value))
+		return oggit_sql_mentions_internal_schema_ddl(value->valuestring);
+	if (cJSON_IsArray(value))
+	{
+		cJSON_ArrayForEach(child, value)
+		{
+			if (oggit_json_mentions_internal_schema(child))
+				return true;
+		}
+		return false;
+	}
+	if (cJSON_IsObject(value))
+	{
+		fmt = oggit_json_str(value, "fmt");
+		objtype = oggit_json_str(value, "objtype");
+		name = oggit_json_str(value, "name");
+		if (fmt != NULL)
+		{
+			char	   *upper_fmt = pstrdup(fmt);
+			int			i;
+
+			for (i = 0; upper_fmt[i]; i++)
+				upper_fmt[i] = pg_toupper((unsigned char) upper_fmt[i]);
+			describes_schema = strstr(upper_fmt, "SCHEMA") != NULL;
+			pfree(upper_fmt);
+		}
+		if (objtype != NULL && pg_strcasecmp(objtype, "schema") == 0)
+			describes_schema = true;
+		if (describes_schema && oggit_identifier_mentions_internal_schema(name))
+			return true;
+
+		cJSON_ArrayForEach(child, value)
+		{
+			if (child->string != NULL &&
+				(strcmp(child->string, "schemaname") == 0 ||
+				 strcmp(child->string, "schema") == 0) &&
+				cJSON_IsString(child) &&
+				oggit_identifier_mentions_internal_schema(child->valuestring))
+				return true;
+			if (child->string != NULL &&
+				strcmp(child->string, "objidentity") == 0 &&
+				cJSON_IsString(child) &&
+				strchr(child->valuestring, '.') != NULL &&
+				oggit_identifier_mentions_internal_schema(child->valuestring))
+				return true;
+			if (oggit_json_mentions_internal_schema(child))
+				return true;
+		}
+	}
+	return false;
+}
+
+static bool
+oggit_string_mentions_merge_barrier(const char *value)
+{
+	return value != NULL &&
+		(strstr(value, "oggit_merge_write_barrier") != NULL ||
+		 strstr(value, "enforce_merge_write_barrier") != NULL ||
+		 strstr(value, "merge_write_barrier") != NULL);
+}
+
+static bool
+oggit_json_mentions_merge_barrier(const cJSON *value)
+{
+	const cJSON *child;
+
+	if (value == NULL)
+		return false;
+	if (cJSON_IsString(value))
+		return oggit_string_mentions_merge_barrier(value->valuestring);
+	if (cJSON_IsArray(value) || cJSON_IsObject(value))
+	{
+		cJSON_ArrayForEach(child, value)
+		{
+			if (oggit_json_mentions_merge_barrier(child))
+				return true;
+		}
+	}
+	return false;
+}
+
+static const char *
+oggit_json_nested_str(const cJSON *obj, const char *field, const char *nested)
+{
+	const cJSON *parent = cJSON_GetObjectItemCaseSensitive(obj, field);
+
+	if (parent != NULL && cJSON_IsObject(parent))
+		return oggit_json_str(parent, nested);
+	return NULL;
+}
+
+static const char *
+oggit_ddl_object_type(const char *raw_type, const char *upper_sql)
+{
+	/* A column rename is deparsed as ALTER TABLE, so SQL shape is more
+	 * specific than the payload's relation-level objtype. */
+	if (upper_sql != NULL && strstr(upper_sql, "RENAME COLUMN") != NULL)
+		return "COLUMN";
+
+	if (raw_type != NULL)
+	{
+		char	   *upper_type = pstrdup(raw_type);
+		const char *object_type = "OTHER";
+		int			i;
+
+		for (i = 0; upper_type[i]; i++)
+			upper_type[i] = pg_toupper((unsigned char) upper_type[i]);
+
+		if (strcmp(upper_type, "TABLE") == 0)
+			object_type = "TABLE";
+		else if (strcmp(upper_type, "COLUMN") == 0)
+			object_type = "COLUMN";
+		else if (strcmp(upper_type, "INDEX") == 0)
+			object_type = "INDEX";
+		else if (strcmp(upper_type, "CONSTRAINT") == 0 ||
+				 strcmp(upper_type, "TABLE CONSTRAINT") == 0)
+			object_type = "CONSTRAINT";
+		else if (strcmp(upper_type, "SEQUENCE") == 0 ||
+				 strcmp(upper_type, "LARGE SEQUENCE") == 0)
+			object_type = "SEQUENCE";
+		else if (strcmp(upper_type, "TRIGGER") == 0)
+			object_type = "TRIGGER";
+		else if (strcmp(upper_type, "FUNCTION") == 0)
+			object_type = "FUNCTION";
+		else if (strcmp(upper_type, "VIEW") == 0)
+			object_type = "VIEW";
+		else if (strcmp(upper_type, "RULE") == 0)
+			object_type = "RULE";
+		else if (strcmp(upper_type, "SCHEMA") == 0)
+			object_type = "SCHEMA";
+
+		pfree(upper_type);
+		if (strcmp(object_type, "OTHER") != 0)
+			return object_type;
+	}
+
+	if (upper_sql != NULL && strstr(upper_sql, "TRIGGER") != NULL)
+		return "TRIGGER";
+	if (upper_sql != NULL && strstr(upper_sql, "FUNCTION") != NULL)
+		return "FUNCTION";
+	if (upper_sql != NULL && strstr(upper_sql, "VIEW") != NULL)
+		return "VIEW";
+	if (upper_sql != NULL && strstr(upper_sql, "SEQUENCE") != NULL)
+		return "SEQUENCE";
+	if (upper_sql != NULL && strstr(upper_sql, "RULE") != NULL)
+		return "RULE";
+	if (upper_sql != NULL && (strstr(upper_sql, "ADD CONSTRAINT") != NULL ||
+							  strstr(upper_sql, "CHECK") != NULL ||
+							  strstr(upper_sql, "FOREIGN KEY") != NULL))
+		return "CONSTRAINT";
+	if (upper_sql != NULL && strstr(upper_sql, "INDEX") != NULL)
+		return "INDEX";
+	if (upper_sql != NULL && strstr(upper_sql, "TABLE") != NULL)
+		return "TABLE";
+	if (upper_sql != NULL && strstr(upper_sql, "SCHEMA") != NULL)
+		return "SCHEMA";
+	return "OTHER";
+}
+
+static bool
+oggit_ddl_identity_from_sql(const char *sql, const char *object_type,
+							char **identity_copy)
+{
+	char	   *upper_sql;
+	char	   *marker;
+	const char *identity_start;
+	const char *identity_end;
+	bool		quoted = false;
+	int			i;
+
+	if (sql == NULL || object_type == NULL || identity_copy == NULL)
+		return false;
+
+	upper_sql = pstrdup(sql);
+	for (i = 0; upper_sql[i]; i++)
+		upper_sql[i] = pg_toupper((unsigned char) upper_sql[i]);
+
+	marker = strstr(upper_sql, object_type);
+	if (marker == NULL)
+	{
+		pfree(upper_sql);
+		return false;
+	}
+
+	identity_start = sql + (marker - upper_sql) + strlen(object_type);
+	while (*identity_start != '\0' && isspace((unsigned char) *identity_start))
+		identity_start++;
+	identity_end = identity_start;
+	while (*identity_end != '\0')
+	{
+		if (*identity_end == '"')
+			quoted = !quoted;
+		else if (!quoted &&
+				 (isspace((unsigned char) *identity_end) ||
+				  *identity_end == '(' || *identity_end == ';'))
+			break;
+		identity_end++;
+	}
+
+	pfree(upper_sql);
+	if (identity_end <= identity_start)
+		return false;
+
+	*identity_copy = pnstrdup(identity_start, identity_end - identity_start);
+	return true;
+}
+
+static bool
+oggit_rule_target_from_text(const char *text, char **target_copy)
+{
+	char	   *upper_text;
+	char	   *marker;
+	const char *target_start;
+	const char *target_end;
+	int			i;
+
+	if (text == NULL || text[0] == '\0')
+		return false;
+
+	upper_text = pstrdup(text);
+	for (i = 0; upper_text[i]; i++)
+		upper_text[i] = pg_toupper((unsigned char) upper_text[i]);
+
+	marker = strstr(upper_text, " TO ");
+	if (marker != NULL)
+		target_start = text + (marker - upper_text) + 4;
+	else
+	{
+		marker = strstr(upper_text, " ON ");
+		if (marker == NULL)
+		{
+			pfree(upper_text);
+			return false;
+		}
+		target_start = text + (marker - upper_text) + 4;
+	}
+
+	while (*target_start != '\0' && isspace((unsigned char) *target_start))
+		target_start++;
+	target_end = target_start;
+	while (*target_end != '\0' &&
+		   !isspace((unsigned char) *target_end) &&
+		   *target_end != ';' &&
+		   *target_end != ',' &&
+		   *target_end != ')' &&
+		   *target_end != '"')
+		target_end++;
+
+	pfree(upper_text);
+	if (target_end <= target_start)
+		return false;
+
+	*target_copy = pnstrdup(target_start, target_end - target_start);
+	return true;
+}
+
+/*
+ * Build a JSON object string that collapses neon_oggit tuple payload
+ * ({col: {value, is_key, type}}) into a flat {col: value} object, matching
+ * the Rust oggit_tuple_payload_to_json(). Returns a palloc'd cJSON object
+ * (caller cJSON_Delete) or NULL.
+ */
+static cJSON *
+oggit_tuple_payload_to_flat(const cJSON *payload)
+{
+	cJSON	   *result;
+	const cJSON *field;
+
+	if (payload == NULL || !cJSON_IsObject(payload))
+		return NULL;
+
+	result = cJSON_CreateObject();
+	cJSON_ArrayForEach(field, payload)
+	{
+		const cJSON *value = cJSON_GetObjectItemCaseSensitive(field, "value");
+
+		if (value != NULL)
+			cJSON_AddItemToObject(result, field->string,
+								  cJSON_Duplicate(value, true));
+	}
+	return result;
+}
+
+static cJSON *
+oggit_flat_project_cols(const cJSON *row, const cJSON *columns)
+{
+	cJSON	   *result;
+	const cJSON *column;
+
+	if (row == NULL || !cJSON_IsObject(row))
+		return NULL;
+
+	result = cJSON_CreateObject();
+	if (columns == NULL || !cJSON_IsArray(columns))
+		return result;
+
+	cJSON_ArrayForEach(column, columns)
+	{
+		const cJSON *value;
+
+		if (!cJSON_IsString(column) || column->valuestring == NULL)
+			continue;
+		value = cJSON_GetObjectItemCaseSensitive(row, column->valuestring);
+		if (value != NULL)
+			cJSON_AddItemToObject(result, column->valuestring,
+								  cJSON_Duplicate(value, true));
+	}
+	return result;
+}
+
+/* Collect non-key column names from a tuple payload (sorted like Rust). */
+static cJSON *
+oggit_tuple_nonkey_cols(const cJSON *payload)
+{
+	cJSON	   *arr = cJSON_CreateArray();
+	const cJSON *field;
+
+	if (payload != NULL && cJSON_IsObject(payload))
+	{
+		cJSON_ArrayForEach(field, payload)
+		{
+			const cJSON *is_key = cJSON_GetObjectItemCaseSensitive(field, "is_key");
+
+			if (!(is_key != NULL && cJSON_IsBool(is_key) && cJSON_IsTrue(is_key)))
+				cJSON_AddItemToArray(arr, cJSON_CreateString(field->string));
+		}
+	}
+	return arr;
+}
+
+/*
+ * SPI helper: execute an INSERT with text/jsonb args. All arguments are
+ * passed as text and cast in SQL, matching how the Rust worker bound them.
+ */
+static void
+oggit_spi_exec_args(const char *sql, int nargs, Oid *argtypes,
+					Datum *values, const char *nulls)
+{
+	int			rc = SPI_execute_with_args(sql, nargs, argtypes, values, nulls,
+										   false, 0, NULL);
+
+	if (rc < 0)
+		elog(ERROR, "oggit: SPI_execute_with_args failed (%d): %s", rc, sql);
+}
+
+static bool
+oggit_relation_has_primary_key(const char *schema, const char *table)
+{
+	Oid			argtypes[2];
+	Datum		values[2];
+	char		nulls[2] = {' ', ' '};
+	bool		has_primary = false;
+	bool		isnull = false;
+	Datum		value;
+	int			rc;
+
+	if (schema == NULL || table == NULL)
+		return false;
+
+	argtypes[0] = TEXTOID;
+	argtypes[1] = TEXTOID;
+	values[0] = CStringGetTextDatum(schema);
+	values[1] = CStringGetTextDatum(table);
+
+	rc = SPI_execute_with_args(
+							   "SELECT EXISTS ("
+							   " SELECT 1"
+							   "   FROM pg_class c"
+							   "   JOIN pg_namespace n ON n.oid = c.relnamespace"
+							   "   JOIN pg_index i ON i.indrelid = c.oid"
+							   "  WHERE n.nspname = $1"
+							   "    AND c.relname = $2"
+							   "    AND i.indisprimary)",
+							   2, argtypes, values, nulls, true, 1, NULL);
+	if (rc != SPI_OK_SELECT || SPI_processed == 0)
+		return false;
+
+	value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	if (!isnull)
+		has_primary = DatumGetBool(value);
+	return has_primary;
+}
+
+static void
+oggit_update_worker_status(const char *status, const char *last_error)
+{
+	Oid			argtypes[2];
+	Datum		values[2];
+	char		nulls[2] = {' ', ' '};
+
+	PG_TRY();
+	{
+		if (oggit_state_table_exists())
+		{
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "oggit: SPI_connect failed while updating worker status");
+
+			argtypes[0] = TEXTOID;
+			argtypes[1] = TEXTOID;
+			values[0] = CStringGetTextDatum(status);
+			if (last_error == NULL || last_error[0] == '\0')
+			{
+				values[1] = (Datum) 0;
+				nulls[1] = 'n';
+			}
+			else
+				values[1] = CStringGetTextDatum(last_error);
+
+			oggit_spi_exec_args("UPDATE oggit.state "
+								"SET status = $1, last_error = $2, updated_at = now() WHERE id = true",
+								2, argtypes, values, nulls);
+
+			SPI_finish();
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+		}
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+	}
+	PG_END_TRY();
+}
+
+static void
