@@ -1203,6 +1203,19 @@ impl StorageController {
         .await
     }
 
+    pub async fn tenant_timeline_delete(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: utils::id::TimelineId,
+    ) -> anyhow::Result<()> {
+        self.dispatch::<(), ()>(
+            Method::DELETE,
+            format!("v1/tenant/{tenant_id}/timeline/{timeline_id}"),
+            None,
+        )
+        .await
+    }
+
     #[instrument(skip(self))]
     pub async fn tenant_timeline_detail(
         &self,

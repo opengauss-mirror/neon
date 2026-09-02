@@ -69,6 +69,12 @@ pub trait StorageControllerApi: Sync {
         req: TimelineCreateRequest,
     ) -> Result<TimelineCreateResponseStorcon>;
 
+    async fn tenant_timeline_delete(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> Result<()>;
+
     async fn tenant_timeline_detail(
         &self,
         tenant_id: TenantId,
@@ -180,6 +186,14 @@ impl StorageControllerApi for StorageController {
         req: TimelineCreateRequest,
     ) -> Result<TimelineCreateResponseStorcon> {
         StorageController::tenant_timeline_create(self, tenant_id, req).await
+    }
+
+    async fn tenant_timeline_delete(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> Result<()> {
+        StorageController::tenant_timeline_delete(self, tenant_id, timeline_id).await
     }
 
     async fn tenant_timeline_detail(
@@ -405,6 +419,19 @@ impl StorageControllerApi for HttpStorageControllerApi {
             Method::POST,
             format!("v1/tenant/{tenant_id}/timeline"),
             Some(req),
+        )
+        .await
+    }
+
+    async fn tenant_timeline_delete(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+    ) -> Result<()> {
+        self.dispatch::<(), _>(
+            Method::DELETE,
+            format!("v1/tenant/{tenant_id}/timeline/{timeline_id}"),
+            None,
         )
         .await
     }
