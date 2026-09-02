@@ -1432,19 +1432,17 @@ async fn oggit_record_event(
                         .and_then(JsonValue::as_str)
                 })
                 .map(str::to_string);
-            let object_name = if object_type == "COLUMN" {
-                ddl_payload.get("colname").and_then(JsonValue::as_str)
-            } else {
-                None
-            }
-            .or_else(|| {
-                ddl_payload
-                    .pointer("/identity/objname")
-                    .and_then(JsonValue::as_str)
-            })
-            .or_else(|| ddl_payload.get("name").and_then(JsonValue::as_str))
-            .or_else(|| ddl_payload.get("objidentity").and_then(JsonValue::as_str))
-            .map(str::to_string);
+            let object_name = ddl_payload
+                .pointer("/identity/objname")
+                .and_then(JsonValue::as_str)
+                .or_else(|| {
+                    (object_type == "COLUMN")
+                        .then(|| ddl_payload.get("colname").and_then(JsonValue::as_str))
+                        .flatten()
+                })
+                .or_else(|| ddl_payload.get("name").and_then(JsonValue::as_str))
+                .or_else(|| ddl_payload.get("objidentity").and_then(JsonValue::as_str))
+                .map(str::to_string);
             let objidentity = ddl_payload
                 .get("objidentity")
                 .and_then(JsonValue::as_str)

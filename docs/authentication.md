@@ -86,6 +86,41 @@ Configuration files for all components point to `public_key.pem` for JWT validat
 However, authentication is disabled by default.
 There is no way to automatically enable it everywhere, you have to configure each component individually.
 
+### Docker control plane
+
+The Docker control plane follows the same optional authentication model as the
+Safekeeper HTTP management API. Authentication is disabled when
+`DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH` is unset or empty. When the
+variable is set, it must point to an Ed25519 public-key PEM file (or a directory
+of public-key PEM files) readable by `docker_control_plane`.
+
+When authentication is enabled, `GET /ready` remains unauthenticated for health
+checks. All other control-plane endpoints require an HTTP header in the form:
+
+```text
+Authorization: Bearer <JWT>
+```
+
+The JWT must validate with the configured public key and must contain
+`"scope": "admin"`. Missing or invalid credentials return `401 Unauthorized`;
+a valid JWT with another scope returns `403 Forbidden`. The control plane uses
+the existing Ed25519 JWT implementation and `Scope::Admin`; tenant, pageserver,
+safekeeper, and generations tokens are not valid substitutes.
+
+For the Docker Compose deployment, the public key can be mounted through the
+existing `.neon:/data/.neon` volume and configured as:
+
+```bash
+export DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH=/data/.neon/control_plane/auth_public_key.pem
+export DOCKER_CONTROL_PLANE_TOKEN='<Admin JWT>'
+```
+
+`DOCKER_CONTROL_PLANE_TOKEN` is consumed by `docker_local` when it calls the
+control plane. It must be kept out of images, source control, and logs. The
+Compose host port is bound to `127.0.0.1` by default; authentication should not
+be treated as a replacement for firewall rules or a protected reverse proxy
+when remote access is required.
+
 CLI also generates signed token (full access to Pageserver) and saves it in
 the CLI's `config` file under `pageserver.auth_token`.
 Note that pageserver's config does not have any similar parameter.

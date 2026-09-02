@@ -172,6 +172,8 @@ ensure_branch_merge_user() {
       return
     fi
 
+    set +x
+
     local merge_user=${BRANCH_MERGE_USER:-branch_merge}
     local merge_password=${BRANCH_MERGE_PASSWORD:-Branch_merge@123}
 
@@ -187,7 +189,6 @@ ensure_branch_merge_user() {
     local password_literal
     password_literal=$(sql_literal "${merge_password}")
 
-    set +x
     if "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -tAc \
       "SELECT 1 FROM pg_roles WHERE rolname = '${merge_user}'" | grep -q 1; then
       "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 \
@@ -203,7 +204,6 @@ ensure_branch_merge_user() {
         -D "${GAUSSHOME}/bin" \
         -o usermapping
     fi
-    set -x
 }
 
 wait_for_compute_running() {
@@ -224,8 +224,11 @@ wait_for_compute_running() {
       esac
 
       if ! kill -0 "${compute_ctl_pid}" 2>/dev/null; then
-        wait "${compute_ctl_pid}"
-        return $?
+        if wait "${compute_ctl_pid}"; then
+          return 0
+        else
+          return $?
+        fi
       fi
       sleep 1
     done
@@ -422,16 +425,22 @@ for _ in $(seq 1 120); do
     break
   fi
   if ! kill -0 "${compute_ctl_pid}" 2>/dev/null; then
-    wait "${compute_ctl_pid}"
-    status=$?
+    if wait "${compute_ctl_pid}"; then
+      status=0
+    else
+      status=$?
+    fi
     write_endpoint_record "Failed"
     exit "${status}"
   fi
   sleep 1
 done
 
-wait "${compute_ctl_pid}"
-status=$?
+if wait "${compute_ctl_pid}"; then
+  status=0
+else
+  status=$?
+fi
 if [[ "${status}" -ne 0 ]]; then
   write_endpoint_record "Failed"
 fi

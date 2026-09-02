@@ -37,15 +37,15 @@ const RELMAP_SIZE_OPEN_GAUSS: usize = 4096;
 /// openGauss/PostgreSQL relfilenode OIDs for critical catalog relations.
 /// When !full_backup, we include ALL blocks (not just block0) of these catalogs
 /// to avoid stale pg_class/pg_type/pg_attribute after compute restart.
-const PG_CLASS_RELNODE: u32 = 14832;
-const PG_TYPE_RELNODE: u32 = 14713;
-const PG_ATTRIBUTE_RELNODE: u32 = 14806;
+const PG_CLASS_RELNODE: u32 = 14828;
+const PG_TYPE_RELNODE: u32 = 14709;
+const PG_ATTRIBUTE_RELNODE: u32 = 14802;
 
 /// pg_class index relfilenodes - CRITICAL for catalog lookups!
 /// Without these indexes, openGauss cannot find user tables after restart.
-const PG_CLASS_OID_INDEX_RELNODE: u32 = 14834;
-const PG_CLASS_RELNAME_NSP_INDEX_RELNODE: u32 = 14835;
-const PG_CLASS_TBLSPC_RELFILENODE_INDEX_RELNODE: u32 = 14836;
+const PG_CLASS_OID_INDEX_RELNODE: u32 = 14830;
+const PG_CLASS_RELNAME_NSP_INDEX_RELNODE: u32 = 14831;
+const PG_CLASS_TBLSPC_RELFILENODE_INDEX_RELNODE: u32 = 14832;
 
 use crate::context::RequestContext;
 use crate::pgdatadir_mapping::Version;

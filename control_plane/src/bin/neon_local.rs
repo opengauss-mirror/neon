@@ -2655,6 +2655,14 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 )?;
             }
 
+            if args.enable_oggit {
+                cplane.check_conflicting_oggit_workers(
+                    endpoint.tenant_id,
+                    endpoint.timeline_id,
+                    Some(endpoint_id),
+                )?;
+            }
+
             let (pageservers, stripe_size) = if let Some(pageserver_id) = pageserver_id {
                 let conf = env.get_pageserver_conf(pageserver_id).unwrap();
                 // Use gRPC if requested.

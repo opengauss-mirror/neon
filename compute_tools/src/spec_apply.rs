@@ -1143,20 +1143,10 @@ async fn get_operations<'a>(
                 },
             ];
 
-            if crate::spec::is_opengauss_pgbin(&params.pgbin) {
-                info!("refreshing neon extension compatibility views on openGauss");
-                operations.push(Operation {
-                    query: String::from(crate::spec::OPENGAUSS_NEON_EXTENSION_COMPAT_SQL),
-                    comment: Some(String::from(
-                        "compat/update: refresh neon extension views on openGauss",
-                    )),
-                });
-            } else {
-                operations.push(Operation {
-                    query: String::from("ALTER EXTENSION neon UPDATE"),
-                    comment: Some(String::from("compat/update: update neon extension version")),
-                });
-            }
+            operations.push(Operation {
+                query: String::from("ALTER EXTENSION neon UPDATE"),
+                comment: Some(String::from("compat/update: update neon extension version")),
+            });
 
             Ok(Box::new(operations.into_iter()))
         }

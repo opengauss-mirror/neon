@@ -24,6 +24,29 @@ export COMPUTE_IMAGE=og_compute:latest
 export COMPOSE_PROJECT_NAME=neon_poc
 ```
 
+默认情况下，`docker_control_plane` 不启用 JWT 认证，仅绑定宿主机的
+`127.0.0.1:8080`。如需启用认证，先准备 Ed25519 公钥和对应的 Admin JWT，
+再设置：
+
+```bash
+export DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH=/data/.neon/control_plane/auth_public_key.pem
+export DOCKER_CONTROL_PLANE_TOKEN='<scope=admin 的 JWT>'
+```
+
+如果直接在 Compose 目录启动，公钥路径必须是容器内路径。项目初始化后，默认公钥位于
+`/data/.neon/control_plane/auth_public_key.pem`；宿主机文件通过 Compose 的
+`.neon:/data/.neon` 挂载到该位置。`DOCKER_CONTROL_PLANE_TOKEN` 仅用于 CLI 调用
+control plane，不要写入镜像或提交到仓库。
+
+启用认证后，除匿名健康检查 `GET /ready` 外，所有 control-plane API 都需要：
+
+```http
+Authorization: Bearer <Admin JWT>
+```
+
+`Admin JWT` 的 payload 至少需要包含 `{"scope":"admin"}`，并且必须由配置公钥对应的
+私钥签名。不要使用 tenant、pageserver 或 safekeeper scope 的 token 调用 control plane。
+
 ## 一键启停
 
 ### 首次初始化并启动

@@ -1940,7 +1940,6 @@ impl ComputeNode {
     #[instrument(skip_all)]
     pub fn post_apply_config(&self) -> Result<()> {
         let conf = self.get_tokio_conn_conf(Some("compute_ctl:post_apply_config"));
-        let is_opengauss = is_opengauss_pgbin(&self.params.pgbin);
         tokio::spawn(async move {
             let res = async {
                 let (mut client, connection) = conf.connect(NoTls).await?;
@@ -1950,7 +1949,7 @@ impl ComputeNode {
                     }
                 });
 
-                handle_neon_extension_upgrade(&mut client, is_opengauss)
+                handle_neon_extension_upgrade(&mut client)
                     .await
                     .context("handle_neon_extension_upgrade")?;
                 Ok::<_, anyhow::Error>(())
@@ -1994,7 +1993,6 @@ impl ComputeNode {
             .unwrap_or_else(|| "postgres".to_string());
         let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:install_oggit_extension"));
         conf.dbname(&database);
-        let is_opengauss = is_opengauss_pgbin(&self.params.pgbin);
 
         tokio::runtime::Handle::current().block_on(async move {
             let (mut client, connection) = conf
@@ -2017,7 +2015,7 @@ impl ComputeNode {
                 .with_context(|| {
                     format!("failed to install neon extension in database {database}")
                 })?;
-            handle_neon_extension_upgrade(&mut client, is_opengauss)
+            handle_neon_extension_upgrade(&mut client)
                 .await
                 .with_context(|| {
                     format!("failed to refresh neon extension in database {database}")

@@ -538,7 +538,7 @@ void CreateFakeSharedMemoryAndSemaphores(bool makePrivate, int port){
 	InitializeNumLwLockPartitions();
 
 	int numSemas;
-	Size size = 512 * 1024 * 1024;
+	Size size = 512  * 1024 * 1024;
     ereport(LOG, (errmsg("[neon-walredo] optimized shmem: %lu MB (CR Buffer disabled)", 
                          (unsigned long)(size/1024/1024))));
 

@@ -197,6 +197,7 @@ pg_init_oggit(void)
 							   0,
 							   NULL, NULL, NULL);
 
+
 	DefineCustomStringVariable(
 							   "neon.oggit_ancestor_timeline_id",
 							   "Ancestor (parent) timeline id recorded in oggit.state",
@@ -2153,7 +2154,7 @@ oggit_record_event_json(const char *json, int ordinal)
 			{
 				const char *column_name = oggit_json_str(ddl_payload, "colname");
 
-				if (column_name != NULL)
+				if (object_name == NULL && column_name != NULL)
 					object_name = column_name;
 			}
 			if (strcmp(object_type, "RULE") == 0)
