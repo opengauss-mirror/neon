@@ -80,6 +80,11 @@ SERVICE_ALIASES = {
 def api(method, path, body=None, timeout=120):
     data = None
     headers = {}
+    control_plane_token = os.environ.get("DOCKER_CONTROL_PLANE_TOKEN") or os.environ.get(
+        "CONTROL_PLANE_JWT_TOKEN"
+    )
+    if control_plane_token:
+        headers["Authorization"] = f"Bearer {control_plane_token}"
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -1673,12 +1678,19 @@ def cmd_endpoint(args):
             endpoint = rewrite_endpoint_with_ports(endpoint)
         if not args.allow_multiple:
             ensure_no_running_primary_on_same_timeline(endpoint)
-        plan = api("POST", f"/v1/endpoint/{args.endpoint_id}/start", {})
+        plan = api("POST", f"/v1/endpoint/{args.endpoint_id}/start", {
+            "enable_oggit": bool(endpoint.get("enable_oggit")),
+        })
         prepare_endpoint_data_dir(api("GET", f"/v1/endpoint/{args.endpoint_id}"))
         service = plan["services"][0]
         disable_endpoint_restart_policy(args.endpoint_id)
-        compose_endpoint(args.endpoint_id, "up", "-d", service)
-        wait_endpoint_started(args.endpoint_id, service, timeout=args.timeout)
+        try:
+            compose_endpoint(args.endpoint_id, "up", "-d", service)
+            wait_endpoint_started(args.endpoint_id, service, timeout=args.timeout)
+        except Exception:
+            compose_endpoint(args.endpoint_id, "stop", service, check=False)
+            api("POST", f"/v1/endpoint/{args.endpoint_id}/stop", {"last_lsn": None})
+            raise
         print_json(api("GET", f"/v1/endpoint/{args.endpoint_id}"))
     elif args.endpoint_cmd == "stop":
         stopped = stop_endpoint(args.endpoint_id, mode=args.mode)

@@ -380,6 +380,27 @@ impl ComputeControlPlane {
         }
         Ok(())
     }
+
+    pub fn check_conflicting_oggit_workers(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        exclude_endpoint_id: Option<&str>,
+    ) -> Result<()> {
+        let Some((endpoint_id, _)) = self.endpoints.iter().find(|(endpoint_id, endpoint)| {
+            exclude_endpoint_id != Some(endpoint_id.as_str())
+                && endpoint.tenant_id == tenant_id
+                && endpoint.timeline_id == timeline_id
+                && endpoint.oggit_database.is_some()
+                && endpoint.status() != EndpointStatus::Stopped
+        }) else {
+            return Ok(());
+        };
+
+        bail!(
+            "timeline {timeline_id} already has an active oggit worker owned by endpoint {endpoint_id}"
+        );
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -678,6 +699,7 @@ impl Endpoint {
         conf.append("wal_level", "logical");
         if is_gaussdb {
             conf.append("enable_subscription", "on");
+            conf.append("support_extended_features", "on");
             // openGauss records every plpgsql function's source into
             // dbe_pldeveloper.gs_source via an autonomous transaction on
             // creation. On a Neon compute that autonomous transaction stalls in

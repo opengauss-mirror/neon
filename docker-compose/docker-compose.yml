@@ -28,10 +28,11 @@ services:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - DOCKER_CONTROL_PLANE_LISTEN=0.0.0.0:8080
+      - DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH=${DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH:-}
       - DOCKER_CONTROL_PLANE_STATE_DIR=/data/.neon/control_plane
       - STORAGE_CONTROLLER_HTTP=${STORAGE_CONTROLLER_HTTP:-http://storage_controller:1234}
     ports:
-      - ${DOCKER_CONTROL_PLANE_HOST_PORT:-8080}:8080
+      - 127.0.0.1:${DOCKER_CONTROL_PLANE_HOST_PORT:-8080}:8080
     volumes:
       - ./.neon:/data/.neon
     command:
@@ -76,6 +77,7 @@ services:
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - TIMELINE_SAFEKEEPER_COUNT=${TIMELINE_SAFEKEEPER_COUNT:-1}
       - STORAGE_CONTROLLER_EXTRA_ARGS=${STORAGE_CONTROLLER_EXTRA_ARGS:-}
+      - CONTROL_PLANE_JWT_TOKEN=${CONTROL_PLANE_JWT_TOKEN:-}
     ports:
       - ${STORAGE_CONTROLLER_HOST_PORT:-1234}:1234
     command: >

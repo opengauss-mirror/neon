@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use axum::{Json, Router};
+use axum::{Json, Router, body::Body};
 use compute_api::requests::{COMPUTE_AUDIENCE, ComputeClaims, ComputeClaimsScope};
 use control_plane::BranchMergeStrategy;
 use control_plane::merge_oggit::{OggitGcParentRequest, OggitGcParentResult, oggit_gc_parent};
@@ -62,7 +63,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_opengauss::NoTls;
-use utils::auth::{Claims, Scope, encode_from_key_file};
+use utils::auth::{Claims, JwtAuth, Scope, encode_from_key_file};
 use utils::id::{EndpointId, NodeId, TenantId, TimelineId};
 use utils::lsn::Lsn;
 
@@ -86,6 +87,86 @@ struct AppState {
     storage_image: String,
     compute_image: String,
     client: Client,
+    oggit_worker_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct ControlPlaneAuth {
+    jwt_auth: Option<Arc<JwtAuth>>,
+}
+
+impl ControlPlaneAuth {
+    fn from_environment() -> Result<Self> {
+        let Some(key_path) = std::env::var_os("DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH")
+            .filter(|path| !path.is_empty())
+        else {
+            return Ok(Self { jwt_auth: None });
+        };
+
+        let key_path = camino::Utf8PathBuf::from_path_buf(PathBuf::from(key_path))
+            .map_err(|path| anyhow!("authentication public key path is not valid UTF-8: {path:?}"))?;
+        let jwt_auth = JwtAuth::from_key_path(&key_path).with_context(|| {
+            format!(
+                "loading docker control plane HTTP authentication public key from {key_path}"
+            )
+        })?;
+
+        Ok(Self {
+            jwt_auth: Some(Arc::new(jwt_auth)),
+        })
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.jwt_auth.is_some()
+    }
+}
+
+async fn authorize_control_plane_request(
+    axum::extract::State(auth): axum::extract::State<ControlPlaneAuth>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(jwt_auth) = auth.jwt_auth else {
+        return next.run(request).await;
+    };
+
+    let Some(authorization_header) = request.headers().get(header::AUTHORIZATION) else {
+        return (StatusCode::UNAUTHORIZED, "missing Authorization header").into_response();
+    };
+    let Ok(authorization_header) = authorization_header.to_str() else {
+        return (StatusCode::UNAUTHORIZED, "invalid Authorization header").into_response();
+    };
+    let Some(token) = authorization_header.strip_prefix("Bearer ") else {
+        return (StatusCode::UNAUTHORIZED, "Authorization header must use Bearer scheme")
+            .into_response();
+    };
+
+    let claims = match validate_control_plane_token(&jwt_auth, token) {
+        Ok(claims) => claims,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
+    request.extensions_mut().insert(claims);
+    next.run(request).await
+}
+
+fn validate_control_plane_token(
+    jwt_auth: &JwtAuth,
+    token: &str,
+) -> std::result::Result<Claims, (StatusCode, &'static str)> {
+    let token_data = jwt_auth.decode::<Claims>(token).map_err(|error| {
+        tracing::debug!(%error, "control plane JWT validation failed");
+        (StatusCode::UNAUTHORIZED, "invalid control plane JWT")
+    })?;
+
+    if token_data.claims.scope != Scope::Admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "control plane Admin scope is required",
+        ));
+    }
+
+    Ok(token_data.claims)
 }
 
 struct DockerStateStore<'a> {
@@ -387,6 +468,12 @@ struct EndpointStopRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct EndpointStartRequest {
+    #[serde(default)]
+    enable_oggit: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct EndpointGenerateJwtQuery {
     scope: Option<String>,
 }
@@ -606,10 +693,11 @@ async fn main() -> Result<()> {
             .timeout(Duration::from_secs(120))
             .build()
             .context("building HTTP client")?,
+        oggit_worker_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
-    let app = Router::new()
-        .route("/ready", get(ready))
+    let auth = ControlPlaneAuth::from_environment()?;
+    let protected_app = Router::new()
         .route("/status", get(status))
         .route("/v1/init", post(init_env))
         .route("/v1/env", get(env))
@@ -720,9 +808,17 @@ async fn main() -> Result<()> {
         .route("/v1/branch/merge/{merge_id}/abort", post(branch_abort))
         .route("/notify-attach", put(notify_attach))
         .route("/notify-safekeepers", put(notify_safekeepers))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            auth.clone(),
+            authorize_control_plane_request,
+        ));
+    let app = Router::new().route("/ready", get(ready)).merge(protected_app);
 
-    println!("docker_control_plane listening on {listen}");
+    println!(
+        "docker_control_plane listening on {listen} (http_auth={})",
+        auth.is_enabled()
+    );
     axum::serve(TcpListener::bind(listen).await?, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -857,10 +953,22 @@ async fn endpoint_create(
 async fn endpoint_start(
     State(state): State<Arc<AppState>>,
     AxumPath(endpoint_id): AxumPath<String>,
+    Json(req): Json<EndpointStartRequest>,
 ) -> Response {
-    match handle_endpoint_start(&state, &endpoint_id).await {
+    let _worker_lock = state.oggit_worker_lock.lock().await;
+    match handle_endpoint_start(&state, &endpoint_id, req.enable_oggit).await {
         Ok(plan) => Json(plan).into_response(),
-        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+        Err(err) => {
+            let status = if err
+                .to_string()
+                .contains("already has an active oggit worker")
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            error_response(status, err)
+        }
     }
 }
 
@@ -869,6 +977,7 @@ async fn endpoint_stop(
     AxumPath(endpoint_id): AxumPath<String>,
     Json(req): Json<EndpointStopRequest>,
 ) -> Response {
+    let _worker_lock = state.oggit_worker_lock.lock().await;
     match update_endpoint_status(&state.state_dir, &endpoint_id, "Stopped", req.last_lsn) {
         Ok(endpoint) => Json(endpoint).into_response(),
         Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -2856,8 +2965,29 @@ async fn handle_endpoint_create(
     Ok(endpoint)
 }
 
-async fn handle_endpoint_start(state: &AppState, endpoint_id: &str) -> Result<PlanResponse> {
+async fn handle_endpoint_start(
+    state: &AppState,
+    endpoint_id: &str,
+    enable_oggit: bool,
+) -> Result<PlanResponse> {
     let mut endpoint = load_endpoint(&state.state_dir, endpoint_id)?;
+    endpoint.enable_oggit = enable_oggit;
+    if enable_oggit {
+        let conflicting_endpoint = load_endpoints(&state.state_dir)?.into_iter().find(|other| {
+            other.endpoint_id != endpoint.endpoint_id
+                && other.tenant_id == endpoint.tenant_id
+                && other.timeline_id == endpoint.timeline_id
+                && other.enable_oggit
+                && matches!(other.status.as_str(), "Running" | "Starting")
+        });
+        if let Some(other) = conflicting_endpoint {
+            bail!(
+                "timeline {} already has an active oggit worker owned by endpoint {}",
+                endpoint.timeline_id,
+                other.endpoint_id
+            );
+        }
+    }
     render_endpoint_config(state, &endpoint).await?;
     render_endpoint_override(state, &endpoint)?;
     endpoint.status = "Starting".to_string();
@@ -3605,6 +3735,44 @@ fn setting_value_enabled(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control_plane_jwt_auth() -> JwtAuth {
+        JwtAuth::from_key(DOCKER_DEV_PUBLIC_KEY.to_string()).unwrap()
+    }
+
+    fn control_plane_jwt(scope: Scope) -> String {
+        let private_key = pem::parse(DOCKER_DEV_PRIVATE_KEY).unwrap();
+        encode_from_key_file(&Claims::new(None, scope), &private_key).unwrap()
+    }
+
+    #[test]
+    fn control_plane_auth_accepts_admin_token() {
+        let claims = validate_control_plane_token(
+            &control_plane_jwt_auth(),
+            &control_plane_jwt(Scope::Admin),
+        )
+        .unwrap();
+
+        assert_eq!(claims.scope, Scope::Admin);
+    }
+
+    #[test]
+    fn control_plane_auth_rejects_non_admin_token() {
+        let error = validate_control_plane_token(
+            &control_plane_jwt_auth(),
+            &control_plane_jwt(Scope::Tenant),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn control_plane_auth_rejects_invalid_token() {
+        let error = validate_control_plane_token(&control_plane_jwt_auth(), "not-a-jwt").unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
 
     fn spec_with_oggit_setting(value: Value) -> Value {
         json!({

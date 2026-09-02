@@ -277,67 +277,30 @@ pub fn add_standby_signal_ext(
 }
 
 #[instrument(skip_all)]
-pub async fn handle_neon_extension_upgrade(client: &mut Client, is_opengauss: bool) -> Result<()> {
-    let query = if is_opengauss {
-        info!("refreshing neon extension compatibility views on openGauss");
-        OPENGAUSS_NEON_EXTENSION_COMPAT_SQL
-    } else {
-        "ALTER EXTENSION neon UPDATE"
-    };
-    info!("update neon extension version with query: {}", query);
-    client.simple_query(query).await?;
+pub async fn handle_neon_extension_upgrade(client: &mut Client) -> Result<()> {
+    let extension_version: String = client
+        .query_one(
+            "SELECT extversion FROM pg_extension WHERE extname = 'neon'",
+            &[],
+        )
+        .await?
+        .get(0);
+    if extension_version == NEON_EXTENSION_TARGET_VERSION {
+        return Ok(());
+    }
+
+    info!(
+        current_version = extension_version,
+        target_version = NEON_EXTENSION_TARGET_VERSION,
+        "updating neon extension"
+    );
+    client.simple_query(NEON_EXTENSION_UPGRADE_SQL).await?;
 
     Ok(())
 }
 
-pub const OPENGAUSS_NEON_EXTENSION_COMPAT_SQL: &str = r#"
-CREATE OR REPLACE FUNCTION neon.neon_start_oggit_worker()
-RETURNS boolean
-AS '$libdir/neon', 'neon_start_oggit_worker'
-LANGUAGE C STRICT;
-
-CREATE OR REPLACE FUNCTION neon.neon_oggit_worker_is_ready()
-RETURNS boolean
-AS '$libdir/neon', 'neon_oggit_worker_is_ready'
-LANGUAGE C STRICT;
-
-REVOKE ALL ON FUNCTION neon.neon_start_oggit_worker() FROM PUBLIC;
-REVOKE ALL ON FUNCTION neon.neon_oggit_worker_is_ready() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION neon.neon_start_oggit_worker() TO cloud_admin;
-GRANT EXECUTE ON FUNCTION neon.neon_oggit_worker_is_ready() TO cloud_admin;
-
-DELETE FROM pg_depend
- WHERE refclassid = 'pg_extension'::regclass
-   AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'neon')
-   AND classid = 'pg_class'::regclass
-   AND objid IN (
-     SELECT c.oid
-       FROM pg_class c
-       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = 'neon'
-        AND c.relname IN ('neon_backend_perf_counters', 'neon_perf_counters')
-   );
-
-DROP VIEW IF EXISTS neon.neon_backend_perf_counters;
-CREATE VIEW neon.neon_backend_perf_counters AS
-  SELECT P.procno, P.pid, P.metric, P.bucket_le, P.value
-  FROM neon.get_backend_perf_counters() AS P (
-    procno integer,
-    pid bigint,
-    metric text,
-    bucket_le float8,
-    value float8
-  );
-
-DROP VIEW IF EXISTS neon.neon_perf_counters;
-CREATE VIEW neon.neon_perf_counters AS
-  SELECT P.metric, P.bucket_le, P.value
-  FROM neon.get_perf_counters() AS P (
-    metric text,
-    bucket_le float8,
-    value float8
-  );
-"#;
+pub const NEON_EXTENSION_TARGET_VERSION: &str = "1.1";
+pub const NEON_EXTENSION_UPGRADE_SQL: &str = "ALTER EXTENSION neon UPDATE TO '1.1'";
 
 pub fn is_opengauss_pgbin(pgbin: &str) -> bool {
     pgbin.contains("gaussdb") || pgbin.contains("openGauss")
@@ -477,4 +440,35 @@ pub async fn handle_migrations(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    const NEON_V1_0_SQL: &str = include_str!("../../pgxn/neon/neon--1.0.sql");
+    const NEON_V1_1_SQL: &str = include_str!("../../pgxn/neon/neon--1.1.sql");
+    const NEON_V1_0_TO_V1_1_SQL: &str = include_str!("../../pgxn/neon/neon--1.0--1.1.sql");
+
+    #[test]
+    fn extension_versions_place_oggit_objects_in_v1_1_upgrade() {
+        assert!(!NEON_V1_0_SQL.contains("CREATE SCHEMA IF NOT EXISTS oggit"));
+
+        for sql in [NEON_V1_1_SQL, NEON_V1_0_TO_V1_1_SQL] {
+            assert!(sql.contains("CREATE SCHEMA IF NOT EXISTS oggit"));
+            for table_name in [
+                "state",
+                "change_log",
+                "object_change",
+                "merge_event_marker",
+                "merge_history",
+                "merge_conflict",
+            ] {
+                assert!(
+                    sql.contains(&format!("CREATE TABLE IF NOT EXISTS oggit.{table_name}")),
+                    "missing Oggit table {table_name}"
+                );
+            }
+            assert!(sql.contains("CREATE OR REPLACE FUNCTION neon_branch_diff("));
+            assert!(sql.contains("CREATE OR REPLACE FUNCTION neon_branch_merge("));
+        }
+    }
 }

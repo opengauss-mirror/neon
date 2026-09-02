@@ -703,13 +703,16 @@ async fn reject_unsupported_source_schema_objects(
                             WHEN 'v' THEN 'views'
                             WHEN 'm' THEN 'materialized views'
                             WHEN 'S' THEN 'sequences'
+                            WHEN 'L' THEN 'sequences'
+                            WHEN 'z' THEN 'sequences'
+                            WHEN 'Z' THEN 'sequences'
                             WHEN 'f' THEN 'foreign tables'
                             ELSE 'non-regular relations'
                         END AS feature
                  FROM pg_class c
                  JOIN pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname = $1
-                   AND c.relkind IN ('v', 'm', 'S', 'f')
+                   AND c.relkind IN ('v', 'm', 'S', 'L', 'z', 'Z', 'f')
 
                  UNION ALL
 
