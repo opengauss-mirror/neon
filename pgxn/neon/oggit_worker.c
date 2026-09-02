@@ -2402,3 +2402,583 @@ oggit_bootstrap(void)
  * context has been torn down (so no historic catalog snapshot is active).
  */
 static int
+oggit_persist_batch(XLogRecPtr scanned_lsn, bool stopped_by_limit,
+					bool stopped_by_shutdown)
+{
+	ListCell   *lc;
+	int			ordinal = 0;
+	int			nevents = list_length(oggit_event_buf);
+	uint64		payload_bytes = oggit_batch_payload_bytes;
+	char		previous_commit_lsn[64] = "";
+	char	   *scanned_lsn_str;
+	Oid			argtypes[1];
+	Datum		values[1];
+	char		nulls[1] = {' '};
+
+	if (XLByteEQ(scanned_lsn, InvalidXLogRecPtr))
+		return nevents;
+
+	scanned_lsn_str = oggit_lsn_to_string(scanned_lsn);
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "oggit: SPI_connect failed while persisting batch");
+
+	foreach(lc, oggit_event_buf)
+	{
+		const char *json = (const char *) lfirst(lc);
+		char		commit_lsn[64];
+
+		oggit_event_commit_lsn(json, commit_lsn, sizeof(commit_lsn));
+		if (strcmp(previous_commit_lsn, commit_lsn) != 0)
+		{
+			strlcpy(previous_commit_lsn, commit_lsn,
+					sizeof(previous_commit_lsn));
+			ordinal = 0;
+		}
+		ordinal++;
+		oggit_record_event_json(json, ordinal);
+	}
+
+	if (!XLByteEQ(oggit_batch_max_decode_lsn, InvalidXLogRecPtr) ||
+		!XLByteEQ(oggit_batch_max_confirmed_lsn, InvalidXLogRecPtr))
+	{
+		char	   *decode_lsn_str;
+		char	   *confirmed_lsn_str;
+		Oid			lsn_argtypes[3];
+		Datum		lsn_values[3];
+		char		lsn_nulls[3] = {' ', ' ', ' '};
+
+		decode_lsn_str = oggit_lsn_to_string(
+			XLByteEQ(oggit_batch_max_decode_lsn, InvalidXLogRecPtr)
+				? scanned_lsn : oggit_batch_max_decode_lsn);
+		confirmed_lsn_str = oggit_lsn_to_string(
+			XLByteEQ(oggit_batch_max_confirmed_lsn, InvalidXLogRecPtr)
+				? (XLByteEQ(oggit_batch_max_decode_lsn, InvalidXLogRecPtr)
+					   ? scanned_lsn : oggit_batch_max_decode_lsn)
+				: oggit_batch_max_confirmed_lsn);
+
+		lsn_argtypes[0] = TEXTOID;
+		lsn_argtypes[1] = TEXTOID;
+		lsn_argtypes[2] = TEXTOID;
+		lsn_values[0] = CStringGetTextDatum(scanned_lsn_str);
+		lsn_values[1] = CStringGetTextDatum(decode_lsn_str);
+		lsn_values[2] = CStringGetTextDatum(confirmed_lsn_str);
+		oggit_spi_exec_args(
+			"UPDATE oggit.state SET scanned_lsn = $1, decode_lsn = $2, "
+			"confirmed_lsn = $3, updated_at = now() WHERE id = true",
+			3, lsn_argtypes, lsn_values, lsn_nulls);
+		pfree(decode_lsn_str);
+		pfree(confirmed_lsn_str);
+	}
+	else
+	{
+		argtypes[0] = TEXTOID;
+		values[0] = CStringGetTextDatum(scanned_lsn_str);
+		oggit_spi_exec_args(
+			"UPDATE oggit.state SET scanned_lsn = $1, updated_at = now() WHERE id = true",
+			1, argtypes, values, nulls);
+	}
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	if (nevents > 0 || stopped_by_limit || stopped_by_shutdown)
+		elog(LOG,
+			 "oggit batch persisted: persisted_events=%d payload_bytes=" UINT64_FORMAT
+			 " scanned_lsn=%s stopped_by_limit=%s stopped_by_shutdown=%s",
+			 nevents, payload_bytes, scanned_lsn_str,
+			 stopped_by_limit ? "true" : "false",
+			 stopped_by_shutdown ? "true" : "false");
+
+	pfree(scanned_lsn_str);
+
+	/* Free the buffered JSON strings and reset batch accounting. */
+	oggit_reset_batch();
+
+	return nevents;
+}
+
+static void
+oggit_start_decode_session(OggitDecodeSession *session)
+{
+	LogicalDecodingContext *ctx;
+	MemoryContext old_context;
+
+	Assert(session->ctx == NULL);
+	Assert(t_thrd.slot_cxt.MyReplicationSlot == NULL);
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	CheckLogicalDecodingRequirements(u_sess->proc_cxt.MyDatabaseId);
+	ReplicationSlotAcquire(oggit_effective_slot_name, false);
+
+	/*
+	 * ReorderBuffer spill files are written under the slot's snap directory.
+	 * Rebuild it only when the logical decoding session starts. Rebuilding it
+	 * per batch would delete spill files for still-uncommitted transactions.
+	 */
+	LogicalCleanSnapDirectory(true);
+
+	old_context = MemoryContextSwitchTo(oggit_decode_cxt);
+	ctx = CreateDecodingContext(InvalidXLogRecPtr, NIL, false,
+								logical_read_local_xlog_page,
+								oggit_prepare_write, oggit_do_write);
+	MemoryContextSwitchTo(old_context);
+
+	session->ctx = ctx;
+	session->startptr = t_thrd.slot_cxt.MyReplicationSlot->data.restart_lsn;
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+}
+
+static void
+oggit_stop_decode_session(OggitDecodeSession *session)
+{
+	if (session->ctx != NULL)
+	{
+		FreeDecodingContext(session->ctx);
+		session->ctx = NULL;
+	}
+
+	session->startptr = InvalidXLogRecPtr;
+
+	if (t_thrd.slot_cxt.MyReplicationSlot != NULL)
+		CleanMyReplicationSlot();
+
+	if (oggit_decode_cxt != NULL)
+		MemoryContextReset(oggit_decode_cxt);
+}
+
+/*
+ * Decode all WAL currently available (up to the commit point captured at
+ * entry) in one batch using the caller's long-lived logical decoding context,
+ * then persist buffered events and advance the slot. Returns the number of
+ * logical events persisted so the caller can decide whether to wait for more
+ * WAL.
+ *
+ * The decoding context's page_read is replaced by NeonWALPageRead (via
+ * Custom_XLogReaderRoutines) when safekeepers are configured, so
+ * XLogReadRecord fetches WAL from the safekeeper and blocks on its socket.
+ */
+static int64
+oggit_decode_one_batch(OggitDecodeSession *session)
+{
+	LogicalDecodingContext *ctx = session->ctx;
+	XLogRecPtr	startptr = session->startptr;
+	XLogRecPtr	end_of_wal;
+	XLogRecPtr	last_end = InvalidXLogRecPtr;
+	XLogRecPtr	scanned_lsn;
+	ResourceOwner old_resowner = t_thrd.utils_cxt.CurrentResourceOwner;
+	ResourceOwner decode_resowner;
+	bool		stopped_by_limit = false;
+	bool		stopped_by_shutdown = false;
+	int			nevents = 0;
+
+	Assert(ctx != NULL);
+	Assert(t_thrd.slot_cxt.MyReplicationSlot != NULL);
+
+	/*
+	 * Safekeeper commit_lsn is the authoritative visibility boundary. A local
+	 * flush/replay position can include WAL that has not reached quorum yet.
+	 */
+	if (!oggit_get_committed_decode_lsn(&end_of_wal))
+	{
+		elog(WARNING, "oggit worker: no safekeeper commit_lsn available; decode is paused");
+		return 0;
+	}
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	decode_resowner = ResourceOwnerCreate(old_resowner,
+								 "oggit logical decoding",
+								 THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
+	t_thrd.utils_cxt.CurrentResourceOwner = decode_resowner;
+	InvalidateSystemCaches();
+
+	PG_TRY();
+	{
+		while ((!XLByteEQ(startptr, InvalidXLogRecPtr) && XLByteLT(startptr, end_of_wal)) ||
+			   (!XLByteEQ(ctx->reader->EndRecPtr, InvalidXLogRecPtr) &&
+				XLByteLT(ctx->reader->EndRecPtr, end_of_wal)))
+		{
+			XLogRecord *record;
+			char	   *errm = NULL;
+
+			record = XLogReadRecord(ctx->reader, startptr, &errm, true, SS_XLOGDIR);
+			startptr = InvalidXLogRecPtr;
+
+			if (errm != NULL)
+				elog(ERROR, "oggit worker: could not read WAL at %X/%X: %s",
+					 LSN_FORMAT_ARGS(ctx->reader->EndRecPtr), errm);
+
+			if (record != NULL)
+			{
+				LogicalDecodingProcessRecord(ctx, ctx->reader);
+				last_end = ctx->reader->EndRecPtr;
+
+				/* Never split a WAL record or perform SPI from an output callback. */
+				if (oggit_shutdown_requested)
+				{
+					stopped_by_shutdown = true;
+					break;
+				}
+				if (oggit_batch_limit_reached())
+				{
+					stopped_by_limit = true;
+					break;
+				}
+			}
+
+			session->startptr = InvalidXLogRecPtr;
+
+			if (oggit_shutdown_requested)
+			{
+				stopped_by_shutdown = true;
+				break;
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	PG_CATCH();
+	{
+		oggit_release_resource_owner(decode_resowner, old_resowner, false);
+		InvalidateSystemCaches();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	session->startptr = InvalidXLogRecPtr;
+
+	oggit_release_resource_owner(decode_resowner, old_resowner, true);
+	InvalidateSystemCaches();
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	/*
+	 * An early stop may only advance to a complete record actually processed by
+	 * this batch. If no such record exists, do not persist or confirm progress.
+	 */
+	if (stopped_by_limit || stopped_by_shutdown)
+	{
+		if (XLByteEQ(last_end, InvalidXLogRecPtr))
+			return 0;
+
+		scanned_lsn = XLByteLT(last_end, end_of_wal) ? last_end : end_of_wal;
+	}
+	else
+		scanned_lsn = end_of_wal;
+
+	nevents = oggit_persist_batch(scanned_lsn, stopped_by_limit,
+								stopped_by_shutdown);
+
+	/* Advance the slot confirmed/restart position in its own transaction. */
+	if (!XLByteEQ(last_end, InvalidXLogRecPtr))
+	{
+		XLogRecPtr	required_lsn;
+
+		StartTransactionCommand();
+		LogicalConfirmReceivedLocation(last_end);
+		required_lsn = t_thrd.slot_cxt.MyReplicationSlot->data.restart_lsn;
+		CommitTransactionCommand();
+
+		oggit_update_required_lsn(required_lsn);
+	}
+
+	return nevents;
+}
+
+/*
+ * Outer decode loop: repeatedly drain available WAL. When a batch decodes
+ * nothing new, wait on the latch (with a bounded timeout) before retrying, so
+ * the worker is effectively event-driven and does not busy-poll.
+ */
+static void
+oggit_run_decode_loop(void)
+{
+	OggitDecodeSession session;
+
+	MemSet(&session, 0, sizeof(session));
+	session.startptr = InvalidXLogRecPtr;
+
+	PG_TRY();
+	{
+		oggit_start_decode_session(&session);
+		g_instance.pid_cxt.OggitWorkerReady = true;
+		elog(LOG, "oggit worker: decode loop started on slot %s",
+			 oggit_effective_slot_name);
+
+		while (!oggit_shutdown_requested)
+		{
+			int64		decoded;
+
+			if (oggit_got_sighup)
+			{
+				oggit_got_sighup = false;
+				ProcessConfigFile(PGC_SIGHUP);
+			}
+
+			decoded = oggit_decode_one_batch(&session);
+
+			if (oggit_shutdown_requested)
+				break;
+
+			if (decoded == 0)
+			{
+				(void) WaitLatch(&t_thrd.proc->procLatch,
+								 WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+								 OGGIT_IDLE_NAP_MS);
+				ResetLatch(&t_thrd.proc->procLatch);
+			}
+
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	PG_CATCH();
+	{
+		oggit_stop_decode_session(&session);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	oggit_stop_decode_session(&session);
+}
+
+void
+OggitWorkerMain(Datum main_arg)
+{
+	sigjmp_buf	local_sigjmp_buf;
+	const char *dbname;
+
+	/*
+	 * Gating: the postmaster starts this thread whenever the neon plugin is
+	 * loaded (mirroring WALPROPOSER). Honour the neon.oggit_enabled GUC and the
+	 * required branch identity here; if disabled, exit quietly so the endpoint
+	 * behaves as if no oggit worker exists.
+	 */
+	g_instance.pid_cxt.OggitWorkerReady = false;
+
+	if (!oggit_enabled)
+	{
+		elog(LOG, "oggit worker: neon.oggit_enabled is off, exiting");
+		proc_exit(0);
+	}
+	if (!oggit_guc_present(oggit_tenant_id) || !oggit_guc_present(oggit_timeline_id))
+	{
+		elog(LOG, "oggit worker: tenant/timeline GUCs empty, exiting");
+		proc_exit(0);
+	}
+
+	t_thrd.role = OGGITWORKER;
+	SetProcessingMode(InitProcessing);
+
+	/* Signal handlers: react quickly to shutdown and reload. */
+	gspqsignal(SIGTERM, oggit_shutdown_handler);
+	gspqsignal(SIGHUP, oggit_sighup_handler);
+	gspqsignal(SIGINT, StatementCancelHandler);
+	gspqsignal(SIGQUIT, quickdie);
+	gspqsignal(SIGALRM, handle_sig_alarm);
+	gspqsignal(SIGPIPE, SIG_IGN);
+	gspqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	gspqsignal(SIGUSR2, oggit_shutdown_handler);
+	gspqsignal(SIGFPE, FloatExceptionHandler);
+	gspqsignal(SIGCHLD, SIG_DFL);
+
+	/*
+	 * The postmaster OGGITWORKER case already ran InitProcessAndShareMemory()
+	 * (InitProcess + shared memory). BaseInit() is still needed before we can
+	 * attach to a database.
+	 */
+	BaseInit();
+
+	/* Standard error-recovery scope for a background thread. */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+		proc_exit(0);
+	}
+	t_thrd.log_cxt.PG_exception_stack = &local_sigjmp_buf;
+	gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
+	(void) gs_signal_unblock_sigusr2();
+
+	/*
+	 * Attach to the target database as cloud_admin. InitBgWorker() is the
+	 * generic backend init path (InitThread -> InitSysCache -> StartXact ->
+	 * InitUser -> SetDatabase -> LoadSysCache -> InitDatabase -> FinishInit),
+	 * which is what enables SPI/executor + catalog access. It needs a valid
+	 * MyProcPort->user_name (InitUser/CheckConnPermission), so set both the
+	 * database and user names first. t_thrd.proc_cxt.PostInit is created per
+	 * thread by knl_thread_init, so we just drive it here.
+	 */
+	dbname = oggit_guc_present(oggit_database) ? oggit_database : "postgres";
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
+
+		if (u_sess->proc_cxt.MyProcPort->database_name)
+			pfree_ext(u_sess->proc_cxt.MyProcPort->database_name);
+		if (u_sess->proc_cxt.MyProcPort->user_name)
+			pfree_ext(u_sess->proc_cxt.MyProcPort->user_name);
+		u_sess->proc_cxt.MyProcPort->database_name = pstrdup(dbname);
+		u_sess->proc_cxt.MyProcPort->user_name = pstrdup("cloud_admin");
+		(void) MemoryContextSwitchTo(oldcxt);
+	}
+	u_sess->proc_cxt.MyProcPort->SessionStartTime = GetCurrentTimestamp();
+
+	t_thrd.proc_cxt.PostInit->SetDatabaseAndUser(dbname, InvalidOid, "cloud_admin");
+	t_thrd.proc_cxt.PostInit->InitBgWorker();
+	t_thrd.proc_cxt.PostInit->GetDatabaseName(u_sess->proc_cxt.MyProcPort->database_name);
+	oggit_initialize_effective_slot_name();
+
+	/* Run as a normal backend from here on. */
+	pgstat_report_activity(STATE_RUNNING, NULL);
+	t_thrd.role = OGGITWORKER;
+
+	/*
+	 * A resource owner is required for buffer pins and SPI. InitBgWorker's
+	 * FinishInit committed its bootstrap transaction, leaving none, so create
+	 * one now (mirrors job_worker).
+	 */
+	t_thrd.utils_cxt.CurrentResourceOwner =
+		ResourceOwnerCreate(NULL, "oggit worker",
+							THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
+
+	SetProcessingMode(NormalProcessing);
+	pgstat_report_appname("OggitWorker");
+
+	elog(LOG, "oggit worker started: tenant=%s timeline=%s slot=%s db=%s",
+		 oggit_tenant_id, oggit_timeline_id, oggit_effective_slot_name, dbname);
+
+	/*
+	 * Long-lived context for buffering one decode batch's JSON events. It
+	 * survives across the decode/persist transactions and is reset after each
+	 * batch is persisted. TopMemoryContext is sealed in openGauss to catch
+	 * leaks, so unseal it while creating our context (mirrors walproposer_pg).
+	 */
+	{
+		bool		was_sealed = TopMemoryContext->is_sealed;
+
+		if (was_sealed)
+			MemoryContextUnSeal(TopMemoryContext);
+		oggit_decode_cxt = AllocSetContextCreate(TopMemoryContext,
+												 "oggit decode session",
+												 ALLOCSET_DEFAULT_MINSIZE,
+												 ALLOCSET_DEFAULT_INITSIZE,
+												 ALLOCSET_DEFAULT_MAXSIZE);
+		oggit_batch_cxt = AllocSetContextCreate(TopMemoryContext,
+												"oggit event batch",
+												ALLOCSET_DEFAULT_MINSIZE,
+												ALLOCSET_DEFAULT_INITSIZE,
+												ALLOCSET_DEFAULT_MAXSIZE);
+		oggit_worker_cxt = AllocSetContextCreate(TopMemoryContext,
+												 "oggit worker",
+												 ALLOCSET_DEFAULT_MINSIZE,
+												 ALLOCSET_DEFAULT_INITSIZE,
+												 ALLOCSET_DEFAULT_MAXSIZE);
+
+		/*
+		 * maskPassword() (invoked by the SPI error callback and by any DDL
+		 * that creates plpgsql functions) switches to
+		 * t_thrd.mem_cxt.mask_password_mem_cxt and palloc0's there. It is
+		 * initialized to NULL per thread (knl_thread.cpp) and only set up by
+		 * the standard backend/aux init paths, which this hand-rolled worker
+		 * does not fully run. Create it here to avoid a NULL-context palloc
+		 * crash during error unwinding / interrupt handling (mirrors
+		 * job_worker.cpp).
+		 */
+		if (t_thrd.mem_cxt.mask_password_mem_cxt == NULL)
+			t_thrd.mem_cxt.mask_password_mem_cxt =
+				AllocSetContextCreate(t_thrd.top_mem_cxt,
+									  "MaskPasswordCtx",
+									  ALLOCSET_DEFAULT_MINSIZE,
+									  ALLOCSET_DEFAULT_INITSIZE,
+									  ALLOCSET_DEFAULT_MAXSIZE);
+		if (was_sealed)
+			MemoryContextSeal(TopMemoryContext);
+	}
+
+	/*
+	 * Bootstrap and decode are wrapped in a PG_TRY so that a transient error
+	 * (e.g. WAL not yet available, catalog race at startup) marks the state
+	 * failed and the worker naps before retrying instead of crashing the
+	 * whole compute.
+	 */
+	while (!oggit_shutdown_requested)
+	{
+		g_instance.pid_cxt.OggitWorkerReady = false;
+		PG_TRY();
+		{
+			if (!oggit_wait_for_state_table())
+				break;
+			oggit_bootstrap();
+			oggit_update_worker_status("active", NULL);
+			oggit_run_decode_loop();
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext oldcontext;
+			char	   *last_error;
+
+			/*
+			 * CopyErrorData/pstrdup must not land in ErrorContext: FlushErrorState
+			 * resets it and would leave last_error dangling, then pfree SIGSEGVs.
+			 * Keep the copy in the long-lived worker context across abort/retry.
+			 */
+			Assert(oggit_worker_cxt != NULL);
+			oldcontext = MemoryContextSwitchTo(oggit_worker_cxt);
+			edata = CopyErrorData();
+			last_error = (edata != NULL && edata->message != NULL)
+				? pstrdup(edata->message) : pstrdup("oggit worker error");
+			MemoryContextSwitchTo(oldcontext);
+
+			g_instance.pid_cxt.OggitWorkerReady = false;
+
+			/* Abort the failed transaction and log the error. */
+			EmitErrorReport();
+			FlushErrorState();
+			if (edata != NULL)
+				FreeErrorData(edata);
+			if (t_thrd.slot_cxt.MyReplicationSlot != NULL)
+				ReplicationSlotRelease();
+			AbortOutOfAnyTransaction();
+
+			/* Drop any partially-buffered batch events and accounting. */
+			oggit_reset_batch();
+
+			if (oggit_shutdown_requested)
+			{
+				pfree(last_error);
+				break;
+			}
+
+			oggit_update_worker_status("failed", last_error);
+			pfree(last_error);
+			elog(LOG, "oggit worker: retrying after error");
+
+			/* Back off before retrying. */
+			(void) WaitLatch(&t_thrd.proc->procLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+							 OGGIT_IDLE_NAP_MS);
+			ResetLatch(&t_thrd.proc->procLatch);
+		}
+		PG_END_TRY();
+
+		/* Normal exit from the decode loop only happens on a shutdown signal. */
+		if (oggit_shutdown_requested)
+			break;
+	}
+
+	g_instance.pid_cxt.OggitWorkerReady = false;
+	elog(LOG, "oggit worker exiting");
+	elog(LOG, "oggit worker exited gracefully");
+	proc_exit(0);
+}

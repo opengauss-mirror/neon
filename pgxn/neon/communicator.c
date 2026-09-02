@@ -300,6 +300,15 @@ typedef struct PrefetchState
 	int			n_unused;		/* count of buffers < unused, > last, that are
 								 * also unused */
 
+	/*
+	 * Capacity of prf_buffer[].  Must be used for ring indexing instead of the
+	 * live GUC readahead_buffer_size: on openGauss (thread-per-connection) that
+	 * GUC is process-global PGC_USERSET, so another backend's SET can change it
+	 * while this backend still owns a differently-sized MyPState.  Indexing with
+	 * the wrong modulus lands on an UNUSED slot and PANICs in prefetch_read().
+	 */
+	int			ring_size;
+
 	/* the buffers */
 	prfh_hash	*prf_hash;
 	int			max_shard_no;
@@ -311,7 +320,7 @@ typedef struct PrefetchState
 THR_LOCAL static PrefetchState *MyPState;
 
 #define GetPrfSlotNoCheck(ring_index) ( \
-	&MyPState->prf_buffer[((ring_index) % readahead_buffer_size)] \
+	&MyPState->prf_buffer[((ring_index) % MyPState->ring_size)] \
 )
 
 #define GetPrfSlot(ring_index) ( \
@@ -613,6 +622,7 @@ readahead_buffer_resize(int newsize, void *extra)
 	newPState->errctx = MyPState->errctx;
 	newPState->hashctx = MyPState->hashctx;
 	newPState->prf_hash = prfh_create(MyPState->hashctx, newsize, NULL);
+	newPState->ring_size = newsize;
 	newPState->n_unused = newsize;
 	newPState->n_requests_inflight = 0;
 	newPState->n_responses_buffered = 0;
@@ -1305,7 +1315,7 @@ prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 	bool		any_hits = false;
 #endif
 	/* We will never read further ahead than our buffer can store. */
-	nblocks = Max(1, Min(nblocks, readahead_buffer_size));
+	nblocks = Max(1, Min(nblocks, MyPState->ring_size));
 
 	/*
 	 * Use an intermediate PrefetchRequest struct as the hash key to ensure
@@ -1424,7 +1434,7 @@ Retry:
 		Assert(slot == NULL);
 
 		/* There should be no buffer overflow */
-		Assert(MyPState->ring_last + readahead_buffer_size >= MyPState->ring_unused);
+		Assert(MyPState->ring_last + MyPState->ring_size >= MyPState->ring_unused);
 
 		/*
 		 * If the prefetch queue is full, we need to make room by clearing the
@@ -1440,24 +1450,30 @@ Retry:
 		 * a prefetch request kind of goes against the principles of
 		 * prefetching)
 		 */
-		if (MyPState->ring_last + readahead_buffer_size == MyPState->ring_unused)
+		if (MyPState->ring_last + MyPState->ring_size == MyPState->ring_unused)
 		{
-			uint64		cleanup_index = MyPState->ring_last;
-
-			slot = GetPrfSlot(cleanup_index);
-
-			Assert(slot->status != PRFS_UNUSED);
+			uint64		cleanup_index;
 
 			/*
-			 * If there is good reason to run compaction on the prefetch buffers,
-			 * try to do that.
+			 * Compaction collapses holes among already-received responses and
+			 * may advance ring_last.  It does *not* guarantee free ring space:
+			 * it can return true after only rearranging RECEIVED slots, leaving
+			 * ring_last unchanged.  In non-assert builds the old code then fell
+			 * through and reused the still-RECEIVED physical slot at
+			 * ring_unused % ring_size, leaving a stale response pointer on a
+			 * PRFS_REQUESTED entry and later PANIC'ing in prefetch_read()
+			 * ("Incorrect prefetch read").
+			 *
+			 * Always re-check fullness after compaction and evict when needed.
 			 */
-			if (ReceiveBufferNeedsCompaction() && compact_prefetch_buffers())
+			if (ReceiveBufferNeedsCompaction())
+				(void) compact_prefetch_buffers();
+
+			if (MyPState->ring_last + MyPState->ring_size == MyPState->ring_unused)
 			{
-				Assert(slot->status == PRFS_UNUSED);
-			}
-			else
-			{
+				cleanup_index = MyPState->ring_last;
+				slot = GetPrfSlot(cleanup_index);
+
 				/*
 				 * We have the slot for ring_last, so that must still be in
 				 * progress
@@ -1484,6 +1500,14 @@ Retry:
 						pgBufferUsage.prefetch.expired += 1;
 						MyNeonCounters->getpage_prefetch_discards_total += 1;
 						break;
+					case PRFS_UNUSED:
+						/*
+						 * Compaction/trailing cleanup should have advanced
+						 * ring_last past unused slots.  Do so here to keep
+						 * non-assert builds safe.
+						 */
+						prefetch_cleanup_trailing_unused();
+						break;
 					default:
 						pg_unreachable();
 				}
@@ -1501,7 +1525,19 @@ Retry:
 
 		slot = GetPrfSlotNoCheck(last_ring_index);
 
-		Assert(slot->status == PRFS_UNUSED);
+		/*
+		 * Defensive guard for non-assert builds: never overwrite a live slot.
+		 * The PANIC we hit in production was exactly status!=UNUSED/response!=NULL
+		 * here, masked by disabled Assert()s.
+		 */
+		if (slot->status != PRFS_UNUSED || slot->response != NULL)
+		{
+			neon_shard_log(slot->shard_no, PANIC,
+						   "Prefetch slot not clean before reuse: status=%d response=%p my=" UINT64_FORMAT " last=" UINT64_FORMAT " receive=" UINT64_FORMAT " unused=" UINT64_FORMAT "",
+						   slot->status, slot->response,
+						   last_ring_index, MyPState->ring_last,
+						   MyPState->ring_receive, MyPState->ring_unused);
+		}
 
 		/*
 		 * We must update the slot data before insertion, because the hash
@@ -1511,6 +1547,7 @@ Retry:
 		slot->shard_no = get_shard_number(&tag);
 		slot->my_ring_index = last_ring_index;
 		slot->flags = 0;
+		slot->response = NULL;
 
 		if (is_prefetch)
 			MyNeonCounters->getpage_prefetch_requests_total++;
@@ -2073,7 +2110,8 @@ communicator_init(void)
 
 	MyPState = (PrefetchState *)MemoryContextAllocZero(TopMemoryContext, prfs_size);
 
-	MyPState->n_unused = readahead_buffer_size;
+	MyPState->ring_size = readahead_buffer_size;
+	MyPState->n_unused = MyPState->ring_size;
 
 	// SlabContext is not supported yet, use STANDARD_CONTEXT instead
 	MyPState->bufctx = AllocSetContextCreate(TopMemoryContext,
@@ -2089,7 +2127,7 @@ communicator_init(void)
 											  ALLOCSET_DEFAULT_SIZES);
 
 	MyPState->prf_hash = prfh_create(MyPState->hashctx,
-									 readahead_buffer_size, NULL);
+									 MyPState->ring_size, NULL);
 	
 	/* Restore the sealed state if it was sealed before */
 	if (was_sealed) {
