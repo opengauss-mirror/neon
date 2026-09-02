@@ -154,6 +154,14 @@ pub fn update_pg_hba(pgdata_path: &Path, databricks_pg_hba: Option<&String>) -> 
         }
     }
 
+    if let Ok(remote_cidr) = std::env::var("COMPUTE_REMOTE_HBA_CIDR") {
+        let remote_hba = format!("host\tall\t\tall\t\t{remote_cidr}\t\tsha256");
+
+        if config::line_in_file(&pghba_path, &remote_hba)? {
+            info!("updated pg_hba.conf to allow external openGauss connections");
+        }
+    }
+
     if config::line_in_file(&pghba_path, PG_HBA_ALL_MD5)? {
         info!("updated pg_hba.conf to allow external connections");
     } else {
@@ -234,32 +242,35 @@ pub fn add_standby_signal_ext(
     if is_opengauss {
         // openGauss uses recovery.conf file with standby_mode = 'on'
         let recovery_conf_path = pgdata_path.join("recovery.conf");
-        
+
         use std::io::Write;
         let mut file = File::create(&recovery_conf_path)?;
-        
-        writeln!(file, "# openGauss recovery configuration for Neon hot standby")?;
+
+        writeln!(
+            file,
+            "# openGauss recovery configuration for Neon hot standby"
+        )?;
         writeln!(file, "standby_mode = 'on'")?;
-        
+
         if let Some(conninfo) = primary_conninfo {
             writeln!(file, "primary_conninfo = '{}'", conninfo)?;
         }
-        
+
         // openGauss uses 'primary_slotname' instead of PostgreSQL's 'primary_slot_name'
         if let Some(slotname) = primary_slotname {
             writeln!(file, "primary_slotname = '{}'", slotname)?;
         }
-        
+
         info!("created recovery.conf for openGauss standby mode");
     } else {
         // PostgreSQL 12+ uses standby.signal file
-    let signalfile = pgdata_path.join("standby.signal");
+        let signalfile = pgdata_path.join("standby.signal");
 
-    if !signalfile.exists() {
-        File::create(signalfile)?;
-        info!("created standby.signal");
-    } else {
-        info!("reused pre-existing standby.signal");
+        if !signalfile.exists() {
+            File::create(signalfile)?;
+            info!("created standby.signal");
+        } else {
+            info!("reused pre-existing standby.signal");
         }
     }
     Ok(())
@@ -280,6 +291,21 @@ pub async fn handle_neon_extension_upgrade(client: &mut Client, is_opengauss: bo
 }
 
 pub const OPENGAUSS_NEON_EXTENSION_COMPAT_SQL: &str = r#"
+CREATE OR REPLACE FUNCTION neon.neon_start_oggit_worker()
+RETURNS boolean
+AS '$libdir/neon', 'neon_start_oggit_worker'
+LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION neon.neon_oggit_worker_is_ready()
+RETURNS boolean
+AS '$libdir/neon', 'neon_oggit_worker_is_ready'
+LANGUAGE C STRICT;
+
+REVOKE ALL ON FUNCTION neon.neon_start_oggit_worker() FROM PUBLIC;
+REVOKE ALL ON FUNCTION neon.neon_oggit_worker_is_ready() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION neon.neon_start_oggit_worker() TO cloud_admin;
+GRANT EXECUTE ON FUNCTION neon.neon_oggit_worker_is_ready() TO cloud_admin;
+
 DELETE FROM pg_depend
  WHERE refclassid = 'pg_extension'::regclass
    AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'neon')
@@ -324,29 +350,102 @@ pub async fn handle_migrations(
     lakebase_mode: bool,
 ) -> Result<()> {
     info!("handle migrations");
+    let is_opengauss = is_opengauss_pgbin(&params.pgbin);
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // !BE SURE TO ONLY ADD MIGRATIONS TO THE END OF THIS ARRAY. IF YOU DO NOT, VERY VERY BAD THINGS MAY HAPPEN!
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-    // Add new migrations in numerical order.
-    let migrations = [
-        &format!(
+    let migration_0001 = if is_opengauss {
+        include_str!("./migrations/0001-add_bypass_rls_to_privileged_role_opengauss.sql")
+            .to_string()
+    } else {
+        format!(
             include_str!("./migrations/0001-add_bypass_rls_to_privileged_role.sql"),
             privileged_role_name = params.privileged_role_name
-        ),
-        &format!(
+        )
+    };
+    let migration_0002 = if is_opengauss {
+        format!(
+            include_str!("./migrations/0002-alter_roles_opengauss.sql"),
+            privileged_role_name = params.privileged_role_name
+        )
+    } else {
+        format!(
             include_str!("./migrations/0002-alter_roles.sql"),
             privileged_role_name = params.privileged_role_name
-        ),
-        &format!(
+        )
+    };
+    let migration_0003 = if is_opengauss {
+        format!(
+            include_str!(
+                "./migrations/0003-grant_pg_create_subscription_to_privileged_role_opengauss.sql"
+            ),
+            privileged_role_name = params.privileged_role_name
+        )
+    } else {
+        format!(
             include_str!("./migrations/0003-grant_pg_create_subscription_to_privileged_role.sql"),
             privileged_role_name = params.privileged_role_name
-        ),
-        &format!(
+        )
+    };
+    let migration_0004 = if is_opengauss {
+        format!(
+            include_str!("./migrations/0004-grant_pg_monitor_to_privileged_role_opengauss.sql"),
+            privileged_role_name = params.privileged_role_name
+        )
+    } else {
+        format!(
             include_str!("./migrations/0004-grant_pg_monitor_to_privileged_role.sql"),
             privileged_role_name = params.privileged_role_name
-        ),
+        )
+    };
+    let migration_0010 = if is_opengauss {
+        include_str!(
+            "./migrations/0010-grant_snapshot_synchronization_funcs_to_privileged_role_opengauss.sql"
+        )
+        .to_string()
+    } else {
+        format!(
+            include_str!(
+                "./migrations/0010-grant_snapshot_synchronization_funcs_to_privileged_role.sql"
+            ),
+            privileged_role_name = params.privileged_role_name
+        )
+    };
+    let migration_0011 = if is_opengauss {
+        include_str!(
+            "./migrations/0011-grant_pg_show_replication_origin_status_to_privileged_role_opengauss.sql"
+        )
+        .to_string()
+    } else {
+        format!(
+            include_str!(
+                "./migrations/0011-grant_pg_show_replication_origin_status_to_privileged_role.sql"
+            ),
+            privileged_role_name = params.privileged_role_name
+        )
+    };
+    let migration_0012 = if is_opengauss {
+        format!(
+            include_str!(
+                "./migrations/0012-grant_pg_signal_backend_to_privileged_role_opengauss.sql"
+            ),
+            privileged_role_name = params.privileged_role_name
+        )
+    } else {
+        format!(
+            include_str!("./migrations/0012-grant_pg_signal_backend_to_privileged_role.sql"),
+            privileged_role_name = params.privileged_role_name
+        )
+    };
+
+    // Add new migrations in numerical order.
+    let migrations = [
+        migration_0001.as_str(),
+        migration_0002.as_str(),
+        migration_0003.as_str(),
+        migration_0004.as_str(),
         &format!(
             include_str!("./migrations/0005-grant_all_on_tables_to_privileged_role.sql"),
             privileged_role_name = params.privileged_role_name
@@ -368,25 +467,12 @@ pub async fn handle_migrations(
             privileged_role_name = params.privileged_role_name
         ),
         include_str!("./migrations/0009-revoke_replication_for_previously_allowed_roles.sql"),
-        &format!(
-            include_str!(
-                "./migrations/0010-grant_snapshot_synchronization_funcs_to_privileged_role.sql"
-            ),
-            privileged_role_name = params.privileged_role_name
-        ),
-        &format!(
-            include_str!(
-                "./migrations/0011-grant_pg_show_replication_origin_status_to_privileged_role.sql"
-            ),
-            privileged_role_name = params.privileged_role_name
-        ),
-        &format!(
-            include_str!("./migrations/0012-grant_pg_signal_backend_to_privileged_role.sql"),
-            privileged_role_name = params.privileged_role_name
-        ),
+        migration_0010.as_str(),
+        migration_0011.as_str(),
+        migration_0012.as_str(),
     ];
 
-    MigrationRunner::new(client, &migrations, lakebase_mode)
+    MigrationRunner::new(client, &migrations, lakebase_mode, is_opengauss)
         .run_migrations()
         .await?;
 

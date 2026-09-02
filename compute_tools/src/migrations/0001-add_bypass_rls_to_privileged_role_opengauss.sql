@@ -1,0 +1,1 @@
+-- SKIP: openGauss does not support PostgreSQL's BYPASSRLS role option.

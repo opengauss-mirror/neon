@@ -1,0 +1,2 @@
+-- SKIP: openGauss does not support granting privileges on these built-in
+--       snapshot synchronization functions.

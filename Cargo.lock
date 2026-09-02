@@ -1566,6 +1566,8 @@ name = "control_plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "base64 0.22.1",
  "camino",
  "clap 4.5.22",
@@ -1573,6 +1575,7 @@ dependencies = [
  "compute_api",
  "endpoint_storage",
  "futures",
+ "http 1.4.0",
  "http-utils",
  "humantime",
  "humantime-serde",
@@ -1604,7 +1607,9 @@ dependencies = [
  "toml_edit",
  "tracing",
  "url",
+ "urlencoding",
  "utils",
+ "uuid 1.10.0",
  "whoami",
  "workspace_hack",
 ]

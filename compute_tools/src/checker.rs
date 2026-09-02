@@ -23,10 +23,18 @@ pub async fn check_writability(compute: &ComputeNode) -> Result<()> {
         }
     });
 
-    let query = "
+    // openGauss does not support PostgreSQL's INSERT ... ON CONFLICT syntax;
+    // use ON DUPLICATE KEY UPDATE there. PostgreSQL keeps the original form.
+    let query = if crate::spec::is_opengauss_pgbin(&compute.params.pgbin) {
+        "
+    INSERT INTO health_check VALUES (1, now())
+        ON DUPLICATE KEY UPDATE updated_at = now();"
+    } else {
+        "
     INSERT INTO health_check VALUES (1, now())
         ON CONFLICT (id) DO UPDATE
-         SET updated_at = now();";
+         SET updated_at = now();"
+    };
 
     match client.simple_query(query).await {
         Result::Ok(result) => {
