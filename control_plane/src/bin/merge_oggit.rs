@@ -3335,3 +3335,680 @@ pub(crate) async fn oggit_finalize_merge_commit_lsn(
 
     Ok(())
 }
+
+async fn oggit_ensure_write_barrier(client: &tokio_opengauss::Client) -> Result<()> {
+    client
+        .batch_execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS oggit.merge_write_barrier (
+                id boolean PRIMARY KEY DEFAULT true CHECK (id),
+                active boolean NOT NULL DEFAULT false,
+                merge_id uuid,
+                reason text,
+                updated_at timestamptz NOT NULL DEFAULT now()
+            );
+
+            CREATE OR REPLACE FUNCTION oggit.enforce_merge_write_barrier()
+            RETURNS trigger AS $$
+            DECLARE
+                active_merge uuid;
+                apply_merge text := '';
+            BEGIN
+                BEGIN
+                    apply_merge := current_setting('neon.oggit_apply_merge');
+                EXCEPTION WHEN OTHERS THEN
+                    apply_merge := '';
+                END;
+
+                IF apply_merge = 'on' THEN
+                    IF TG_OP = 'DELETE' THEN
+                        RETURN OLD;
+                    ELSIF TG_OP = 'TRUNCATE' THEN
+                        RETURN NULL;
+                    ELSE
+                        RETURN NEW;
+                    END IF;
+                END IF;
+
+                active_merge := (
+                    SELECT merge_id
+                      FROM oggit.merge_write_barrier
+                     WHERE id AND active
+                     LIMIT 1
+                );
+                IF active_merge IS NOT NULL THEN
+                    RAISE EXCEPTION 'oggit merge % is blocked; this branch writes are temporarily disabled', active_merge;
+                END IF;
+
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                ELSIF TG_OP = 'TRUNCATE' THEN
+                    RETURN NULL;
+                ELSE
+                    RETURN NEW;
+                END IF;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            INSERT INTO oggit.merge_write_barrier (id, active)
+            SELECT true, false
+             WHERE NOT EXISTS (SELECT 1 FROM oggit.merge_write_barrier WHERE id);
+            "#,
+        )
+        .await
+        .context("failed to ensure oggit write barrier objects")?;
+    Ok(())
+}
+
+async fn oggit_install_write_barrier_triggers(client: &tokio_opengauss::Client) -> Result<()> {
+    oggit_ensure_write_barrier(client).await?;
+    let rows = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relkind = 'r'
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              ORDER BY n.nspname, c.relname",
+            &[],
+        )
+        .await
+        .context("failed to list tables for oggit write barrier")?;
+
+    for row in rows {
+        let schema_name: String = row.get(0);
+        let table_name: String = row.get(1);
+        if oggit_is_internal_schema(&schema_name) {
+            continue;
+        }
+
+        let rel = format!(
+            "{}.{}",
+            quote_sql_ident(&schema_name),
+            quote_sql_ident(&table_name)
+        );
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER IF EXISTS oggit_merge_write_barrier_row ON {rel};
+                 CREATE TRIGGER oggit_merge_write_barrier_row
+                 BEFORE INSERT OR UPDATE OR DELETE ON {rel}
+                 FOR EACH ROW EXECUTE PROCEDURE oggit.enforce_merge_write_barrier();
+                 DROP TRIGGER IF EXISTS oggit_merge_write_barrier_truncate ON {rel};
+                 CREATE TRIGGER oggit_merge_write_barrier_truncate
+                 BEFORE TRUNCATE ON {rel}
+                 FOR EACH STATEMENT EXECUTE PROCEDURE oggit.enforce_merge_write_barrier();"
+            ))
+            .await
+            .with_context(|| format!("failed to install oggit write barrier on {rel}"))?;
+    }
+
+    Ok(())
+}
+
+async fn oggit_lock_branch_merge(client: &tokio_opengauss::Client) -> Result<()> {
+    client
+        .query_one(
+            "SELECT pg_advisory_xact_lock(7308613716351542879::bigint)",
+            &[],
+        )
+        .await
+        .context("failed to acquire branch-level oggit merge lock")?;
+    Ok(())
+}
+
+async fn oggit_active_merge_lease(client: &tokio_opengauss::Client) -> Result<Option<String>> {
+    let barrier_exists = client
+        .query_opt(
+            "SELECT 1
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'oggit'
+                AND c.relname = 'merge_write_barrier'",
+            &[],
+        )
+        .await
+        .context("failed to inspect oggit merge barrier catalog")?
+        .is_some();
+    if !barrier_exists {
+        return Ok(None);
+    }
+
+    Ok(client
+        .query_opt(
+            "SELECT merge_id::text FROM oggit.merge_write_barrier WHERE id AND active",
+            &[],
+        )
+        .await
+        .context("failed to inspect active oggit merge lease")?
+        .map(|row| row.get(0)))
+}
+
+async fn oggit_require_merge_lease(
+    client: &tokio_opengauss::Client,
+    expected_merge_id: Option<&str>,
+) -> Result<()> {
+    let active_merge = oggit_active_merge_lease(client).await?;
+    match (active_merge.as_deref(), expected_merge_id) {
+        (None, None) => Ok(()),
+        (Some(active), None) => bail!("branch already has active oggit merge {active}"),
+        (Some(active), Some(expected)) if active == expected => Ok(()),
+        (Some(active), Some(expected)) => {
+            bail!("active oggit merge lease belongs to {active}, not requested merge {expected}")
+        }
+        (None, Some(expected)) => bail!("active oggit merge lease for {expected} not found"),
+    }
+}
+
+pub(crate) async fn oggit_require_no_active_merge(
+    client: &tokio_opengauss::Client,
+) -> Result<()> {
+    oggit_require_merge_lease(client, None).await
+}
+
+async fn oggit_enable_write_barrier(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+    reason: &str,
+) -> Result<()> {
+    oggit_install_write_barrier_triggers(client).await?;
+    let updated = client
+        .execute(
+            "UPDATE oggit.merge_write_barrier
+                SET active = true,
+                    merge_id = $1::text::uuid,
+                    reason = $2,
+                    updated_at = now()
+              WHERE id
+                AND (NOT active OR merge_id = $1::text::uuid)",
+            &[&merge_id, &reason],
+        )
+        .await
+        .context("failed to enable oggit write barrier")?;
+    if updated == 0 {
+        let active_merge: Option<String> = client
+            .query_opt(
+                "SELECT merge_id::text FROM oggit.merge_write_barrier WHERE id AND active",
+                &[],
+            )
+            .await
+            .context("failed to inspect active oggit merge barrier")?
+            .map(|row| row.get(0));
+        bail!(
+            "branch already has active oggit merge {}",
+            active_merge.unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    Ok(())
+}
+
+async fn oggit_disable_write_barrier(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+) -> Result<()> {
+    oggit_ensure_write_barrier(client).await?;
+    client
+        .execute(
+            "UPDATE oggit.merge_write_barrier
+                SET active = false,
+                    merge_id = NULL,
+                    reason = NULL,
+                    updated_at = now()
+              WHERE id
+                AND merge_id = $1::text::uuid",
+            &[&merge_id],
+        )
+        .await
+        .context("failed to disable oggit write barrier")?;
+    Ok(())
+}
+
+async fn oggit_repair_owned_sequences(
+    client: &tokio_opengauss::Client,
+    theirs_delta: &[OggitDelta],
+) -> Result<i64> {
+    let mut tables = BTreeSet::new();
+    for delta in theirs_delta {
+        tables.insert((delta.schema_name.clone(), delta.table_name.clone()));
+    }
+    let mut repaired = 0_i64;
+
+    for (schema_name, table_name) in tables {
+        let columns = client
+            .query(
+                "SELECT a.attname
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                   JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+                  WHERE n.nspname = $1
+                    AND c.relname = $2
+                    AND c.relkind = 'r'
+                    AND pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%'",
+                &[&schema_name, &table_name],
+            )
+            .await
+            .context("failed to inspect sequence-owned columns")?;
+
+        for row in columns {
+            let column_name: String = row.get(0);
+            let seq_name: Option<String> = client
+                .query_one(
+                    "SELECT pg_get_serial_sequence($1, $2)",
+                    &[
+                        &format!(
+                            "{}.{}",
+                            quote_sql_ident(&schema_name),
+                            quote_sql_ident(&table_name)
+                        ),
+                        &column_name,
+                    ],
+                )
+                .await
+                .context("failed to get serial sequence")?
+                .get(0);
+            let Some(seq_name) = seq_name else {
+                continue;
+            };
+            let max_sql = format!(
+                "SELECT max({})::bigint FROM {}.{}",
+                quote_sql_ident(&column_name),
+                quote_sql_ident(&schema_name),
+                quote_sql_ident(&table_name)
+            );
+            let max_value: Option<i64> = client
+                .query_one(max_sql.as_str(), &[])
+                .await
+                .context("failed to get max sequence-owned value")?
+                .get(0);
+            let Some(max_value) = max_value else {
+                continue;
+            };
+            let current_sql = format!("SELECT last_value::bigint FROM {seq_name}");
+            let current_value: i64 = client
+                .query_one(current_sql.as_str(), &[])
+                .await
+                .context("failed to get sequence last_value")?
+                .get(0);
+            if current_value < max_value {
+                client
+                    .execute("SELECT setval($1, $2, true)", &[&seq_name, &max_value])
+                    .await
+                    .context("failed to repair sequence value")?;
+                repaired += 1;
+            }
+        }
+    }
+
+    Ok(repaired)
+}
+
+async fn oggit_insert_merge_conflict(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+    conflict_scope: &str,
+    conflict_type: &str,
+    schema_name: Option<&str>,
+    table_name: Option<&str>,
+    object_name: Option<&str>,
+    ours_op: Option<&str>,
+    theirs_op: Option<&str>,
+    ours_cols: &[String],
+    theirs_cols: &[String],
+    key_json: &Option<JsonValue>,
+    ours_json: &Option<JsonValue>,
+    theirs_json: &Option<JsonValue>,
+    reason: &str,
+) -> Result<()> {
+    let key_json_text = key_json.as_ref().map(JsonValue::to_string);
+    let ours_json_text = ours_json.as_ref().map(JsonValue::to_string);
+    let theirs_json_text = theirs_json.as_ref().map(JsonValue::to_string);
+    client
+        .execute(
+            "INSERT INTO oggit.merge_conflict (
+                merge_id, conflict_scope, conflict_type, schema_name, table_name,
+                object_name, ours_op, theirs_op, ours_cols, theirs_cols,
+                key_json, ours_json, theirs_json, reason
+             )
+             VALUES (
+                $1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11::text::jsonb, $12::text::jsonb, $13::text::jsonb, $14
+             )",
+            &[
+                &merge_id,
+                &conflict_scope,
+                &conflict_type,
+                &schema_name.map(str::to_string),
+                &table_name.map(str::to_string),
+                &object_name.map(str::to_string),
+                &ours_op.map(str::to_string),
+                &theirs_op.map(str::to_string),
+                &ours_cols.to_vec(),
+                &theirs_cols.to_vec(),
+                &key_json_text,
+                &ours_json_text,
+                &theirs_json_text,
+                &reason,
+            ],
+        )
+        .await
+        .context("failed to insert oggit merge conflict")?;
+    Ok(())
+}
+
+async fn oggit_mark_conflict_processed(
+    client: &tokio_opengauss::Client,
+    conflict_id: i64,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE oggit.merge_conflict
+                SET status = 'skipped',
+                    updated_at = now()
+              WHERE conflict_id = $1",
+            &[&conflict_id],
+        )
+        .await
+        .context("failed to mark resolved conflict processed")?;
+    Ok(())
+}
+
+async fn oggit_begin_apply_savepoint(client: &tokio_opengauss::Client) -> Result<()> {
+    client
+        .batch_execute("SAVEPOINT oggit_apply_execution")
+        .await
+        .context("failed to create oggit apply savepoint")?;
+    Ok(())
+}
+
+async fn oggit_release_apply_savepoint(client: &tokio_opengauss::Client) -> Result<()> {
+    client
+        .batch_execute("RELEASE SAVEPOINT oggit_apply_execution")
+        .await
+        .context("failed to release oggit apply savepoint")?;
+    Ok(())
+}
+
+async fn oggit_rollback_apply_savepoint(client: &tokio_opengauss::Client) -> Result<()> {
+    client
+        .batch_execute(
+            "ROLLBACK TO SAVEPOINT oggit_apply_execution;
+             RELEASE SAVEPOINT oggit_apply_execution",
+        )
+        .await
+        .context("failed to rollback oggit apply savepoint")?;
+    Ok(())
+}
+
+fn oggit_apply_error_reason(error: &anyhow::Error) -> String {
+    format!("database apply failed: {error:#}")
+}
+
+async fn oggit_reset_conflict_to_apply_error(
+    client: &tokio_opengauss::Client,
+    conflict_id: i64,
+    reason: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "UPDATE oggit.merge_conflict
+                SET conflict_type = 'apply_error',
+                    reason = $2,
+                    resolution = NULL,
+                    custom_sql = NULL,
+                    status = 'pending',
+                    updated_at = now()
+              WHERE conflict_id = $1",
+            &[&conflict_id, &reason],
+        )
+        .await
+        .context("failed to reset oggit conflict after apply error")?;
+    Ok(())
+}
+
+async fn oggit_record_object_apply_error(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+    object: &OggitObjectChange,
+    existing_conflict: Option<&OggitConflict>,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let reason = oggit_apply_error_reason(error);
+    if let Some(conflict) = existing_conflict {
+        oggit_reset_conflict_to_apply_error(client, conflict.conflict_id, &reason).await?;
+        return Ok(false);
+    }
+
+    oggit_insert_merge_conflict(
+        client,
+        merge_id,
+        oggit_merge_conflict_scope(&object.object_type),
+        "apply_error",
+        object.schema_name.as_deref(),
+        None,
+        object.object_name.as_deref(),
+        None,
+        None,
+        &[],
+        &[],
+        &None,
+        &None,
+        &Some(object.change_json.clone()),
+        &reason,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn oggit_record_dml_apply_error(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+    delta: &OggitDelta,
+    ours: Option<&OggitDelta>,
+    existing_conflict: Option<&OggitConflict>,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let reason = oggit_apply_error_reason(error);
+    if let Some(conflict) = existing_conflict {
+        oggit_reset_conflict_to_apply_error(client, conflict.conflict_id, &reason).await?;
+        return Ok(false);
+    }
+
+    oggit_insert_merge_conflict(
+        client,
+        merge_id,
+        "row",
+        "apply_error",
+        Some(&delta.schema_name),
+        Some(&delta.table_name),
+        None,
+        ours.map(|delta| delta.final_op.as_str()),
+        Some(&delta.final_op),
+        ours.map(|delta| delta.changed_cols.as_slice())
+            .unwrap_or(&[]),
+        &delta.changed_cols,
+        &delta.key_json,
+        &ours.and_then(|delta| delta.new_row.clone()),
+        &delta.new_row,
+        &reason,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn oggit_record_sequence_apply_error(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let reason = oggit_apply_error_reason(error);
+    oggit_insert_merge_conflict(
+        client,
+        merge_id,
+        "sequence",
+        "apply_error",
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &None,
+        &None,
+        &None,
+        &reason,
+    )
+    .await
+}
+
+async fn oggit_update_merge_history_status(
+    client: &tokio_opengauss::Client,
+    merge_id: &str,
+    status: &str,
+    conflict_count: i64,
+) -> Result<()> {
+    let conflict_count_i32 =
+        i32::try_from(conflict_count).context("oggit conflict count exceeds integer range")?;
+    client
+        .execute(
+            "UPDATE oggit.merge_history
+                SET status = $2,
+                    conflict_count = $3::integer,
+                    finished_at = now()
+              WHERE merge_id = $1::text::uuid",
+            &[&merge_id, &status, &conflict_count_i32],
+        )
+        .await
+        .context("failed to update oggit merge history")?;
+    Ok(())
+}
+
+/// Idempotency (design doc §16): a child increment identified by
+/// (child_timeline_id, parent_timeline_id, child_to_lsn) that already reached
+/// status='applied' must not be re-planned or re-applied. Returns the existing
+/// applied merge row, if any.
+async fn oggit_find_applied_merge(
+    client: &tokio_opengauss::Client,
+    child_timeline_id: &str,
+    parent_timeline_id: &str,
+    child_to_lsn: &str,
+    parent_to_lsn: &str,
+    direction: OggitMergeDirection,
+) -> Result<Option<String>> {
+    oggit_ensure_merge_history_direction_column(client).await?;
+    let row = client
+        .query_opt(
+            "SELECT merge_id::text
+               FROM oggit.merge_history
+              WHERE child_timeline_id = $1
+                AND parent_timeline_id = $2
+                AND child_to_lsn = $3
+                AND parent_to_lsn = $4
+                AND merge_direction = $5
+                AND status = 'applied'
+              ORDER BY finished_at DESC NULLS LAST
+              LIMIT 1",
+            &[
+                &child_timeline_id,
+                &parent_timeline_id,
+                &child_to_lsn,
+                &parent_to_lsn,
+                &direction.as_str(),
+            ],
+        )
+        .await
+        .context("failed to check applied oggit merge history")?;
+    Ok(row.map(|row| row.get::<_, String>(0)))
+}
+
+async fn oggit_find_latest_applied_merge_bounds(
+    client: &tokio_opengauss::Client,
+    source_meta_schema: &str,
+    source_timeline_id: &str,
+    target_timeline_id: &str,
+    child_timeline_id: &str,
+    parent_timeline_id: &str,
+    requested_child_to_lsn: &str,
+    requested_parent_to_lsn: &str,
+) -> Result<Option<OggitAppliedMergeBounds>> {
+    oggit_ensure_merge_history_direction_column(client).await?;
+    let mut rows = Vec::new();
+    for (meta_schema, schema_timeline_id) in [
+        ("oggit", target_timeline_id),
+        (source_meta_schema, source_timeline_id),
+    ] {
+        let relname = oggit_meta_table_name(client, meta_schema, "merge_history").await?;
+        let sql = format!(
+            "SELECT child_to_lsn, parent_to_lsn, merge_commit_lsn
+               FROM {}.{}
+              WHERE child_timeline_id = $1
+                AND parent_timeline_id = $2
+                AND status = 'applied'",
+            quote_sql_ident(meta_schema),
+            quote_sql_ident(&relname)
+        );
+        rows.extend(
+            client
+                .query(sql.as_str(), &[&child_timeline_id, &parent_timeline_id])
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to read applied oggit merge bounds from {meta_schema}.{relname}"
+                    )
+                })?
+                .into_iter()
+                .map(|row| (row, schema_timeline_id)),
+        );
+    }
+
+    let requested_child_to = oggit_lsn_value(requested_child_to_lsn);
+    let requested_parent_to = oggit_lsn_value(requested_parent_to_lsn);
+    let mut latest: Option<OggitAppliedMergeBounds> = None;
+    for (row, schema_timeline_id) in rows {
+        let child_to_lsn: String = row.get(0);
+        let parent_to_lsn: String = row.get(1);
+        let merge_commit_lsn: Option<String> = row.get(2);
+        let direction = if schema_timeline_id == child_timeline_id {
+            OggitMergeDirection::ParentToChild
+        } else if schema_timeline_id == parent_timeline_id {
+            OggitMergeDirection::ChildToParent
+        } else {
+            continue;
+        };
+        let child_from_lsn = if direction == OggitMergeDirection::ParentToChild {
+            merge_commit_lsn
+                .clone()
+                .unwrap_or_else(|| child_to_lsn.clone())
+        } else {
+            child_to_lsn.clone()
+        };
+        let parent_from_lsn = if direction == OggitMergeDirection::ChildToParent {
+            merge_commit_lsn.unwrap_or_else(|| parent_to_lsn.clone())
+        } else {
+            parent_to_lsn.clone()
+        };
+        let child_from = oggit_lsn_value(&child_from_lsn);
+        let parent_from = oggit_lsn_value(&parent_from_lsn);
+        if child_from > requested_child_to || parent_from > requested_parent_to {
+            continue;
+        }
+        let is_newer = latest
+            .as_ref()
+            .map(|current| {
+                (child_from, parent_from)
+                    > (
+                        oggit_lsn_value(&current.child_from_lsn),
+                        oggit_lsn_value(&current.parent_from_lsn),
+                    )
+            })
+            .unwrap_or(true);
+        if is_newer {
+            latest = Some(OggitAppliedMergeBounds {
+                child_from_lsn,
+                parent_from_lsn,
+            });
+        }
+    }
+
+    Ok(latest)
+}
