@@ -6,7 +6,7 @@
 //! rely on `neon_local` to set up the environment for each test.
 //!
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::exit;
@@ -28,6 +28,19 @@ use control_plane::local_env::{
     EndpointStorageConf, InitForceMode, LocalEnv, NeonBroker, NeonLocalInitConf,
     NeonLocalInitPageserverConf, SafekeeperConf,
 };
+use control_plane::merge_oggit::{OggitGcParentRequest, OggitGcParentResult, oggit_gc_parent};
+use control_plane::ops::endpoint::compute_mode_from_options;
+use control_plane::ops::tenant::{TenantCreateOptions, create_tenant};
+use control_plane::ops::timeline::{
+    TimelineBranchOptions, TimelineCreateOptions, branch_timeline, create_timeline,
+};
+use control_plane::ops::{
+    branch as branch_ops,
+    branch::{
+        BranchCommandOutput, BranchDiffOptions, BranchMergeOptions, BranchResolveOptions,
+        BranchTargetOptions,
+    },
+};
 use control_plane::pageserver::PageServerNode;
 use control_plane::safekeeper::SafekeeperNode;
 use control_plane::storage_controller::{
@@ -39,13 +52,9 @@ use pageserver_api::config::{
     DEFAULT_HTTP_LISTEN_PORT as DEFAULT_PAGESERVER_HTTP_PORT,
     DEFAULT_PG_LISTEN_PORT as DEFAULT_PAGESERVER_PG_PORT,
 };
-use pageserver_api::controller_api::{
-    NodeAvailabilityWrapper, PlacementPolicy, TenantCreateRequest,
-};
-use pageserver_api::models::{
-    ShardParameters, TenantConfigRequest, TenantWaitLsnRequest, TimelineCreateRequest, TimelineInfo,
-};
-use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, ShardCount, ShardStripeSize, TenantShardId};
+use pageserver_api::controller_api::{NodeAvailabilityWrapper, PlacementPolicy};
+use pageserver_api::models::{TenantConfigRequest, TenantWaitLsnRequest, TimelineInfo};
+use pageserver_api::shard::{DEFAULT_STRIPE_SIZE, TenantShardId};
 use postgres_backend::AuthType;
 use postgres_connection::parse_host_port;
 use safekeeper_api::membership::{SafekeeperGeneration, SafekeeperId};
@@ -56,25 +65,16 @@ use safekeeper_api::{
 use storage_broker::DEFAULT_LISTEN_ADDR as DEFAULT_BROKER_ADDR;
 use tokio::task::JoinSet;
 use tokio_opengauss::NoTls;
-use url::{Host, Url};
+use url::Host;
 use utils::auth::{Claims, Scope};
 use utils::id::{NodeId, TenantId, TenantTimelineId, TimelineId};
 use utils::lsn::Lsn;
 use utils::project_git_version;
 
-mod merge_oggit;
-use merge_oggit::{
-    oggit_abort_merge, oggit_continue_merge, oggit_diff_from_meta, oggit_finalize_merge_commit_lsn,
-    oggit_freeze_metadata_lsn, oggit_json_text, oggit_merge_from_meta, oggit_merge_status,
-    oggit_read_conflicts, oggit_resolve_conflict, oggit_resolve_conflict_sql,
-};
-
 // Default id of a safekeeper node, if not specified on the command line.
 const DEFAULT_SAFEKEEPER_ID: NodeId = NodeId(1);
 const DEFAULT_PAGESERVER_ID: NodeId = NodeId(1);
 const DEFAULT_BRANCH_NAME: &str = "main";
-const OGGIT_FDW_SCHEMA: &str = "oggit_fdw";
-const OGGIT_FDW_LOCK_NAME: &str = "neon_local:branch:oggit_fdw";
 project_git_version!(GIT_VERSION);
 
 #[allow(dead_code)]
@@ -116,6 +116,8 @@ enum NeonLocalCmd {
     Mappings(MappingsCmd),
     #[command(subcommand)]
     Branch(BranchCmd),
+    #[command(subcommand)]
+    Oggit(OggitCmd),
 
     Start(StartCmdArgs),
     Stop(StopCmdArgs),
@@ -255,6 +257,29 @@ enum TimelineCmd {
 }
 
 #[derive(clap::Subcommand)]
+#[clap(about = "Manage oggit metadata")]
+enum OggitCmd {
+    Gc(OggitGcCmdArgs),
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Garbage collect old oggit change_log/object_change rows on root parent timelines")]
+struct OggitGcCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(
+        long,
+        default_value_t = 16 * 1024 * 1024,
+        help = "LSN bytes retained on root parents without live direct children"
+    )]
+    retention_lsn_distance: u64,
+}
+
+#[derive(clap::Subcommand)]
 #[clap(about = "Diff and merge local Neon branches through running endpoints")]
 enum BranchCmd {
     Diff(BranchDiffCmdArgs),
@@ -319,11 +344,7 @@ struct BranchDiffCmdArgs {
     #[clap(long, default_value = "public", help = "Target schema to compare")]
     target_schema: String,
 
-    #[clap(
-        long,
-        default_value = "postgres",
-        help = "Database name on both endpoints"
-    )]
+    #[clap(long, help = "Database name on both endpoints")]
     database: String,
 
     #[clap(
@@ -359,17 +380,6 @@ pub(crate) enum BranchMergeStrategy {
     Ours,
     Theirs,
     Manual,
-}
-
-impl BranchMergeStrategy {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            BranchMergeStrategy::Fail => "fail",
-            BranchMergeStrategy::Ours => "ours",
-            BranchMergeStrategy::Theirs => "theirs",
-            BranchMergeStrategy::Manual => "manual",
-        }
-    }
 }
 
 #[derive(clap::Args)]
@@ -409,11 +419,7 @@ struct BranchMergeCmdArgs {
     #[clap(long, default_value = "public", help = "Target schema to merge into")]
     target_schema: String,
 
-    #[clap(
-        long,
-        default_value = "postgres",
-        help = "Database name on both endpoints"
-    )]
+    #[clap(long, help = "Database name on both endpoints")]
     database: String,
 
     #[clap(
@@ -475,7 +481,7 @@ struct BranchMergeStatusCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -503,7 +509,7 @@ struct BranchConflictsCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -515,16 +521,6 @@ enum BranchConflictResolution {
     Ours,
     Theirs,
     Skip,
-}
-
-impl BranchConflictResolution {
-    fn as_str(self) -> &'static str {
-        match self {
-            BranchConflictResolution::Ours => "ours",
-            BranchConflictResolution::Theirs => "theirs",
-            BranchConflictResolution::Skip => "skip",
-        }
-    }
 }
 
 #[derive(clap::Args)]
@@ -561,7 +557,7 @@ struct BranchResolveCmdArgs {
     )]
     custom_sql: Option<String>,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -589,7 +585,7 @@ struct BranchContinueCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -617,7 +613,7 @@ struct BranchAbortCmdArgs {
     #[clap(long, help = "Merge id returned by branch merge")]
     merge_id: String,
 
-    #[clap(long, default_value = "postgres", help = "Database name")]
+    #[clap(long, help = "Database name")]
     database: String,
 
     #[clap(long, default_value = "cloud_admin", help = "Database user")]
@@ -1084,6 +1080,19 @@ struct EndpointStartCmdArgs {
 
     #[clap(
         long,
+        help = "Enable the compute-side oggit logical decoding worker for this endpoint"
+    )]
+    enable_oggit: bool,
+
+    #[clap(
+        long,
+        requires = "enable_oggit",
+        help = "Database monitored by the oggit worker; defaults to the endpoint's previous selection or postgres"
+    )]
+    oggit_database: Option<String>,
+
+    #[clap(
+        long,
         help = "Run in development mode, skipping VM-specific operations like process termination",
         action = clap::ArgAction::SetTrue
     )]
@@ -1258,6 +1267,7 @@ fn main() -> Result<()> {
             NeonLocalCmd::Endpoint(subcmd) => rt.block_on(handle_endpoint(&subcmd, env)),
             NeonLocalCmd::Mappings(subcmd) => handle_mappings(&subcmd, env),
             NeonLocalCmd::Branch(subcmd) => rt.block_on(handle_branch(&subcmd, Some(env))),
+            NeonLocalCmd::Oggit(subcmd) => rt.block_on(handle_oggit(&subcmd, env)),
         };
 
         let subcommand_result = if &original_env != env {
@@ -1568,63 +1578,31 @@ async fn handle_tenant(subcmd: &TenantCmd, env: &mut local_env::LocalEnv) -> any
 
             let tenant_conf = PageServerNode::parse_config(tenant_conf)?;
 
-            // If tenant ID was not specified, generate one
-            let tenant_id = args.tenant_id.unwrap_or_else(TenantId::generate);
-
-            // We must register the tenant with the storage controller, so
-            // that when the pageserver restarts, it will be re-attached.
             let storage_controller = StorageController::from_env(env);
-            storage_controller
-                .tenant_create(TenantCreateRequest {
-                    // Note that ::unsharded here isn't actually because the tenant is unsharded, its because the
-                    // storage controller expects a shard-naive tenant_id in this attribute, and the TenantCreateRequest
-                    // type is used both in the storage controller (for creating tenants) and in the pageserver (for
-                    // creating shards)
-                    new_tenant_id: TenantShardId::unsharded(tenant_id),
-                    generation: None,
-                    shard_parameters: ShardParameters {
-                        count: ShardCount::new(args.shard_count),
-                        stripe_size: args
-                            .shard_stripe_size
-                            .map(ShardStripeSize)
-                            .unwrap_or(DEFAULT_STRIPE_SIZE),
-                    },
+            let output = create_tenant(
+                &storage_controller,
+                env,
+                TenantCreateOptions {
+                    tenant_id: args.tenant_id,
+                    timeline_id: args.timeline_id,
+                    branch_name: DEFAULT_BRANCH_NAME.to_string(),
+                    set_default: args.set_default,
+                    pg_version: args.pg_version,
+                    shard_count: args.shard_count,
+                    shard_stripe_size: args.shard_stripe_size,
                     placement_policy: args.placement_policy.clone(),
                     config: tenant_conf,
-                })
-                .await?;
+                },
+            )
+            .await?;
+            let tenant_id = output.tenant_id;
+            let new_timeline_id = output.timeline_id;
             println!("tenant {tenant_id} successfully created on the pageserver");
-
-            // Create an initial timeline for the new tenant
-            let new_timeline_id = args.timeline_id.unwrap_or(TimelineId::generate());
-
-            // FIXME: passing None for ancestor_start_lsn is not kosher in a sharded world: we can't have
-            // different shards picking different start lsns.  Maybe we have to teach storage controller
-            // to let shard 0 branch first and then propagate the chosen LSN to other shards.
-            storage_controller
-                .tenant_timeline_create(
-                    tenant_id,
-                    TimelineCreateRequest {
-                        new_timeline_id,
-                        mode: pageserver_api::models::TimelineCreateRequestMode::Bootstrap {
-                            existing_initdb_timeline_id: None,
-                            pg_version: Some(args.pg_version),
-                        },
-                    },
-                )
-                .await?;
-
-            env.register_branch_mapping(
-                DEFAULT_BRANCH_NAME.to_string(),
-                tenant_id,
-                new_timeline_id,
-            )?;
 
             println!("Created an initial timeline '{new_timeline_id}' for tenant: {tenant_id}",);
 
             if args.set_default {
                 println!("Setting tenant {tenant_id} as a default one");
-                env.default_tenant_id = Some(tenant_id);
             }
         }
         TenantCmd::SetDefault(args) => {
@@ -1663,28 +1641,24 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
         }
         TimelineCmd::Create(args) => {
             let tenant_id = get_tenant_id(args.tenant_id, env)?;
-            let new_branch_name = &args.branch_name;
-            let new_timeline_id_opt = args.timeline_id;
-            let new_timeline_id = new_timeline_id_opt.unwrap_or(TimelineId::generate());
-
             let storage_controller = StorageController::from_env(env);
-            let create_req = TimelineCreateRequest {
-                new_timeline_id,
-                mode: pageserver_api::models::TimelineCreateRequestMode::Bootstrap {
-                    existing_initdb_timeline_id: None,
-                    pg_version: Some(args.pg_version),
+            let output = create_timeline(
+                &storage_controller,
+                env,
+                TimelineCreateOptions {
+                    tenant_id,
+                    timeline_id: args.timeline_id,
+                    branch_name: args.branch_name.clone(),
+                    pg_version: args.pg_version,
                 },
-            };
-            let timeline_info = storage_controller
-                .tenant_timeline_create(tenant_id, create_req)
-                .await?;
+            )
+            .await?;
 
-            let last_record_lsn = timeline_info.last_record_lsn;
-            env.register_branch_mapping(new_branch_name.to_string(), tenant_id, new_timeline_id)?;
+            let last_record_lsn = output.timeline_info.last_record_lsn;
 
             println!(
                 "Created timeline '{}' at Lsn {last_record_lsn} for tenant: {tenant_id}",
-                timeline_info.timeline_id
+                output.timeline_info.timeline_id
             );
         }
         // TODO: rename to import-basebackup-plus-wal
@@ -1880,26 +1854,22 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                 endpoint_lsn
             };
 
-            let create_req = TimelineCreateRequest {
-                new_timeline_id,
-                mode: pageserver_api::models::TimelineCreateRequestMode::Branch {
+            let output = branch_timeline(
+                &storage_controller,
+                env,
+                TimelineBranchOptions {
+                    tenant_id,
+                    timeline_id: Some(new_timeline_id),
+                    branch_name: new_branch_name.to_string(),
                     ancestor_timeline_id,
                     ancestor_start_lsn: start_lsn,
-                    read_only: false,
-                    pg_version: None,
                 },
-            };
-            let timeline_info = storage_controller
-                .tenant_timeline_create(tenant_id, create_req)
-                .await?;
-
-            let last_record_lsn = timeline_info.last_record_lsn;
-
-            env.register_branch_mapping(new_branch_name.to_string(), tenant_id, new_timeline_id)?;
+            )
+            .await?;
 
             println!(
-                "Created timeline '{}' at Lsn {last_record_lsn} for tenant: {tenant_id}. Ancestor timeline: '{ancestor_branch_name}'",
-                timeline_info.timeline_id
+                "Created timeline '{}' at Lsn {} for tenant: {tenant_id}. Ancestor timeline: '{ancestor_branch_name}'",
+                output.timeline_info.timeline_id, output.timeline_info.last_record_lsn
             );
         }
     }
@@ -1970,124 +1940,7 @@ fn resolve_branch_endpoint(
     Ok(matches.remove(0))
 }
 
-struct BranchEndpointRef {
-    endpoint_id: String,
-    branch_name: String,
-    connstr: String,
-    fdw_host: String,
-    fdw_port: u16,
-    user: String,
-    password: Option<String>,
-    database: String,
-}
-
-impl BranchEndpointRef {
-    fn from_local(
-        endpoint_id: String,
-        endpoint: Arc<Endpoint>,
-        branch_name: String,
-        user: &str,
-        database: &str,
-    ) -> Self {
-        Self {
-            endpoint_id,
-            branch_name,
-            connstr: endpoint.connstr(user, database),
-            fdw_host: endpoint.pg_address.ip().to_string(),
-            fdw_port: endpoint.pg_address.port(),
-            user: user.to_string(),
-            password: None,
-            database: database.to_string(),
-        }
-    }
-
-    fn from_connstr(
-        connstr: &str,
-        branch_name: Option<&String>,
-        fallback_name: &str,
-        fallback_user: &str,
-        fallback_database: &str,
-    ) -> Result<Self> {
-        let (fdw_host, fdw_port, user, password, database) =
-            parse_external_connstr(connstr, fallback_user, fallback_database)?;
-        let branch_name = branch_name
-            .cloned()
-            .unwrap_or_else(|| fallback_name.to_string());
-
-        Ok(Self {
-            endpoint_id: connstr.to_string(),
-            branch_name,
-            connstr: connstr.to_string(),
-            fdw_host,
-            fdw_port,
-            user,
-            password,
-            database,
-        })
-    }
-}
-
-fn parse_external_connstr(
-    connstr: &str,
-    fallback_user: &str,
-    fallback_database: &str,
-) -> Result<(String, u16, String, Option<String>, String)> {
-    if connstr.starts_with("postgresql://") || connstr.starts_with("postgres://") {
-        let url = Url::parse(connstr).context("invalid endpoint connection string")?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow!("endpoint connection string must include host"))?
-            .to_string();
-        let port = url.port().unwrap_or(5432);
-        let user = if url.username().is_empty() {
-            fallback_user.to_string()
-        } else {
-            url.username().to_string()
-        };
-        let password = url
-            .password()
-            .map(urlencoding::decode)
-            .transpose()
-            .context("invalid percent-encoding in endpoint password")?
-            .map(Cow::into_owned);
-        let database = url.path().trim_start_matches('/');
-        let database = if database.is_empty() {
-            fallback_database.to_string()
-        } else {
-            database.to_string()
-        };
-        return Ok((host, port, user, password, database));
-    }
-
-    let mut host = None;
-    let mut port = None;
-    let mut user = None;
-    let mut password = None;
-    let mut database = None;
-    for part in connstr.split_whitespace() {
-        let Some((key, value)) = part.split_once('=') else {
-            continue;
-        };
-        let value = value.trim_matches('\'').trim_matches('"');
-        match key {
-            "host" => host = Some(value.to_string()),
-            "port" => port = Some(value.parse::<u16>().context("invalid connstr port")?),
-            "user" => user = Some(value.to_string()),
-            "password" => password = Some(value.to_string()),
-            "dbname" | "database" => database = Some(value.to_string()),
-            _ => {}
-        }
-    }
-
-    let host = host.ok_or_else(|| anyhow!("endpoint connection string must include host"))?;
-    Ok((
-        host,
-        port.unwrap_or(5432),
-        user.unwrap_or_else(|| fallback_user.to_string()),
-        password,
-        database.unwrap_or_else(|| fallback_database.to_string()),
-    ))
-}
+type BranchEndpointRef = branch_ops::BranchEndpointRef;
 
 fn require_branch_env<'a>(env: Option<&'a local_env::LocalEnv>) -> Result<&'a local_env::LocalEnv> {
     env.context("local branch endpoint mode requires an initialized NEON_REPO_DIR; use --source-connstr/--target-connstr for Docker endpoints")
@@ -2148,221 +2001,6 @@ fn resolve_branch_endpoint_ref(
     ))
 }
 
-async fn connect_to_branch_endpoint(
-    endpoint: &BranchEndpointRef,
-) -> Result<tokio_opengauss::Client> {
-    let (client, connection) = tokio_opengauss::connect(&endpoint.connstr, NoTls)
-        .await
-        .with_context(|| format!("failed to connect to endpoint at {}", endpoint.connstr))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
-    Ok(client)
-}
-
-async fn current_endpoint_lsn(client: &tokio_opengauss::Client) -> Result<String> {
-    let row = client
-        .query_one("SELECT pg_current_xlog_location()::text", &[])
-        .await
-        .context("failed to read endpoint current LSN")?;
-    Ok(row.get(0))
-}
-
-async fn lock_branch_fdw_workspace(client: &tokio_opengauss::Client) -> Result<()> {
-    client
-        .query_one(
-            "SELECT pg_advisory_lock(hashtext(current_database()), hashtext($1::text))",
-            &[&OGGIT_FDW_LOCK_NAME],
-        )
-        .await
-        .context("failed to lock the oggit FDW workspace")?;
-    Ok(())
-}
-
-struct SourceColumn {
-    name: String,
-    data_type: String,
-    not_null: bool,
-    default_expr: Option<String>,
-}
-
-struct SourceConstraint {
-    name: String,
-    definition: String,
-}
-
-struct SourceIndex {
-    definition: String,
-}
-
-fn quote_sql_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
-fn quote_sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-async fn import_branch_source_foreign_tables(
-    target_client: &mut tokio_opengauss::Client,
-    source_endpoint: &BranchEndpointRef,
-    source_schema: &str,
-    fdw_schema: &str,
-    fdw_server: &str,
-) -> Result<()> {
-    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
-    let rows = source_client
-        .query(
-            "SELECT c.relname::text,
-                    a.attname::text,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
-                    a.attnotnull
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN pg_attribute a ON a.attrelid = c.oid
-             WHERE n.nspname = $1
-               AND c.relkind = 'r'
-               AND a.attnum > 0
-               AND NOT a.attisdropped
-             ORDER BY c.relname, a.attnum",
-            &[&source_schema],
-        )
-        .await
-        .with_context(|| format!("failed to read source schema {source_schema} metadata"))?;
-
-    let mut tables: BTreeMap<String, Vec<SourceColumn>> = BTreeMap::new();
-    for row in rows {
-        let table_name: String = row.get(0);
-        tables.entry(table_name).or_default().push(SourceColumn {
-            name: row.get(1),
-            data_type: row.get(2),
-            not_null: row.get(3),
-            default_expr: None,
-        });
-    }
-
-    for (table_name, columns) in tables {
-        let column_defs = columns
-            .iter()
-            .map(|column| {
-                let not_null = if column.not_null { " NOT NULL" } else { "" };
-                format!(
-                    "{} {}{}",
-                    quote_sql_ident(&column.name),
-                    column.data_type,
-                    not_null
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let create_sql = format!(
-            "CREATE FOREIGN TABLE {}.{} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
-            quote_sql_ident(fdw_schema),
-            quote_sql_ident(&table_name),
-            column_defs,
-            quote_sql_ident(fdw_server),
-            quote_sql_literal(source_schema),
-            quote_sql_literal(&table_name)
-        );
-
-        target_client
-            .batch_execute(&create_sql)
-            .await
-            .with_context(|| format!("failed to create foreign table {fdw_schema}.{table_name}"))?;
-    }
-
-    Ok(())
-}
-
-async fn import_source_oggit_foreign_tables(
-    target_client: &mut tokio_opengauss::Client,
-    fdw_schema: &str,
-    fdw_server: &str,
-) -> Result<()> {
-    let table_defs = [
-        (
-            "oggit_state",
-            "state",
-            "id boolean,
-             tenant_id text,
-             timeline_id text,
-             ancestor_timeline_id text,
-             branch_start_lsn text,
-             slot_name text,
-             required_lsn text,
-             decode_lsn text,
-             scanned_lsn text,
-             confirmed_lsn text,
-             status text,
-             last_error text,
-             updated_at timestamptz",
-        ),
-        (
-            "oggit_change_log",
-            "change_log",
-            "id bigint,
-			 commit_lsn text,
-			 record_lsn text,
-			 xid text,
-			 merge_id uuid,
-			 ordinal integer,
-			 op text,
-             schema_name text,
-             table_name text,
-             relid oid,
-             identity_kind text,
-             key_json jsonb,
-             old_row jsonb,
-             new_row jsonb,
-             changed_cols text[],
-             unsupported_reason text,
-             created_at timestamptz",
-        ),
-        (
-            "oggit_object_change",
-            "object_change",
-            "id bigint,
-			 commit_lsn text,
-			 merge_id uuid,
-			 ordinal integer,
-             object_type text,
-             schema_name text,
-             object_name text,
-             action text,
-             change_json jsonb,
-             safety_class text,
-             unsupported_reason text,
-             created_at timestamptz",
-        ),
-    ];
-
-    for (foreign_name, remote_name, columns) in table_defs {
-        let create_sql = format!(
-            "CREATE FOREIGN TABLE {}.{} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
-            quote_sql_ident(fdw_schema),
-            quote_sql_ident(foreign_name),
-            columns,
-            quote_sql_ident(fdw_server),
-            quote_sql_literal("oggit"),
-            quote_sql_literal(remote_name)
-        );
-
-        target_client
-            .batch_execute(&create_sql)
-            .await
-            .with_context(|| {
-                format!("failed to create foreign table {fdw_schema}.{foreign_name}")
-            })?;
-    }
-
-    Ok(())
-}
-
 /// Build the compute-side oggit worker configuration for a Primary openGauss
 /// endpoint. Returns None for non-Primary endpoints or when gaussdb is not the
 /// backing binary. Inference of branch_start_lsn / ancestor_timeline_id mirrors
@@ -2371,6 +2009,7 @@ async fn build_oggit_endpoint_config(
     env: &local_env::LocalEnv,
     endpoint: &Endpoint,
     safekeepers: &[NodeId],
+    database: &str,
 ) -> Option<control_plane::endpoint::OggitEndpointConfig> {
     if !matches!(endpoint.mode, ComputeMode::Primary) {
         return None;
@@ -2423,610 +2062,37 @@ async fn build_oggit_endpoint_config(
         timeline_id: timeline_id.to_string(),
         ancestor_timeline_id,
         branch_start_lsn,
-        slot_name: "neon_oggit_slot".to_string(),
-        database: "postgres".to_string(),
+        database: database.to_string(),
         safekeeper_http_urls,
     })
 }
 
-async fn read_database_compatibility(client: &tokio_opengauss::Client) -> Result<String> {
-    let row = client
-        .query_one(
-            "SELECT datcompatibility::text
-             FROM pg_database
-             WHERE datname = current_database()",
-            &[],
-        )
-        .await
-        .context("failed to read database compatibility")?;
-    Ok(row.get(0))
-}
-
-async fn ensure_branch_database_compatibility(
-    target_client: &tokio_opengauss::Client,
-    source_endpoint: &BranchEndpointRef,
-) -> Result<()> {
-    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
-    let source_compatibility = read_database_compatibility(&source_client)
-        .await
-        .context("failed to read source database compatibility")?;
-    let target_compatibility = read_database_compatibility(target_client)
-        .await
-        .context("failed to read target database compatibility")?;
-
-    if source_compatibility != target_compatibility {
-        bail!(
-            "database compatibility mismatch: source database {} is {}, target database is {}",
-            source_endpoint.database,
-            source_compatibility,
-            target_compatibility,
-        );
+fn branch_output_print(output: BranchCommandOutput) {
+    for line in output.lines {
+        println!("{line}");
     }
-
-    Ok(())
 }
 
-async fn list_schema_tables(
-    client: &tokio_opengauss::Client,
-    schema: &str,
-) -> Result<BTreeSet<String>> {
-    let rows = client
-        .query(
-            "SELECT c.relname::text
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = $1
-               AND c.relkind = 'r'
-             ORDER BY c.relname",
-            &[&schema],
-        )
-        .await
-        .with_context(|| format!("failed to list tables in schema {schema}"))?;
-
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
-}
-
-async fn load_source_columns(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    table_name: &str,
-) -> Result<Vec<SourceColumn>> {
-    let rows = source_client
-        .query(
-            "SELECT a.attname::text,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
-                    a.attnotnull,
-                    pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN pg_attribute a ON a.attrelid = c.oid
-             LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
-             WHERE n.nspname = $1
-               AND c.relname = $2
-               AND c.relkind = 'r'
-               AND a.attnum > 0
-               AND NOT a.attisdropped
-             ORDER BY a.attnum",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| format!("failed to read columns for {source_schema}.{table_name}"))?;
-
-    if rows.is_empty() {
-        bail!("source table {source_schema}.{table_name} does not exist or has no columns");
+fn local_branch_strategy(strategy: BranchMergeStrategy) -> control_plane::BranchMergeStrategy {
+    match strategy {
+        BranchMergeStrategy::Fail => control_plane::BranchMergeStrategy::Fail,
+        BranchMergeStrategy::Ours => control_plane::BranchMergeStrategy::Ours,
+        BranchMergeStrategy::Theirs => control_plane::BranchMergeStrategy::Theirs,
+        BranchMergeStrategy::Manual => control_plane::BranchMergeStrategy::Manual,
     }
-
-    Ok(rows
-        .into_iter()
-        .map(|row| SourceColumn {
-            name: row.get(0),
-            data_type: row.get(1),
-            not_null: row.get(2),
-            default_expr: row.get(3),
-        })
-        .collect())
 }
 
-async fn load_source_constraints(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    table_name: &str,
-) -> Result<Vec<SourceConstraint>> {
-    let rows = source_client
-        .query(
-            "SELECT con.conname::text,
-                    pg_catalog.pg_get_constraintdef(con.oid, true)::text
-             FROM pg_constraint con
-             JOIN pg_class c ON c.oid = con.conrelid
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = $1
-               AND c.relname = $2
-               AND con.contype IN ('p', 'u', 'c')
-             ORDER BY CASE con.contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 ELSE 2 END,
-                      con.conname",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| format!("failed to read constraints for {source_schema}.{table_name}"))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| SourceConstraint {
-            name: row.get(0),
-            definition: row.get(1),
-        })
-        .collect())
-}
-
-async fn reject_unsupported_source_schema_objects(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-) -> Result<()> {
-    let rows = source_client
-        .query(
-            "SELECT object_name, feature
-             FROM (
-                 SELECT c.relname::text AS object_name,
-                        CASE c.relkind
-                            WHEN 'v' THEN 'views'
-                            WHEN 'm' THEN 'materialized views'
-                            WHEN 'S' THEN 'sequences'
-                            WHEN 'f' THEN 'foreign tables'
-                            ELSE 'non-regular relations'
-                        END AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relkind IN ('v', 'm', 'S', 'f')
-
-                 UNION ALL
-
-                 SELECT p.proname::text AS object_name,
-                        'functions or procedures'::text AS feature
-                 FROM pg_proc p
-                 JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname = $1
-             ) unsupported
-             ORDER BY feature, object_name",
-            &[&source_schema],
-        )
-        .await
-        .with_context(|| {
-            format!("failed to inspect unsupported objects in schema {source_schema}")
-        })?;
-
-    let objects = rows
-        .into_iter()
-        .map(|row| {
-            let object_name: String = row.get(0);
-            let feature: String = row.get(1);
-            format!("{object_name} ({feature})")
-        })
-        .collect::<Vec<_>>();
-
-    if !objects.is_empty() {
-        bail!(
-            "source schema {source_schema} contains unsupported objects: {}",
-            objects.join(", ")
-        );
+fn local_conflict_resolution(
+    resolution: BranchConflictResolution,
+) -> branch_ops::BranchConflictResolution {
+    match resolution {
+        BranchConflictResolution::Ours => branch_ops::BranchConflictResolution::Ours,
+        BranchConflictResolution::Theirs => branch_ops::BranchConflictResolution::Theirs,
+        BranchConflictResolution::Skip => branch_ops::BranchConflictResolution::Skip,
     }
-
-    Ok(())
 }
 
-async fn reject_unsupported_source_table_features(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    table_name: &str,
-) -> Result<()> {
-    let rows = source_client
-        .query(
-            "SELECT feature
-             FROM (
-                 SELECT 'foreign key constraints'::text AS feature
-                 FROM pg_constraint con
-                 JOIN pg_class c ON c.oid = con.conrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND con.contype = 'f'
-
-                 UNION ALL
-
-                 SELECT 'sequence or auto-increment defaults'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_attribute a ON a.attrelid = c.oid
-                 JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND c.relkind = 'r'
-                   AND pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%'
-
-                 UNION ALL
-
-                 SELECT 'table or column comments'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND (
-                       pg_catalog.obj_description(c.oid, 'pg_class') IS NOT NULL
-                       OR EXISTS (
-                           SELECT 1
-                           FROM pg_attribute a
-                           WHERE a.attrelid = c.oid
-                             AND a.attnum > 0
-                             AND NOT a.attisdropped
-                             AND pg_catalog.col_description(c.oid, a.attnum) IS NOT NULL
-                       )
-                   )
-
-                 UNION ALL
-
-                 SELECT 'owner or explicit privileges'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND (
-                       pg_catalog.pg_get_userbyid(c.relowner) <> current_user
-                       OR c.relacl IS NOT NULL
-                   )
-
-                 UNION ALL
-
-                 SELECT 'partitioned tables'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND EXISTS (
-                       SELECT 1
-                       FROM pg_partition p
-                       WHERE p.parentid = c.oid
-                          OR p.oid = c.oid
-                   )
-
-                 UNION ALL
-
-                 SELECT 'triggers'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_trigger t ON t.tgrelid = c.oid
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND NOT t.tgisinternal
-
-                 UNION ALL
-
-                 SELECT 'tablespace settings'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND c.reltablespace <> 0
-
-                 UNION ALL
-
-                 SELECT 'storage parameters'::text AS feature
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1
-                   AND c.relname = $2
-                   AND EXISTS (
-                       SELECT 1
-                       FROM unnest(c.reloptions) AS opt
-                       WHERE opt NOT IN ('orientation=row', 'compression=no')
-                         AND opt NOT LIKE 'collate=%'
-                   )
-             ) unsupported
-             ORDER BY feature",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| {
-            format!("failed to inspect unsupported features for {source_schema}.{table_name}")
-        })?;
-
-    let features = rows
-        .into_iter()
-        .map(|row| row.get::<_, String>(0))
-        .collect::<Vec<_>>();
-    if !features.is_empty() {
-        bail!(
-            "source-only table {source_schema}.{table_name} uses unsupported features: {}",
-            features.join(", ")
-        );
-    }
-
-    Ok(())
-}
-
-fn retarget_index_definition(
-    indexdef: &str,
-    target_schema: &str,
-    table_name: &str,
-) -> Result<String> {
-    let on_pos = indexdef
-        .find(" ON ")
-        .ok_or_else(|| anyhow!("could not parse index definition: {indexdef}"))?;
-    let rel_start = on_pos + " ON ".len();
-    let tail = &indexdef[rel_start..];
-    let rel_end = tail
-        .find(" USING ")
-        .or_else(|| tail.find(" ("))
-        .ok_or_else(|| anyhow!("could not parse index relation in definition: {indexdef}"))?;
-    let target_relation = format!(
-        "{}.{}",
-        quote_sql_ident(target_schema),
-        quote_sql_ident(table_name)
-    );
-
-    Ok(format!(
-        "{}{}{}",
-        &indexdef[..rel_start],
-        target_relation,
-        &tail[rel_end..]
-    ))
-}
-
-async fn load_source_indexes(
-    source_client: &tokio_opengauss::Client,
-    source_schema: &str,
-    target_schema: &str,
-    table_name: &str,
-) -> Result<Vec<SourceIndex>> {
-    let rows = source_client
-        .query(
-            "SELECT pg_catalog.pg_get_indexdef(i.indexrelid)::text
-             FROM pg_index i
-             JOIN pg_class t ON t.oid = i.indrelid
-             JOIN pg_namespace n ON n.oid = t.relnamespace
-             WHERE n.nspname = $1
-               AND t.relname = $2
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM pg_constraint con
-                   WHERE con.conindid = i.indexrelid
-               )
-             ORDER BY i.indexrelid::text",
-            &[&source_schema, &table_name],
-        )
-        .await
-        .with_context(|| format!("failed to read indexes for {source_schema}.{table_name}"))?;
-
-    rows.into_iter()
-        .map(|row| {
-            let definition: String = row.get(0);
-            Ok(SourceIndex {
-                definition: retarget_index_definition(&definition, target_schema, table_name)?,
-            })
-        })
-        .collect()
-}
-
-async fn copy_source_only_tables_with_schema(
-    target_client: &mut tokio_opengauss::Client,
-    source_endpoint: &BranchEndpointRef,
-    source_schema: &str,
-    target_schema: &str,
-    fdw_schema: &str,
-    copy_source_only_tables: bool,
-) -> Result<(Vec<(String, i64)>, Vec<String>)> {
-    let source_client = connect_to_branch_endpoint(source_endpoint).await?;
-    reject_unsupported_source_schema_objects(&source_client, source_schema).await?;
-
-    target_client
-        .batch_execute(&format!(
-            "CREATE SCHEMA IF NOT EXISTS {}",
-            quote_sql_ident(target_schema)
-        ))
-        .await
-        .with_context(|| format!("failed to create target schema {target_schema}"))?;
-
-    let source_tables = list_schema_tables(&source_client, source_schema).await?;
-    let target_tables = list_schema_tables(target_client, target_schema).await?;
-    let source_only_tables = source_tables
-        .difference(&target_tables)
-        .cloned()
-        .collect::<Vec<_>>();
-    let common_tables = source_tables
-        .intersection(&target_tables)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if !copy_source_only_tables && !source_only_tables.is_empty() {
-        bail!(
-            "target table {}.{} does not exist",
-            target_schema,
-            source_only_tables[0]
-        );
-    }
-
-    let mut copied_tables = Vec::new();
-    for table_name in source_only_tables {
-        reject_unsupported_source_table_features(&source_client, source_schema, &table_name)
-            .await?;
-        let columns = load_source_columns(&source_client, source_schema, &table_name).await?;
-        let constraints =
-            load_source_constraints(&source_client, source_schema, &table_name).await?;
-        let indexes =
-            load_source_indexes(&source_client, source_schema, target_schema, &table_name).await?;
-
-        let column_defs = columns
-            .iter()
-            .map(|column| {
-                let default_expr = column
-                    .default_expr
-                    .as_ref()
-                    .map(|expr| format!(" DEFAULT {expr}"))
-                    .unwrap_or_default();
-                let not_null = if column.not_null { " NOT NULL" } else { "" };
-                format!(
-                    "{} {}{}{}",
-                    quote_sql_ident(&column.name),
-                    column.data_type,
-                    default_expr,
-                    not_null
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let create_table_sql = format!(
-            "CREATE TABLE {}.{} ({})",
-            quote_sql_ident(target_schema),
-            quote_sql_ident(&table_name),
-            column_defs
-        );
-        target_client
-            .batch_execute(&create_table_sql)
-            .await
-            .with_context(|| {
-                format!("failed to create target table {target_schema}.{table_name}")
-            })?;
-
-        for constraint in constraints {
-            let add_constraint_sql = format!(
-                "ALTER TABLE {}.{} ADD CONSTRAINT {} {}",
-                quote_sql_ident(target_schema),
-                quote_sql_ident(&table_name),
-                quote_sql_ident(&constraint.name),
-                constraint.definition
-            );
-            target_client
-                .batch_execute(&add_constraint_sql)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to add constraint {} on {target_schema}.{table_name}",
-                        constraint.name
-                    )
-                })?;
-        }
-
-        for index in indexes {
-            target_client
-                .batch_execute(&index.definition)
-                .await
-                .with_context(|| {
-                    format!("failed to create index on {target_schema}.{table_name}")
-                })?;
-        }
-
-        let column_list = columns
-            .iter()
-            .map(|column| quote_sql_ident(&column.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let copy_sql = format!(
-            "INSERT INTO {}.{} ({}) SELECT {} FROM {}.{}",
-            quote_sql_ident(target_schema),
-            quote_sql_ident(&table_name),
-            column_list,
-            column_list,
-            quote_sql_ident(fdw_schema),
-            quote_sql_ident(&table_name)
-        );
-        let copied_count = target_client
-            .execute(copy_sql.as_str(), &[])
-            .await
-            .with_context(|| format!("failed to copy rows into {target_schema}.{table_name}"))?;
-        copied_tables.push((table_name, copied_count as i64));
-    }
-
-    Ok((copied_tables, common_tables))
-}
-
-fn name_array_literal(names: &[String]) -> String {
-    let values = names
-        .iter()
-        .map(|name| quote_sql_literal(name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("ARRAY[{values}]::name[]")
-}
-
-async fn prepare_branch_source_fdw(
-    client: &mut tokio_opengauss::Client,
-    args_source_schema: &str,
-    fdw_schema: &str,
-    fdw_server: &str,
-    source_endpoint: &BranchEndpointRef,
-) -> Result<()> {
-    client
-        .batch_execute("CREATE EXTENSION IF NOT EXISTS neon")
-        .await
-        .context("failed to create neon extension on target endpoint")?;
-
-    let source_port = i32::from(source_endpoint.fdw_port);
-
-    let user_mapping_options = match &source_endpoint.password {
-        Some(password) => format!(
-            "user {}, password {}",
-            quote_sql_literal(&source_endpoint.user),
-            quote_sql_literal(password)
-        ),
-        None => format!("user {}", quote_sql_literal(&source_endpoint.user)),
-    };
-
-    let prepare_sql = format!(
-        "DROP SERVER IF EXISTS {} CASCADE;
-         DROP SCHEMA IF EXISTS {} CASCADE;
-         CREATE SCHEMA {};
-         CREATE SERVER {} FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host {}, port {}, dbname {});
-         CREATE USER MAPPING FOR CURRENT_USER SERVER {} OPTIONS ({});",
-        quote_sql_ident(fdw_server),
-        quote_sql_ident(fdw_schema),
-        quote_sql_ident(fdw_schema),
-        quote_sql_ident(fdw_server),
-        quote_sql_literal(&source_endpoint.fdw_host),
-        quote_sql_literal(&source_port.to_string()),
-        quote_sql_literal(&source_endpoint.database),
-        quote_sql_ident(fdw_server),
-        user_mapping_options,
-    );
-
-    client
-        .batch_execute(&prepare_sql)
-        .await
-        .context("failed to prepare postgres_fdw source schema")?;
-
-    import_branch_source_foreign_tables(
-        client,
-        source_endpoint,
-        args_source_schema,
-        fdw_schema,
-        fdw_server,
-    )
-    .await
-    .context("failed to create source foreign tables")?;
-
-    Ok(())
-}
-
-async fn cleanup_branch_source_fdw(
-    client: &mut tokio_opengauss::Client,
-    fdw_schema: &str,
-    fdw_server: &str,
-) -> Result<()> {
-    let cleanup_sql = format!(
-        "DROP SERVER IF EXISTS {} CASCADE;
-         DROP SCHEMA IF EXISTS {} CASCADE",
-        quote_sql_ident(fdw_server),
-        quote_sql_ident(fdw_schema),
-    );
-
-    client
-        .batch_execute(&cleanup_sql)
-        .await
-        .context("failed to clean up postgres_fdw source schema")?;
-
-    Ok(())
-}
-
-async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) -> Result<()> {
+async fn handle_branch_ops(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) -> Result<()> {
     match subcmd {
         BranchCmd::Diff(args) => {
             let needs_local = args.source_connstr.is_none() || args.target_connstr.is_none();
@@ -3064,117 +2130,18 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            println!(
-                "Diffing source branch '{}' ({}) against target branch '{}' ({})",
-                source_endpoint.branch_name,
-                source_endpoint.endpoint_id,
-                target_endpoint.branch_name,
-                target_endpoint.endpoint_id
+            branch_output_print(
+                branch_ops::diff_branch(BranchDiffOptions {
+                    source_endpoint,
+                    target_endpoint,
+                    source_schema: args.source_schema.clone(),
+                    target_schema: args.target_schema.clone(),
+                    fdw_server: args.fdw_server.clone(),
+                    keep_fdw: args.keep_fdw,
+                    incremental_oggit: args.incremental_oggit,
+                })
+                .await?,
             );
-
-            let mut client = connect_to_branch_endpoint(&target_endpoint).await?;
-            lock_branch_fdw_workspace(&client).await?;
-            let parent_command_lsn = if args.incremental_oggit {
-                Some(current_endpoint_lsn(&client).await?)
-            } else {
-                None
-            };
-            let child_command_lsn = if args.incremental_oggit {
-                let source_client = connect_to_branch_endpoint(&source_endpoint).await?;
-                Some(current_endpoint_lsn(&source_client).await?)
-            } else {
-                None
-            };
-            ensure_branch_database_compatibility(&client, &source_endpoint).await?;
-            prepare_branch_source_fdw(
-                &mut client,
-                &args.source_schema,
-                &OGGIT_FDW_SCHEMA,
-                &args.fdw_server,
-                &source_endpoint,
-            )
-            .await?;
-
-            if args.incremental_oggit {
-                import_source_oggit_foreign_tables(
-                    &mut client,
-                    &OGGIT_FDW_SCHEMA,
-                    &args.fdw_server,
-                )
-                .await?;
-                let diff_result = oggit_diff_from_meta(
-                    &client,
-                    &OGGIT_FDW_SCHEMA,
-                    None,
-                    None,
-                    child_command_lsn.as_deref(),
-                    parent_command_lsn.as_deref(),
-                )
-                .await
-                .context("branch diff failed")?;
-
-                if !args.keep_fdw {
-                    if let Err(e) =
-                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
-                            .await
-                    {
-                        eprintln!("Warning: {e:#}");
-                    }
-                }
-
-                println!(
-                    "oggit.diff\tbase_lsn={}\tchild_to_lsn={}\tparent_to_lsn={}",
-                    diff_result.base_lsn, diff_result.child_to_lsn, diff_result.parent_to_lsn
-                );
-
-                for row in diff_result.rows {
-                    println!(
-                        "{}\t{}.{}\t{}\tkey={}\tours={}\ttheirs={}\t{}",
-                        row.diff_scope,
-                        row.schema_name,
-                        row.table_name,
-                        row.diff_type,
-                        oggit_json_text(&row.key_json),
-                        oggit_json_text(&row.ours_json),
-                        oggit_json_text(&row.theirs_json),
-                        row.detail.unwrap_or_default()
-                    );
-                }
-            } else {
-                let diff_result = client
-                    .query(
-                        "SELECT 'row'::text, schema_name, table_name, diff_type,
-                                COALESCE(row_data, ''), ''::text, ''::text, ''::text
-                           FROM neon_branch_diff($1::name, $2::name, NULL::name[])",
-                        &[&OGGIT_FDW_SCHEMA, &args.target_schema],
-                    )
-                    .await;
-
-                if !args.keep_fdw {
-                    if let Err(e) =
-                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
-                            .await
-                    {
-                        eprintln!("Warning: {e:#}");
-                    }
-                }
-
-                for row in diff_result.context("branch diff failed")? {
-                    let diff_scope: String = row.get(0);
-                    let schema_name: String = row.get(1);
-                    let table_name: String = row.get(2);
-                    let diff_type: String = row.get(3);
-                    let key_json: String = row.get(4);
-                    let ours_json: String = row.get(5);
-                    let theirs_json: String = row.get(6);
-                    let detail: String = row.get(7);
-
-                    println!(
-                        "{diff_scope}\t{schema_name}.{table_name}\t{diff_type}\tkey={key_json}\tours={ours_json}\ttheirs={theirs_json}\t{detail}"
-                    );
-                }
-            }
         }
         BranchCmd::Merge(args) => {
             let needs_local = args.source_connstr.is_none() || args.target_connstr.is_none();
@@ -3212,217 +2179,20 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            println!(
-                "Merging source branch '{}' ({}) into target branch '{}' ({}) with strategy '{}'",
-                source_endpoint.branch_name,
-                source_endpoint.endpoint_id,
-                target_endpoint.branch_name,
-                target_endpoint.endpoint_id,
-                args.strategy.as_str()
+            branch_output_print(
+                branch_ops::merge_branch(BranchMergeOptions {
+                    source_endpoint,
+                    target_endpoint,
+                    source_schema: args.source_schema.clone(),
+                    target_schema: args.target_schema.clone(),
+                    strategy: local_branch_strategy(args.strategy),
+                    fdw_server: args.fdw_server.clone(),
+                    copy_source_only_tables: !args.no_copy_source_only_tables,
+                    keep_fdw: args.keep_fdw,
+                    incremental_oggit: args.incremental_oggit,
+                })
+                .await?,
             );
-
-            let mut client = connect_to_branch_endpoint(&target_endpoint).await?;
-            lock_branch_fdw_workspace(&client).await?;
-            let parent_command_lsn = if args.incremental_oggit {
-                Some(current_endpoint_lsn(&client).await?)
-            } else {
-                None
-            };
-            let child_command_lsn = if args.incremental_oggit {
-                let source_client = connect_to_branch_endpoint(&source_endpoint).await?;
-                let requested_lsn = current_endpoint_lsn(&source_client).await?;
-                oggit_freeze_metadata_lsn(&source_client, &requested_lsn, "child")
-                    .await
-                    .context("failed to freeze child oggit metadata before merge")?;
-                Some(requested_lsn)
-            } else {
-                None
-            };
-            if let Some(requested_lsn) = parent_command_lsn.as_deref() {
-                oggit_freeze_metadata_lsn(&client, requested_lsn, "parent")
-                    .await
-                    .context("failed to freeze parent oggit metadata before merge")?;
-            }
-            ensure_branch_database_compatibility(&client, &source_endpoint).await?;
-            prepare_branch_source_fdw(
-                &mut client,
-                &args.source_schema,
-                &OGGIT_FDW_SCHEMA,
-                &args.fdw_server,
-                &source_endpoint,
-            )
-            .await?;
-
-            if !args.incremental_oggit && matches!(args.strategy, BranchMergeStrategy::Manual) {
-                bail!("manual merge strategy requires --incremental-oggit");
-            }
-
-            if args.incremental_oggit {
-                import_source_oggit_foreign_tables(
-                    &mut client,
-                    &OGGIT_FDW_SCHEMA,
-                    &args.fdw_server,
-                )
-                .await?;
-                client
-                    .batch_execute("BEGIN")
-                    .await
-                    .context("failed to start branch merge transaction")?;
-
-                let merge_result = oggit_merge_from_meta(
-                    &client,
-                    &OGGIT_FDW_SCHEMA,
-                    args.strategy,
-                    None,
-                    None,
-                    child_command_lsn.as_deref(),
-                    parent_command_lsn.as_deref(),
-                )
-                .await;
-
-                if merge_result.is_err() {
-                    if let Err(e) = client.batch_execute("ROLLBACK").await {
-                        eprintln!("Warning: failed to roll back branch merge transaction: {e:#}");
-                    }
-                    if !args.keep_fdw {
-                        if let Err(e) = cleanup_branch_source_fdw(
-                            &mut client,
-                            &OGGIT_FDW_SCHEMA,
-                            &args.fdw_server,
-                        )
-                        .await
-                        {
-                            eprintln!("Warning: {e:#}");
-                        }
-                    }
-                }
-
-                let merge_result = merge_result.context("branch merge failed")?;
-                client
-                    .batch_execute("COMMIT")
-                    .await
-                    .context("failed to commit branch merge transaction")?;
-                if merge_result.status == "applied" {
-                    oggit_finalize_merge_commit_lsn(&client, &merge_result.merge_id)
-                        .await
-                        .context("failed to finalize oggit merge commit LSN")?;
-                }
-
-                if merge_result.status == "blocked" && !args.keep_fdw {
-                    eprintln!(
-                        "Keeping FDW schema '{}' and server '{}' so branch continue can reread child oggit metadata",
-                        OGGIT_FDW_SCHEMA, args.fdw_server
-                    );
-                } else if !args.keep_fdw {
-                    if let Err(e) =
-                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
-                            .await
-                    {
-                        eprintln!("Warning: {e:#}");
-                    }
-                }
-
-                println!(
-                    "oggit.merge\tmerge_id={}\tstatus={}\tconflicts={}\tapplied={}",
-                    merge_result.merge_id,
-                    merge_result.status,
-                    merge_result.conflict_count,
-                    merge_result.applied_count
-                );
-                for detail in &merge_result.skipped_details {
-                    println!("oggit.skipped\t{detail}");
-                }
-                if merge_result.status == "failed" {
-                    bail!("branch merge failed");
-                }
-                return Ok(());
-            }
-
-            let copy_source_only_tables = !args.no_copy_source_only_tables;
-            client
-                .batch_execute("BEGIN")
-                .await
-                .context("failed to start branch merge transaction")?;
-
-            let merge_result: Result<(Vec<(String, i64)>, Vec<tokio_opengauss::Row>)> = async {
-                let (copied_tables, common_tables) = copy_source_only_tables_with_schema(
-                    &mut client,
-                    &source_endpoint,
-                    &args.source_schema,
-                    &args.target_schema,
-                    &OGGIT_FDW_SCHEMA,
-                    copy_source_only_tables,
-                )
-                .await?;
-
-                let include_tables_sql = name_array_literal(&common_tables);
-                let merge_sql = format!(
-                    "SELECT schema_name, table_name, inserted_count, updated_count
-                     FROM neon_branch_merge($1::name, $2::name, $3, {include_tables_sql}, false)"
-                );
-                let merged_tables = client
-                    .query(
-                        merge_sql.as_str(),
-                        &[
-                            &OGGIT_FDW_SCHEMA,
-                            &args.target_schema,
-                            &args.strategy.as_str(),
-                        ],
-                    )
-                    .await?;
-
-                client
-                    .batch_execute("COMMIT")
-                    .await
-                    .context("failed to commit branch merge transaction")?;
-
-                Ok((copied_tables, merged_tables))
-            }
-            .await;
-
-            if merge_result.is_err() {
-                if let Err(e) = client.batch_execute("ROLLBACK").await {
-                    eprintln!("Warning: failed to roll back branch merge transaction: {e:#}");
-                }
-                if !args.keep_fdw {
-                    if let Err(e) =
-                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
-                            .await
-                    {
-                        eprintln!("Warning: {e:#}");
-                    }
-                }
-            }
-
-            let (copied_tables, merged_tables) = merge_result.context("branch merge failed")?;
-
-            if !args.keep_fdw {
-                if let Err(e) =
-                    cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
-                        .await
-                {
-                    eprintln!("Warning: {e:#}");
-                }
-            }
-
-            for (table_name, inserted_count) in copied_tables {
-                println!(
-                    "{}.{}\tinserted={}\tupdated=0",
-                    args.target_schema, table_name, inserted_count
-                );
-            }
-
-            for row in merged_tables {
-                let schema_name: String = row.get(0);
-                let table_name: String = row.get(1);
-                let inserted_count: i64 = row.get(2);
-                let updated_count: i64 = row.get(3);
-
-                println!(
-                    "{schema_name}.{table_name}\tinserted={inserted_count}\tupdated={updated_count}"
-                );
-            }
         }
         BranchCmd::MergeStatus(args) => {
             let needs_local = args.target_connstr.is_none();
@@ -3448,27 +2218,12 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            let client = connect_to_branch_endpoint(&target_endpoint).await?;
-            let (history, pending_conflict_count) = oggit_merge_status(&client, &args.merge_id)
-                .await
-                .context("failed to read oggit merge status")?
-                .with_context(|| format!("merge {} not found", args.merge_id))?;
-
-            println!(
-                "oggit.merge\tmerge_id={}\tbranch={} ({})\tchild_timeline={}\tparent_timeline={}\tbase_lsn={}\tchild_to_lsn={}\tparent_to_lsn={}\tstrategy={}\tstatus={}\tconflicts={}\tpending={}",
-                history.merge_id,
-                target_endpoint.branch_name,
-                target_endpoint.endpoint_id,
-                history.child_timeline_id,
-                history.parent_timeline_id,
-                history.base_lsn,
-                history.child_to_lsn,
-                history.parent_to_lsn,
-                history.strategy,
-                history.status,
-                history.conflict_count,
-                pending_conflict_count
+            branch_output_print(
+                branch_ops::merge_status(BranchTargetOptions {
+                    target_endpoint,
+                    merge_id: args.merge_id.clone(),
+                })
+                .await?,
             );
         }
         BranchCmd::Conflicts(args) => {
@@ -3495,33 +2250,13 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            println!(
-                "Listing oggit merge conflicts on target branch '{}' ({}) for merge {}",
-                target_endpoint.branch_name, target_endpoint.endpoint_id, args.merge_id
+            branch_output_print(
+                branch_ops::conflicts(BranchTargetOptions {
+                    target_endpoint,
+                    merge_id: args.merge_id.clone(),
+                })
+                .await?,
             );
-
-            let client = connect_to_branch_endpoint(&target_endpoint).await?;
-            for conflict in oggit_read_conflicts(&client, &args.merge_id)
-                .await
-                .context("failed to list oggit merge conflicts")?
-            {
-                println!(
-                    "{}\t{}\t{}\t{}.{}\tobject={}\tkey={}\tours={}\ttheirs={}\tresolution={}\tstatus={}\t{}",
-                    conflict.conflict_id,
-                    conflict.conflict_scope,
-                    conflict.conflict_type,
-                    conflict.schema_name.unwrap_or_default(),
-                    conflict.table_name.unwrap_or_default(),
-                    conflict.object_name.unwrap_or_default(),
-                    oggit_json_text(&conflict.key_json),
-                    oggit_json_text(&conflict.ours_json),
-                    oggit_json_text(&conflict.theirs_json),
-                    conflict.resolution.unwrap_or_default(),
-                    conflict.status,
-                    conflict.reason
-                );
-            }
         }
         BranchCmd::Resolve(args) => {
             let needs_local = args.target_connstr.is_none();
@@ -3547,36 +2282,16 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            let client = connect_to_branch_endpoint(&target_endpoint).await?;
-            if let Some(custom_sql) = &args.custom_sql {
-                oggit_resolve_conflict_sql(&client, &args.merge_id, args.conflict_id, custom_sql)
-                    .await
-                    .context("failed to store custom oggit conflict SQL")?;
-                println!(
-                    "Resolved conflict {} on target branch '{}' ({}) with custom SQL",
-                    args.conflict_id, target_endpoint.branch_name, target_endpoint.endpoint_id
-                );
-            } else {
-                let resolution = args
-                    .resolution
-                    .context("pass either --resolution or --custom-sql")?;
-                oggit_resolve_conflict(
-                    &client,
-                    &args.merge_id,
-                    args.conflict_id,
-                    resolution.as_str(),
-                )
-                .await
-                .context("failed to resolve oggit conflict")?;
-                println!(
-                    "Resolved conflict {} on target branch '{}' ({}) as {}",
-                    args.conflict_id,
-                    target_endpoint.branch_name,
-                    target_endpoint.endpoint_id,
-                    resolution.as_str()
-                );
-            }
+            branch_output_print(
+                branch_ops::resolve_conflict(BranchResolveOptions {
+                    target_endpoint,
+                    merge_id: args.merge_id.clone(),
+                    conflict_id: args.conflict_id,
+                    resolution: args.resolution.map(local_conflict_resolution),
+                    custom_sql: args.custom_sql.clone(),
+                })
+                .await?,
+            );
         }
         BranchCmd::Continue(args) => {
             let needs_local = args.target_connstr.is_none();
@@ -3602,40 +2317,13 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            println!(
-                "Continuing oggit merge {} on target branch '{}' ({})",
-                args.merge_id, target_endpoint.branch_name, target_endpoint.endpoint_id
+            branch_output_print(
+                branch_ops::continue_merge(BranchTargetOptions {
+                    target_endpoint,
+                    merge_id: args.merge_id.clone(),
+                })
+                .await?,
             );
-
-            let client = connect_to_branch_endpoint(&target_endpoint).await?;
-            client
-                .batch_execute("BEGIN")
-                .await
-                .context("failed to start oggit continue transaction")?;
-            let result = oggit_continue_merge(&client, &args.merge_id).await;
-            if result.is_err() {
-                if let Err(e) = client.batch_execute("ROLLBACK").await {
-                    eprintln!("Warning: failed to roll back oggit continue transaction: {e:#}");
-                }
-            }
-            let result = result.context("failed to continue oggit merge")?;
-            client
-                .batch_execute("COMMIT")
-                .await
-                .context("failed to commit oggit continue transaction")?;
-            if result.status == "applied" {
-                oggit_finalize_merge_commit_lsn(&client, &result.merge_id)
-                    .await
-                    .context("failed to finalize oggit merge commit LSN")?;
-            }
-            println!(
-                "oggit.merge\tmerge_id={}\tstatus={}\tconflicts={}\tapplied={}",
-                result.merge_id, result.status, result.conflict_count, result.applied_count
-            );
-            for detail in &result.skipped_details {
-                println!("oggit.skipped\t{detail}");
-            }
         }
         BranchCmd::Abort(args) => {
             let needs_local = args.target_connstr.is_none();
@@ -3661,26 +2349,12 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
                 &args.user,
                 &args.database,
             )?;
-
-            let client = connect_to_branch_endpoint(&target_endpoint).await?;
-            client
-                .batch_execute("BEGIN")
-                .await
-                .context("failed to start oggit abort transaction")?;
-            let result = oggit_abort_merge(&client, &args.merge_id).await;
-            if result.is_err() {
-                if let Err(e) = client.batch_execute("ROLLBACK").await {
-                    eprintln!("Warning: failed to roll back oggit abort transaction: {e:#}");
-                }
-            }
-            result.context("failed to abort oggit merge")?;
-            client
-                .batch_execute("COMMIT")
-                .await
-                .context("failed to commit oggit abort transaction")?;
-            println!(
-                "Aborted oggit merge {} on target branch '{}' ({})",
-                args.merge_id, target_endpoint.branch_name, target_endpoint.endpoint_id
+            branch_output_print(
+                branch_ops::abort_merge(BranchTargetOptions {
+                    target_endpoint,
+                    merge_id: args.merge_id.clone(),
+                })
+                .await?,
             );
         }
     }
@@ -3688,6 +2362,137 @@ async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) ->
     Ok(())
 }
 
+fn min_child_ancestor_lsn(parent_id: TimelineId, timelines: &[TimelineInfo]) -> Option<String> {
+    timelines
+        .iter()
+        .filter(|timeline| timeline.ancestor_timeline_id == Some(parent_id))
+        .filter_map(|timeline| timeline.ancestor_lsn)
+        .min()
+        .map(|lsn| lsn.to_string())
+}
+
+async fn run_oggit_gc_on_endpoint(
+    connstr: &str,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+    floor_lsn: String,
+    retention_lsn_distance: u128,
+) -> Result<OggitGcParentResult> {
+    let (client, connection) = tokio_opengauss::connect(connstr, NoTls)
+        .await
+        .with_context(|| format!("failed to connect to oggit parent endpoint at {connstr}"))?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    oggit_gc_parent(
+        &client,
+        OggitGcParentRequest {
+            tenant_id: tenant_id.to_string(),
+            timeline_id: timeline_id.to_string(),
+            floor_lsn,
+            retention_lsn_distance,
+        },
+    )
+    .await
+}
+
+async fn handle_oggit(subcmd: &OggitCmd, env: &local_env::LocalEnv) -> Result<()> {
+    match subcmd {
+        OggitCmd::Gc(args) => handle_oggit_gc(args, env).await,
+    }
+}
+
+async fn handle_oggit_gc(args: &OggitGcCmdArgs, env: &local_env::LocalEnv) -> Result<()> {
+    let tenant_id = get_tenant_id(args.tenant_id, env)?;
+    let pageserver = get_default_pageserver(env);
+    let tenant_shard_id = TenantShardId::unsharded(tenant_id);
+    let timelines = pageserver.timeline_list(&tenant_shard_id).await?;
+    let cplane = ComputeControlPlane::load(env.clone())?;
+
+    let mut results = Vec::new();
+    for timeline in timelines
+        .iter()
+        .filter(|timeline| timeline.ancestor_timeline_id.is_none())
+    {
+        let floor_lsn = min_child_ancestor_lsn(timeline.timeline_id, &timelines)
+            .unwrap_or_else(|| "0/0".to_string());
+        let running_endpoints = cplane
+            .endpoints
+            .iter()
+            .filter(|(_, endpoint)| {
+                endpoint.tenant_id == tenant_id
+                    && endpoint.timeline_id == timeline.timeline_id
+                    && endpoint.status() == EndpointStatus::Running
+            })
+            .collect::<Vec<_>>();
+
+        if running_endpoints.is_empty() {
+            results.push(OggitGcParentResult {
+                tenant_id: tenant_id.to_string(),
+                timeline_id: timeline.timeline_id.to_string(),
+                status: "skipped".to_string(),
+                floor_lsn,
+                deleted_change_log: 0,
+                deleted_object_change: 0,
+                skipped_reason: Some("no running endpoint for root parent timeline".to_string()),
+            });
+            continue;
+        }
+        if running_endpoints.len() > 1 {
+            results.push(OggitGcParentResult {
+                tenant_id: tenant_id.to_string(),
+                timeline_id: timeline.timeline_id.to_string(),
+                status: "skipped".to_string(),
+                floor_lsn,
+                deleted_change_log: 0,
+                deleted_object_change: 0,
+                skipped_reason: Some(
+                    "multiple running endpoints for root parent timeline".to_string(),
+                ),
+            });
+            continue;
+        }
+
+        let (endpoint_id, endpoint) = running_endpoints[0];
+        let mut result = run_oggit_gc_on_endpoint(
+            &endpoint.connstr("cloud_admin", "postgres"),
+            tenant_id,
+            timeline.timeline_id,
+            floor_lsn,
+            u128::from(args.retention_lsn_distance),
+        )
+        .await
+        .with_context(|| format!("failed to GC endpoint {endpoint_id}"))?;
+        if result.status == "deleted"
+            && result.deleted_change_log == 0
+            && result.deleted_object_change == 0
+        {
+            result.status = "ok".to_string();
+        }
+        results.push(result);
+    }
+
+    for result in results {
+        let skipped = result.skipped_reason.as_deref().unwrap_or("");
+        println!(
+            "tenant_id={}\ttimeline_id={}\tstatus={}\tgc_lsn={}\tdeleted_change_log={}\tdeleted_object_change={}\tskipped_reason={}",
+            result.tenant_id,
+            result.timeline_id,
+            result.status,
+            result.floor_lsn,
+            result.deleted_change_log,
+            result.deleted_object_change,
+            skipped,
+        );
+    }
+    Ok(())
+}
+
+async fn handle_branch(subcmd: &BranchCmd, env: Option<&local_env::LocalEnv>) -> Result<()> {
+    handle_branch_ops(subcmd, env).await
+}
 async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Result<()> {
     let mut cplane = ComputeControlPlane::load(env.clone())?;
 
@@ -3767,12 +2572,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 .get_branch_timeline_id(&branch_name, tenant_id)
                 .ok_or_else(|| anyhow!("Found no timeline id for branch name '{branch_name}'"))?;
 
-            let mode = match (args.lsn, args.hot_standby) {
-                (Some(lsn), false) => ComputeMode::Static(lsn),
-                (None, true) => ComputeMode::Replica,
-                (None, false) => ComputeMode::Primary,
-                (Some(_), true) => anyhow::bail!("cannot specify both lsn and hot-standby"),
-            };
+            let mode = compute_mode_from_options(args.lsn, args.hot_standby)?;
 
             match (mode, args.hot_standby) {
                 (ComputeMode::Static(_), true) => {
@@ -3934,10 +2734,19 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
             let endpoint_storage_token = env.generate_auth_token(&claims)?;
             let endpoint_storage_addr = env.endpoint_storage.listen_addr.to_string();
 
-            // Build the compute-side oggit worker config for Primary openGauss
-            // endpoints. The worker runs inside compute and decodes this
-            // branch's WAL into the oggit metadata tables.
-            let oggit = build_oggit_endpoint_config(env, endpoint, &safekeepers).await;
+            // Oggit is opt-in. Without this flag, local endpoints do not write
+            // neon.oggit_* GUCs into the generated postgresql.conf.
+            let oggit = if args.enable_oggit {
+                let oggit_database = args
+                    .oggit_database
+                    .clone()
+                    .or_else(|| endpoint.oggit_database.clone())
+                    .unwrap_or_else(|| "postgres".to_string());
+                endpoint.persist_oggit_database(&oggit_database)?;
+                build_oggit_endpoint_config(env, endpoint, &safekeepers, &oggit_database).await
+            } else {
+                None
+            };
 
             let args = control_plane::endpoint::EndpointStartArgs {
                 auth_token,
