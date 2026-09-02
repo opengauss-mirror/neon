@@ -62,10 +62,19 @@ use utils::id::{NodeId, TenantId, TenantTimelineId, TimelineId};
 use utils::lsn::Lsn;
 use utils::project_git_version;
 
+mod merge_oggit;
+use merge_oggit::{
+    oggit_abort_merge, oggit_continue_merge, oggit_diff_from_meta, oggit_freeze_metadata_lsn,
+    oggit_json_text, oggit_merge_from_meta, oggit_merge_status, oggit_read_conflicts,
+    oggit_resolve_conflict, oggit_resolve_conflict_sql,
+};
+
 // Default id of a safekeeper node, if not specified on the command line.
 const DEFAULT_SAFEKEEPER_ID: NodeId = NodeId(1);
 const DEFAULT_PAGESERVER_ID: NodeId = NodeId(1);
 const DEFAULT_BRANCH_NAME: &str = "main";
+const OGGIT_FDW_SCHEMA: &str = "oggit_fdw";
+const OGGIT_FDW_LOCK_NAME: &str = "neon_local:branch:oggit_fdw";
 project_git_version!(GIT_VERSION);
 
 #[allow(dead_code)]
@@ -250,6 +259,11 @@ enum TimelineCmd {
 enum BranchCmd {
     Diff(BranchDiffCmdArgs),
     Merge(BranchMergeCmdArgs),
+    MergeStatus(BranchMergeStatusCmdArgs),
+    Conflicts(BranchConflictsCmdArgs),
+    Resolve(BranchResolveCmdArgs),
+    Continue(BranchContinueCmdArgs),
+    Abort(BranchAbortCmdArgs),
 }
 
 #[derive(clap::Args)]
@@ -300,13 +314,6 @@ struct BranchDiffCmdArgs {
     #[clap(
         long,
         default_value = "neon_merge_src",
-        help = "Temporary FDW schema on target"
-    )]
-    fdw_schema: String,
-
-    #[clap(
-        long,
-        default_value = "neon_merge_src",
         help = "Temporary FDW server on target"
     )]
     fdw_server: String,
@@ -316,21 +323,29 @@ struct BranchDiffCmdArgs {
         help = "Keep the temporary FDW schema and server after the command"
     )]
     keep_fdw: bool,
+
+    #[clap(
+        long,
+        help = "Use oggit incremental metadata instead of full-table FDW diff"
+    )]
+    incremental_oggit: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum BranchMergeStrategy {
+pub(crate) enum BranchMergeStrategy {
     Fail,
     Ours,
     Theirs,
+    Manual,
 }
 
 impl BranchMergeStrategy {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             BranchMergeStrategy::Fail => "fail",
             BranchMergeStrategy::Ours => "ours",
             BranchMergeStrategy::Theirs => "theirs",
+            BranchMergeStrategy::Manual => "manual",
         }
     }
 }
@@ -384,16 +399,9 @@ struct BranchMergeCmdArgs {
         long,
         value_enum,
         default_value = "fail",
-        help = "Conflict strategy: fail, ours, or theirs"
+        help = "Conflict strategy: fail, ours, theirs, or manual"
     )]
     strategy: BranchMergeStrategy,
-
-    #[clap(
-        long,
-        default_value = "neon_merge_src",
-        help = "Temporary FDW schema on target"
-    )]
-    fdw_schema: String,
 
     #[clap(
         long,
@@ -410,6 +418,167 @@ struct BranchMergeCmdArgs {
         help = "Keep the temporary FDW schema and server after the command"
     )]
     keep_fdw: bool,
+
+    #[clap(
+        long,
+        help = "Use oggit incremental metadata instead of full-table FDW merge"
+    )]
+    incremental_oggit: bool,
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Show status for an oggit incremental merge")]
+struct BranchMergeStatusCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(long, help = "Merge id returned by branch merge")]
+    merge_id: String,
+
+    #[clap(long, default_value = "postgres", help = "Database name")]
+    database: String,
+
+    #[clap(long, default_value = "cloud_admin", help = "Database user")]
+    user: String,
+}
+
+#[derive(clap::Args)]
+#[clap(about = "List conflicts for a blocked oggit incremental merge")]
+struct BranchConflictsCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(long, help = "Merge id returned by branch merge")]
+    merge_id: String,
+
+    #[clap(long, default_value = "postgres", help = "Database name")]
+    database: String,
+
+    #[clap(long, default_value = "cloud_admin", help = "Database user")]
+    user: String,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum BranchConflictResolution {
+    Ours,
+    Theirs,
+    Skip,
+}
+
+impl BranchConflictResolution {
+    fn as_str(self) -> &'static str {
+        match self {
+            BranchConflictResolution::Ours => "ours",
+            BranchConflictResolution::Theirs => "theirs",
+            BranchConflictResolution::Skip => "skip",
+        }
+    }
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Resolve one conflict in a blocked oggit incremental merge")]
+struct BranchResolveCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(long, help = "Merge id returned by branch merge")]
+    merge_id: String,
+
+    #[clap(long, help = "Conflict id from branch conflicts")]
+    conflict_id: i64,
+
+    #[clap(long, value_enum, help = "Resolution: ours, theirs, or skip")]
+    resolution: Option<BranchConflictResolution>,
+
+    #[clap(
+        long,
+        conflicts_with = "resolution",
+        help = "Custom SQL to run during continue"
+    )]
+    custom_sql: Option<String>,
+
+    #[clap(long, default_value = "postgres", help = "Database name")]
+    database: String,
+
+    #[clap(long, default_value = "cloud_admin", help = "Database user")]
+    user: String,
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Continue a blocked oggit incremental merge after conflicts are resolved")]
+struct BranchContinueCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(long, help = "Merge id returned by branch merge")]
+    merge_id: String,
+
+    #[clap(long, default_value = "postgres", help = "Database name")]
+    database: String,
+
+    #[clap(long, default_value = "cloud_admin", help = "Database user")]
+    user: String,
+}
+
+#[derive(clap::Args)]
+#[clap(about = "Abort a blocked oggit incremental merge")]
+struct BranchAbortCmdArgs {
+    #[clap(
+        long = "tenant-id",
+        help = "Tenant id. Represented as a hexadecimal string 32 symbols length"
+    )]
+    tenant_id: Option<TenantId>,
+
+    #[clap(long, help = "Target branch name")]
+    target_branch: String,
+
+    #[clap(long, help = "Running endpoint id for the target branch")]
+    target_endpoint: Option<String>,
+
+    #[clap(long, help = "Merge id returned by branch merge")]
+    merge_id: String,
+
+    #[clap(long, default_value = "postgres", help = "Database name")]
+    database: String,
+
+    #[clap(long, default_value = "cloud_admin", help = "Database user")]
+    user: String,
 }
 
 #[derive(clap::Args)]
@@ -1007,7 +1176,7 @@ fn main() -> Result<()> {
         // This tool uses a collection of simple files to store its state, and consequently
         // it is not generally safe to run multiple commands concurrently.  Rather than expect
         // all callers to know this, use a lock file to protect against concurrent execution.
-        let _repo_lock = RepoLock::new().unwrap();
+        let _repo_lock = Some(RepoLock::new().unwrap());
 
         // all other commands need an existing config
         let env = LocalEnv::load_config(&local_env::base_path()).context("Error loading config")?;
@@ -1574,13 +1743,21 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                                     Ok(row) => {
                                         let lsn_str: String = row.get(0);
                                         // Parse LSN format like "00000000/04BEFAA0" or "0/4BEFAA0"
-                                        if let Ok(lsn) = Lsn::from_str(&lsn_str.replace("00000000/", "0/")) {
-                                            println!("Syncing branch point with endpoint flush LSN: {}", lsn);
+                                        if let Ok(lsn) =
+                                            Lsn::from_str(&lsn_str.replace("00000000/", "0/"))
+                                        {
+                                            println!(
+                                                "Syncing branch point with endpoint flush LSN: {}",
+                                                lsn
+                                            );
                                             endpoint_lsn = Some(lsn);
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("Warning: Failed to get flush LSN from endpoint: {}", e);
+                                        eprintln!(
+                                            "Warning: Failed to get flush LSN from endpoint: {}",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -1613,7 +1790,11 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                             timeout: timeout_per_attempt,
                         };
 
-                        match pageserver.http_client.wait_lsn(tenant_shard_id, wait_req).await {
+                        match pageserver
+                            .http_client
+                            .wait_lsn(tenant_shard_id, wait_req)
+                            .await
+                        {
                             Ok(_) => {
                                 println!("WAL sync complete.");
                                 success = true;
@@ -1621,16 +1802,24 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
                             }
                             Err(e) => {
                                 if attempt < max_retries {
-                                    println!("Attempt {}/{}: still waiting... ({})", attempt, max_retries, e);
+                                    println!(
+                                        "Attempt {}/{}: still waiting... ({})",
+                                        attempt, max_retries, e
+                                    );
                                 } else {
-                                    eprintln!("Warning: wait_lsn failed after {} attempts: {}", max_retries, e);
+                                    eprintln!(
+                                        "Warning: wait_lsn failed after {} attempts: {}",
+                                        max_retries, e
+                                    );
                                 }
                             }
                         }
                     }
 
                     if !success {
-                        eprintln!("Proceeding with branch creation anyway. Data may be incomplete.");
+                        eprintln!(
+                            "Proceeding with branch creation anyway. Data may be incomplete."
+                        );
                     }
                 }
 
@@ -1747,6 +1936,25 @@ async fn connect_to_endpoint(
     Ok(client)
 }
 
+async fn current_endpoint_lsn(client: &tokio_opengauss::Client) -> Result<String> {
+    let row = client
+        .query_one("SELECT pg_current_xlog_location()::text", &[])
+        .await
+        .context("failed to read endpoint current LSN")?;
+    Ok(row.get(0))
+}
+
+async fn lock_branch_fdw_workspace(client: &tokio_opengauss::Client) -> Result<()> {
+    client
+        .query_one(
+            "SELECT pg_advisory_lock(hashtext(current_database()), hashtext($1::text))",
+            &[&OGGIT_FDW_LOCK_NAME],
+        )
+        .await
+        .context("failed to lock the oggit FDW workspace")?;
+    Ok(())
+}
+
 struct SourceColumn {
     name: String,
     data_type: String,
@@ -1843,6 +2051,154 @@ async fn import_branch_source_foreign_tables(
     }
 
     Ok(())
+}
+
+async fn import_source_oggit_foreign_tables(
+    target_client: &mut tokio_opengauss::Client,
+    fdw_schema: &str,
+    fdw_server: &str,
+) -> Result<()> {
+    let table_defs = [
+        (
+            "oggit_state",
+            "state",
+            "id boolean,
+             tenant_id text,
+             timeline_id text,
+             ancestor_timeline_id text,
+             branch_start_lsn text,
+             slot_name text,
+             required_lsn text,
+             decode_lsn text,
+             scanned_lsn text,
+             confirmed_lsn text,
+             status text,
+             last_error text,
+             updated_at timestamptz",
+        ),
+        (
+            "oggit_change_log",
+            "change_log",
+            "id bigint,
+             commit_lsn text,
+             record_lsn text,
+             xid text,
+             ordinal integer,
+             op text,
+             schema_name text,
+             table_name text,
+             relid oid,
+             identity_kind text,
+             key_json jsonb,
+             old_row jsonb,
+             new_row jsonb,
+             changed_cols text[],
+             unsupported_reason text,
+             created_at timestamptz",
+        ),
+        (
+            "oggit_object_change",
+            "object_change",
+            "id bigint,
+             commit_lsn text,
+             ordinal integer,
+             object_type text,
+             schema_name text,
+             object_name text,
+             action text,
+             change_json jsonb,
+             safety_class text,
+             unsupported_reason text,
+             created_at timestamptz",
+        ),
+    ];
+
+    for (foreign_name, remote_name, columns) in table_defs {
+        let create_sql = format!(
+            "CREATE FOREIGN TABLE {}.{} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
+            quote_sql_ident(fdw_schema),
+            quote_sql_ident(foreign_name),
+            columns,
+            quote_sql_ident(fdw_server),
+            quote_sql_literal("oggit"),
+            quote_sql_literal(remote_name)
+        );
+
+        target_client
+            .batch_execute(&create_sql)
+            .await
+            .with_context(|| {
+                format!("failed to create foreign table {fdw_schema}.{foreign_name}")
+            })?;
+    }
+
+    Ok(())
+}
+
+/// Build the compute-side oggit worker configuration for a Primary openGauss
+/// endpoint. Returns None for non-Primary endpoints or when gaussdb is not the
+/// backing binary. Inference of branch_start_lsn / ancestor_timeline_id mirrors
+/// the former external worker: it queries the pageserver's timeline_info.
+async fn build_oggit_endpoint_config(
+    env: &local_env::LocalEnv,
+    endpoint: &Endpoint,
+    safekeepers: &[NodeId],
+) -> Option<control_plane::endpoint::OggitEndpointConfig> {
+    if !matches!(endpoint.mode, ComputeMode::Primary) {
+        return None;
+    }
+    if !env
+        .pg_bin_dir(endpoint.pg_version())
+        .ok()?
+        .join("gaussdb")
+        .exists()
+    {
+        return None;
+    }
+
+    let tenant_id = endpoint.tenant_id;
+    let timeline_id = endpoint.timeline_id;
+
+    // Best-effort query of ancestor info. On failure we still start the worker
+    // with a 0/0 base; the worker records what it can and diff/merge validates.
+    let timeline_info = get_default_pageserver(env)
+        .timeline_info(
+            TenantShardId::unsharded(tenant_id),
+            timeline_id,
+            pageserver_client::mgmt_api::ForceAwaitLogicalSize::No,
+        )
+        .await
+        .ok();
+    let branch_start_lsn = timeline_info
+        .as_ref()
+        .and_then(|info| info.ancestor_lsn)
+        .map(|lsn| lsn.to_string())
+        .unwrap_or_else(|| "0/0".to_string());
+    let ancestor_timeline_id = timeline_info
+        .as_ref()
+        .and_then(|info| info.ancestor_timeline_id)
+        .map(|id| id.to_string());
+    let safekeeper_http_urls = safekeepers
+        .iter()
+        .filter_map(|id| env.safekeepers.iter().find(|sk| sk.id == *id))
+        .map(|sk| {
+            let listen_addr = sk
+                .listen_addr
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            format!("http://{}:{}", listen_addr, sk.http_port)
+        })
+        .collect::<Vec<_>>();
+
+    Some(control_plane::endpoint::OggitEndpointConfig {
+        tenant_id: tenant_id.to_string(),
+        timeline_id: timeline_id.to_string(),
+        ancestor_timeline_id,
+        branch_start_lsn,
+        slot_name: "neon_oggit_slot".to_string(),
+        database: "postgres".to_string(),
+        safekeeper_http_urls,
+    })
 }
 
 async fn read_database_compatibility(client: &tokio_opengauss::Client) -> Result<String> {
@@ -2424,11 +2780,15 @@ async fn cleanup_branch_source_fdw(
     fdw_schema: &str,
     fdw_server: &str,
 ) -> Result<()> {
+    let cleanup_sql = format!(
+        "DROP SERVER IF EXISTS {} CASCADE;
+         DROP SCHEMA IF EXISTS {} CASCADE",
+        quote_sql_ident(fdw_server),
+        quote_sql_ident(fdw_schema),
+    );
+
     client
-        .query(
-            "SELECT neon_branch_cleanup_source($1::name, $2::name)",
-            &[&fdw_schema, &fdw_server],
-        )
+        .batch_execute(&cleanup_sql)
         .await
         .context("failed to clean up postgres_fdw source schema")?;
 
@@ -2465,6 +2825,19 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
 
             let mut client =
                 connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            lock_branch_fdw_workspace(&client).await?;
+            let parent_command_lsn = if args.incremental_oggit {
+                Some(current_endpoint_lsn(&client).await?)
+            } else {
+                None
+            };
+            let child_command_lsn = if args.incremental_oggit {
+                let source_client =
+                    connect_to_endpoint(&source_endpoint, &args.user, &args.database).await?;
+                Some(current_endpoint_lsn(&source_client).await?)
+            } else {
+                None
+            };
             ensure_branch_database_compatibility(
                 &client,
                 &source_endpoint,
@@ -2475,7 +2848,7 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             prepare_branch_source_fdw(
                 &mut client,
                 &args.source_schema,
-                &args.fdw_schema,
+                &OGGIT_FDW_SCHEMA,
                 &args.fdw_server,
                 &source_endpoint,
                 &args.database,
@@ -2483,29 +2856,84 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             )
             .await?;
 
-            let diff_result = client
-                .query(
-                    "SELECT schema_name, table_name, diff_type, row_data FROM neon_branch_diff($1::name, $2::name, NULL::name[])",
-                    &[&args.fdw_schema, &args.target_schema],
+            if args.incremental_oggit {
+                import_source_oggit_foreign_tables(
+                    &mut client,
+                    &OGGIT_FDW_SCHEMA,
+                    &args.fdw_server,
                 )
-                .await;
+                .await?;
+                let diff_result = oggit_diff_from_meta(
+                    &client,
+                    &OGGIT_FDW_SCHEMA,
+                    None,
+                    None,
+                    child_command_lsn.as_deref(),
+                    parent_command_lsn.as_deref(),
+                )
+                .await
+                .context("branch diff failed")?;
 
-            if !args.keep_fdw {
-                if let Err(e) =
-                    cleanup_branch_source_fdw(&mut client, &args.fdw_schema, &args.fdw_server).await
-                {
-                    eprintln!("Warning: {e:#}");
+                if !args.keep_fdw {
+                    if let Err(e) =
+                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
+                            .await
+                    {
+                        eprintln!("Warning: {e:#}");
+                    }
                 }
-            }
 
-            for row in diff_result.context("branch diff failed")? {
-                let schema_name: String = row.get(0);
-                let table_name: String = row.get(1);
-                let diff_type: String = row.get(2);
-                let row_data: Option<String> = row.get(3);
-                let row_data = row_data.unwrap_or_default();
+                println!(
+                    "oggit.diff\tbase_lsn={}\tchild_to_lsn={}\tparent_to_lsn={}",
+                    diff_result.base_lsn, diff_result.child_to_lsn, diff_result.parent_to_lsn
+                );
 
-                println!("{schema_name}.{table_name}\t{diff_type}\t{row_data}");
+                for row in diff_result.rows {
+                    println!(
+                        "{}\t{}.{}\t{}\tkey={}\tours={}\ttheirs={}\t{}",
+                        row.diff_scope,
+                        row.schema_name,
+                        row.table_name,
+                        row.diff_type,
+                        oggit_json_text(&row.key_json),
+                        oggit_json_text(&row.ours_json),
+                        oggit_json_text(&row.theirs_json),
+                        row.detail.unwrap_or_default()
+                    );
+                }
+            } else {
+                let diff_result = client
+                    .query(
+                        "SELECT 'row'::text, schema_name, table_name, diff_type,
+                                COALESCE(row_data, ''), ''::text, ''::text, ''::text
+                           FROM neon_branch_diff($1::name, $2::name, NULL::name[])",
+                        &[&OGGIT_FDW_SCHEMA, &args.target_schema],
+                    )
+                    .await;
+
+                if !args.keep_fdw {
+                    if let Err(e) =
+                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
+                            .await
+                    {
+                        eprintln!("Warning: {e:#}");
+                    }
+                }
+
+                for row in diff_result.context("branch diff failed")? {
+                    let diff_scope: String = row.get(0);
+                    let schema_name: String = row.get(1);
+                    let table_name: String = row.get(2);
+                    let diff_type: String = row.get(3);
+                    let key_json: String = row.get(4);
+                    let ours_json: String = row.get(5);
+                    let theirs_json: String = row.get(6);
+                    let detail: String = row.get(7);
+
+                    println!(
+                        "{diff_scope}\t{schema_name}.{table_name}\t{diff_type}\tkey={key_json}\tours={ours_json}\ttheirs={theirs_json}\t{detail}"
+                    );
+                }
             }
         }
         BranchCmd::Merge(args) => {
@@ -2538,6 +2966,28 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
 
             let mut client =
                 connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            lock_branch_fdw_workspace(&client).await?;
+            let parent_command_lsn = if args.incremental_oggit {
+                Some(current_endpoint_lsn(&client).await?)
+            } else {
+                None
+            };
+            let child_command_lsn = if args.incremental_oggit {
+                let source_client =
+                    connect_to_endpoint(&source_endpoint, &args.user, &args.database).await?;
+                let requested_lsn = current_endpoint_lsn(&source_client).await?;
+                oggit_freeze_metadata_lsn(&source_client, &requested_lsn, "child")
+                    .await
+                    .context("failed to freeze child oggit metadata before merge")?;
+                Some(requested_lsn)
+            } else {
+                None
+            };
+            if let Some(requested_lsn) = parent_command_lsn.as_deref() {
+                oggit_freeze_metadata_lsn(&client, requested_lsn, "parent")
+                    .await
+                    .context("failed to freeze parent oggit metadata before merge")?;
+            }
             ensure_branch_database_compatibility(
                 &client,
                 &source_endpoint,
@@ -2548,13 +2998,90 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
             prepare_branch_source_fdw(
                 &mut client,
                 &args.source_schema,
-                &args.fdw_schema,
+                &OGGIT_FDW_SCHEMA,
                 &args.fdw_server,
                 &source_endpoint,
                 &args.database,
                 &args.user,
             )
             .await?;
+
+            if !args.incremental_oggit && matches!(args.strategy, BranchMergeStrategy::Manual) {
+                bail!("manual merge strategy requires --incremental-oggit");
+            }
+
+            if args.incremental_oggit {
+                import_source_oggit_foreign_tables(
+                    &mut client,
+                    &OGGIT_FDW_SCHEMA,
+                    &args.fdw_server,
+                )
+                .await?;
+                client
+                    .batch_execute("BEGIN")
+                    .await
+                    .context("failed to start branch merge transaction")?;
+
+                let merge_result = oggit_merge_from_meta(
+                    &client,
+                    &OGGIT_FDW_SCHEMA,
+                    args.strategy,
+                    None,
+                    None,
+                    child_command_lsn.as_deref(),
+                    parent_command_lsn.as_deref(),
+                )
+                .await;
+
+                if merge_result.is_err() {
+                    if let Err(e) = client.batch_execute("ROLLBACK").await {
+                        eprintln!("Warning: failed to roll back branch merge transaction: {e:#}");
+                    }
+                    if !args.keep_fdw {
+                        if let Err(e) = cleanup_branch_source_fdw(
+                            &mut client,
+                            &OGGIT_FDW_SCHEMA,
+                            &args.fdw_server,
+                        )
+                        .await
+                        {
+                            eprintln!("Warning: {e:#}");
+                        }
+                    }
+                }
+
+                let merge_result = merge_result.context("branch merge failed")?;
+                client
+                    .batch_execute("COMMIT")
+                    .await
+                    .context("failed to commit branch merge transaction")?;
+
+                if merge_result.status == "blocked" && !args.keep_fdw {
+                    eprintln!(
+                        "Keeping FDW schema '{}' and server '{}' so branch continue can reread child oggit metadata",
+                        OGGIT_FDW_SCHEMA, args.fdw_server
+                    );
+                } else if !args.keep_fdw {
+                    if let Err(e) =
+                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
+                            .await
+                    {
+                        eprintln!("Warning: {e:#}");
+                    }
+                }
+
+                println!(
+                    "oggit.merge\tmerge_id={}\tstatus={}\tconflicts={}\tapplied={}",
+                    merge_result.merge_id,
+                    merge_result.status,
+                    merge_result.conflict_count,
+                    merge_result.applied_count
+                );
+                if merge_result.status == "failed" {
+                    bail!("branch merge failed");
+                }
+                return Ok(());
+            }
 
             let copy_source_only_tables = !args.no_copy_source_only_tables;
             client
@@ -2568,7 +3095,7 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     &source_endpoint,
                     &args.source_schema,
                     &args.target_schema,
-                    &args.fdw_schema,
+                    &OGGIT_FDW_SCHEMA,
                     &args.database,
                     &args.user,
                     copy_source_only_tables,
@@ -2584,7 +3111,7 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     .query(
                         merge_sql.as_str(),
                         &[
-                            &args.fdw_schema,
+                            &OGGIT_FDW_SCHEMA,
                             &args.target_schema,
                             &args.strategy.as_str(),
                         ],
@@ -2604,17 +3131,27 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                 if let Err(e) = client.batch_execute("ROLLBACK").await {
                     eprintln!("Warning: failed to roll back branch merge transaction: {e:#}");
                 }
+                if !args.keep_fdw {
+                    if let Err(e) =
+                        cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
+                            .await
+                    {
+                        eprintln!("Warning: {e:#}");
+                    }
+                }
             }
+
+            let (copied_tables, merged_tables) = merge_result.context("branch merge failed")?;
 
             if !args.keep_fdw {
                 if let Err(e) =
-                    cleanup_branch_source_fdw(&mut client, &args.fdw_schema, &args.fdw_server).await
+                    cleanup_branch_source_fdw(&mut client, &OGGIT_FDW_SCHEMA, &args.fdw_server)
+                        .await
                 {
                     eprintln!("Warning: {e:#}");
                 }
             }
 
-            let (copied_tables, merged_tables) = merge_result.context("branch merge failed")?;
             for (table_name, inserted_count) in copied_tables {
                 println!(
                     "{}.{}\tinserted={}\tupdated=0",
@@ -2632,6 +3169,187 @@ async fn handle_branch(subcmd: &BranchCmd, env: &local_env::LocalEnv) -> Result<
                     "{schema_name}.{table_name}\tinserted={inserted_count}\tupdated={updated_count}"
                 );
             }
+        }
+        BranchCmd::MergeStatus(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            let (history, pending_conflict_count) = oggit_merge_status(&client, &args.merge_id)
+                .await
+                .context("failed to read oggit merge status")?
+                .with_context(|| format!("merge {} not found", args.merge_id))?;
+
+            println!(
+                "oggit.merge\tmerge_id={}\tbranch={} ({})\tchild_timeline={}\tparent_timeline={}\tbase_lsn={}\tchild_to_lsn={}\tparent_to_lsn={}\tstrategy={}\tstatus={}\tconflicts={}\tpending={}",
+                history.merge_id,
+                args.target_branch,
+                target_endpoint_id,
+                history.child_timeline_id,
+                history.parent_timeline_id,
+                history.base_lsn,
+                history.child_to_lsn,
+                history.parent_to_lsn,
+                history.strategy,
+                history.status,
+                history.conflict_count,
+                pending_conflict_count
+            );
+        }
+        BranchCmd::Conflicts(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            println!(
+                "Listing oggit merge conflicts on target branch '{}' ({}) for merge {}",
+                args.target_branch, target_endpoint_id, args.merge_id
+            );
+
+            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            for conflict in oggit_read_conflicts(&client, &args.merge_id)
+                .await
+                .context("failed to list oggit merge conflicts")?
+            {
+                println!(
+                    "{}\t{}\t{}\t{}.{}\tobject={}\tkey={}\tours={}\ttheirs={}\tresolution={}\tstatus={}\t{}",
+                    conflict.conflict_id,
+                    conflict.conflict_scope,
+                    conflict.conflict_type,
+                    conflict.schema_name.unwrap_or_default(),
+                    conflict.table_name.unwrap_or_default(),
+                    conflict.object_name.unwrap_or_default(),
+                    oggit_json_text(&conflict.key_json),
+                    oggit_json_text(&conflict.ours_json),
+                    oggit_json_text(&conflict.theirs_json),
+                    conflict.resolution.unwrap_or_default(),
+                    conflict.status,
+                    conflict.reason
+                );
+            }
+        }
+        BranchCmd::Resolve(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            if let Some(custom_sql) = &args.custom_sql {
+                oggit_resolve_conflict_sql(&client, &args.merge_id, args.conflict_id, custom_sql)
+                    .await
+                    .context("failed to store custom oggit conflict SQL")?;
+                println!(
+                    "Resolved conflict {} on target branch '{}' ({}) with custom SQL",
+                    args.conflict_id, args.target_branch, target_endpoint_id
+                );
+            } else {
+                let resolution = args
+                    .resolution
+                    .context("pass either --resolution or --custom-sql")?;
+                oggit_resolve_conflict(
+                    &client,
+                    &args.merge_id,
+                    args.conflict_id,
+                    resolution.as_str(),
+                )
+                .await
+                .context("failed to resolve oggit conflict")?;
+                println!(
+                    "Resolved conflict {} on target branch '{}' ({}) as {}",
+                    args.conflict_id,
+                    args.target_branch,
+                    target_endpoint_id,
+                    resolution.as_str()
+                );
+            }
+        }
+        BranchCmd::Continue(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            println!(
+                "Continuing oggit merge {} on target branch '{}' ({})",
+                args.merge_id, args.target_branch, target_endpoint_id
+            );
+
+            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            client
+                .batch_execute("BEGIN")
+                .await
+                .context("failed to start oggit continue transaction")?;
+            let result = oggit_continue_merge(&client, &args.merge_id).await;
+            if result.is_err() {
+                if let Err(e) = client.batch_execute("ROLLBACK").await {
+                    eprintln!("Warning: failed to roll back oggit continue transaction: {e:#}");
+                }
+            }
+            let result = result.context("failed to continue oggit merge")?;
+            client
+                .batch_execute("COMMIT")
+                .await
+                .context("failed to commit oggit continue transaction")?;
+            println!(
+                "oggit.merge\tmerge_id={}\tstatus={}\tconflicts={}\tapplied={}",
+                result.merge_id, result.status, result.conflict_count, result.applied_count
+            );
+        }
+        BranchCmd::Abort(args) => {
+            let tenant_id = get_tenant_id(args.tenant_id, env)?;
+            let (target_endpoint_id, target_endpoint) = resolve_branch_endpoint(
+                &cplane,
+                env,
+                tenant_id,
+                &args.target_branch,
+                &args.target_endpoint,
+                "target",
+            )?;
+
+            let client = connect_to_endpoint(&target_endpoint, &args.user, &args.database).await?;
+            client
+                .batch_execute("BEGIN")
+                .await
+                .context("failed to start oggit abort transaction")?;
+            let result = oggit_abort_merge(&client, &args.merge_id).await;
+            if result.is_err() {
+                if let Err(e) = client.batch_execute("ROLLBACK").await {
+                    eprintln!("Warning: failed to roll back oggit abort transaction: {e:#}");
+                }
+            }
+            result.context("failed to abort oggit merge")?;
+            client
+                .batch_execute("COMMIT")
+                .await
+                .context("failed to commit oggit abort transaction")?;
+            println!(
+                "Aborted oggit merge {} on target branch '{}' ({})",
+                args.merge_id, args.target_branch, target_endpoint_id
+            );
         }
     }
 
@@ -2739,7 +3457,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
             }
 
             if !args.allow_multiple {
-                cplane.check_conflicting_endpoints(mode, tenant_id, timeline_id)?;
+                cplane.check_conflicting_endpoints(mode, tenant_id, timeline_id, None)?;
             }
 
             cplane.new_endpoint(
@@ -2787,8 +3505,12 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
             if endpoint.status() == EndpointStatus::Crashed {
                 let pidfile_path = endpoint.pgdata().join("postmaster.pid");
                 if pidfile_path.exists() {
-                    std::fs::remove_file(&pidfile_path)
-                        .with_context(|| format!("failed to remove crashed pidfile: {}", pidfile_path.display()))?;
+                    std::fs::remove_file(&pidfile_path).with_context(|| {
+                        format!(
+                            "failed to remove crashed pidfile: {}",
+                            pidfile_path.display()
+                        )
+                    })?;
                 }
             }
 
@@ -2797,6 +3519,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                     endpoint.mode,
                     endpoint.tenant_id,
                     endpoint.timeline_id,
+                    Some(endpoint_id),
                 )?;
             }
 
@@ -2879,6 +3602,11 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
             let endpoint_storage_token = env.generate_auth_token(&claims)?;
             let endpoint_storage_addr = env.endpoint_storage.listen_addr.to_string();
 
+            // Build the compute-side oggit worker config for Primary openGauss
+            // endpoints. The worker runs inside compute and decodes this
+            // branch's WAL into the oggit metadata tables.
+            let oggit = build_oggit_endpoint_config(env, endpoint, &safekeepers).await;
+
             let args = control_plane::endpoint::EndpointStartArgs {
                 auth_token,
                 endpoint_storage_token,
@@ -2893,6 +3621,7 @@ async fn handle_endpoint(subcmd: &EndpointCmd, env: &local_env::LocalEnv) -> Res
                 autoprewarm: args.autoprewarm,
                 offload_lfc_interval_seconds: args.offload_lfc_interval_seconds,
                 dev: args.dev,
+                oggit,
             };
 
             println!("Starting existing endpoint {endpoint_id}...");
