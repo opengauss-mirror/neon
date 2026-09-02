@@ -8,11 +8,12 @@ use std::error::Error as _;
 use http_utils::error::HttpErrorBody;
 use reqwest::{IntoUrl, Method, Response, StatusCode};
 use safekeeper_api::models::{
-    self, PullTimelineRequest, PullTimelineResponse, SafekeeperStatus, SafekeeperUtilization,
-    TimelineCreateRequest,
+    self, OggitRequiredLsnRequest, PullTimelineRequest, PullTimelineResponse, SafekeeperStatus,
+    SafekeeperUtilization, TimelineCreateRequest,
 };
 use utils::id::{NodeId, TenantId, TimelineId};
 use utils::logging::SecretString;
+use utils::lsn::Lsn;
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -167,6 +168,22 @@ impl Client {
             self.mgmt_api_endpoint, tenant_id, timeline_id
         );
         self.get(&uri).await
+    }
+
+    pub async fn update_oggit_required_lsn(
+        &self,
+        tenant_id: TenantId,
+        timeline_id: TimelineId,
+        oggit_required_lsn: Lsn,
+    ) -> Result<OggitRequiredLsnRequest> {
+        let uri = format!(
+            "{}/v1/tenant/{}/timeline/{}/oggit_required_lsn",
+            self.mgmt_api_endpoint, tenant_id, timeline_id
+        );
+        let resp = self
+            .put(&uri, &OggitRequiredLsnRequest { oggit_required_lsn })
+            .await?;
+        resp.json().await.map_err(Error::ReceiveBody)
     }
 
     pub async fn snapshot(

@@ -62,6 +62,9 @@ pub struct TimelinePersistentState {
     /// pushed to s3. We don't remove WAL beyond it. Persisted only for
     /// informational purposes, we receive it from pageserver (or broker).
     pub remote_consistent_lsn: Lsn,
+    /// Oldest WAL LSN still needed by an oggit logical decoding worker.
+    /// Lsn::MAX means that no oggit worker retention horizon is registered.
+    pub oggit_required_lsn: Lsn,
     /// Holds names of partial segments uploaded to remote storage. Used to
     /// clean up old objects without leaving garbage in remote storage.
     pub partial_backup: wal_backup_partial::State,
@@ -144,6 +147,7 @@ impl TimelinePersistentState {
             backup_lsn: start_lsn,
             peer_horizon_lsn: start_lsn,
             remote_consistent_lsn: Lsn(0),
+            oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
             creation_ts: SystemTime::now(),
@@ -174,6 +178,7 @@ pub struct TimelineMemState {
     pub backup_lsn: Lsn,
     pub peer_horizon_lsn: Lsn,
     pub remote_consistent_lsn: Lsn,
+    pub oggit_required_lsn: Lsn,
     #[serde(with = "hex")]
     pub proposer_uuid: PgUuid,
 }
@@ -201,6 +206,7 @@ where
                 backup_lsn: state.backup_lsn,
                 peer_horizon_lsn: state.peer_horizon_lsn,
                 remote_consistent_lsn: state.remote_consistent_lsn,
+                oggit_required_lsn: state.oggit_required_lsn,
                 proposer_uuid: state.proposer_uuid,
             },
             pers: state,
@@ -216,6 +222,7 @@ where
         s.backup_lsn = self.inmem.backup_lsn;
         s.peer_horizon_lsn = self.inmem.peer_horizon_lsn;
         s.remote_consistent_lsn = self.inmem.remote_consistent_lsn;
+        s.oggit_required_lsn = self.inmem.oggit_required_lsn;
         s.proposer_uuid = self.inmem.proposer_uuid;
         s
     }
@@ -233,6 +240,7 @@ where
         self.inmem.backup_lsn = s.backup_lsn;
         self.inmem.peer_horizon_lsn = s.peer_horizon_lsn;
         self.inmem.remote_consistent_lsn = s.remote_consistent_lsn;
+        self.inmem.oggit_required_lsn = s.oggit_required_lsn;
         self.inmem.proposer_uuid = s.proposer_uuid;
         Ok(())
     }

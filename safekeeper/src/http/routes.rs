@@ -17,9 +17,9 @@ use hyper::{Body, Request, Response, StatusCode};
 use pem::Pem;
 use postgres_ffi::WAL_SEGMENT_SIZE;
 use safekeeper_api::models::{
-    AcceptorStateStatus, PullTimelineRequest, SafekeeperStatus, SkTimelineInfo, TenantDeleteResult,
-    TermSwitchApiEntry, TimelineCopyRequest, TimelineCreateRequest, TimelineDeleteResult,
-    TimelineStatus, TimelineTermBumpRequest,
+    AcceptorStateStatus, OggitRequiredLsnRequest, PullTimelineRequest, SafekeeperStatus,
+    SkTimelineInfo, TenantDeleteResult, TermSwitchApiEntry, TimelineCopyRequest,
+    TimelineCreateRequest, TimelineDeleteResult, TimelineStatus, TimelineTermBumpRequest,
 };
 use safekeeper_api::{ServerInfo, membership, models};
 use storage_broker::proto::{SafekeeperTimelineInfo, TenantTimelineId as ProtoTenantTimelineId};
@@ -211,11 +211,43 @@ async fn timeline_status_handler(request: Request<Body>) -> Result<Response<Body
         backup_lsn: inmem.backup_lsn,
         peer_horizon_lsn: inmem.peer_horizon_lsn,
         remote_consistent_lsn: inmem.remote_consistent_lsn,
+        oggit_required_lsn: inmem.oggit_required_lsn,
         peers: tli.get_peers(conf).await,
         walsenders: tli.get_walsenders().get_all_public(),
         walreceivers: tli.get_walreceivers().get_all(),
     };
     json_response(StatusCode::OK, status)
+}
+
+async fn oggit_required_lsn_handler(
+    mut request: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    let ttid = TenantTimelineId::new(
+        parse_request_param(&request, "tenant_id")?,
+        parse_request_param(&request, "timeline_id")?,
+    );
+    check_permission(&request, Some(ttid.tenant_id))?;
+
+    let request_data: OggitRequiredLsnRequest = json_request(&mut request).await?;
+    let global_timelines = get_global_timelines(&request);
+    let tli = global_timelines.get(ttid).map_err(ApiError::from)?;
+    let updated_lsn = request_data.oggit_required_lsn;
+
+    tli.map_control_file(|state| {
+        if updated_lsn != Lsn::MAX && updated_lsn < state.timeline_start_lsn {
+            anyhow::bail!(
+                "oggit_required_lsn {} is before timeline_start_lsn {}",
+                updated_lsn,
+                state.timeline_start_lsn
+            );
+        }
+        state.oggit_required_lsn = updated_lsn;
+        Ok(())
+    })
+    .await
+    .map_err(ApiError::BadRequest)?;
+
+    json_response(StatusCode::OK, request_data)
 }
 
 /// Deactivates the timeline and removes its data directory.
@@ -765,6 +797,10 @@ pub fn make_router(
         .get("/v1/tenant/:tenant_id/timeline/:timeline_id", |r| {
             request_span(r, timeline_status_handler)
         })
+        .put(
+            "/v1/tenant/:tenant_id/timeline/:timeline_id/oggit_required_lsn",
+            |r| request_span(r, oggit_required_lsn_handler),
+        )
         .delete("/v1/tenant/:tenant_id/timeline/:timeline_id", |r| {
             request_span(r, timeline_delete_handler)
         })

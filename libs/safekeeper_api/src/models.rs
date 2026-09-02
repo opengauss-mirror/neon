@@ -204,9 +204,16 @@ pub struct TimelineStatus {
     pub backup_lsn: Lsn,
     pub peer_horizon_lsn: Lsn,
     pub remote_consistent_lsn: Lsn,
+    pub oggit_required_lsn: Lsn,
     pub peers: Vec<PeerInfo>,
     pub walsenders: Vec<WalSenderState>,
     pub walreceivers: Vec<WalReceiverState>,
+}
+
+/// Request to update the oldest WAL LSN still needed by an oggit worker.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OggitRequiredLsnRequest {
+    pub oggit_required_lsn: Lsn,
 }
 
 /// Request to switch membership configuration.
@@ -236,6 +243,10 @@ fn lsn_invalid() -> Lsn {
     Lsn::INVALID
 }
 
+fn lsn_max() -> Lsn {
+    Lsn::MAX
+}
+
 /// Data about safekeeper's timeline, mirrors broker.proto.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkTimelineInfo {
@@ -257,6 +268,8 @@ pub struct SkTimelineInfo {
     pub remote_consistent_lsn: Lsn,
     #[serde(default = "lsn_invalid")]
     pub peer_horizon_lsn: Lsn,
+    #[serde(default = "lsn_max")]
+    pub oggit_required_lsn: Lsn,
     #[serde(default = "lsn_invalid")]
     pub local_start_lsn: Lsn,
     /// A connection string to use for WAL receiving.

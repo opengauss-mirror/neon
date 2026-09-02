@@ -48,6 +48,7 @@ pub(crate) struct StateSnapshot {
     pub(crate) cfile_commit_lsn: Lsn,
     pub(crate) cfile_remote_consistent_lsn: Lsn,
     pub(crate) cfile_backup_lsn: Lsn,
+    pub(crate) cfile_oggit_required_lsn: Lsn,
 
     // latest state
     pub(crate) flush_lsn: Lsn,
@@ -71,6 +72,7 @@ impl StateSnapshot {
             cfile_commit_lsn: state.commit_lsn,
             cfile_remote_consistent_lsn: state.remote_consistent_lsn,
             cfile_backup_lsn: state.backup_lsn,
+            cfile_oggit_required_lsn: state.oggit_required_lsn,
             flush_lsn: read_guard.sk.flush_lsn(),
             last_log_term: read_guard.sk.last_log_term(),
             cfile_last_persist_at: state.pers.last_persist_at(),
@@ -85,6 +87,7 @@ impl StateSnapshot {
             || state.inmem.backup_lsn > state.backup_lsn
             || state.inmem.peer_horizon_lsn > state.peer_horizon_lsn
             || state.inmem.remote_consistent_lsn > state.remote_consistent_lsn
+            || state.inmem.oggit_required_lsn != state.oggit_required_lsn
     }
 }
 

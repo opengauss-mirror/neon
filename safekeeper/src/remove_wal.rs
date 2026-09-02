@@ -7,7 +7,8 @@ use crate::timeline_manager::StateSnapshot;
 /// We hold WAL till it is consumed by
 /// 1) pageserver (remote_consistent_lsn)
 /// 2) s3 offloading.
-/// 3) Additionally we must store WAL since last local commit_lsn because
+/// 3) oggit logical decoding worker, if registered.
+/// 4) Additionally we must store WAL since last local commit_lsn because
 ///    that's where we start looking for last WAL record on start.
 ///
 /// If some peer safekeeper misses data it will fetch it from the remote
@@ -20,6 +21,9 @@ pub(crate) fn calc_horizon_lsn(state: &StateSnapshot, extra_horizon_lsn: Option<
     let mut horizon_lsn = state.cfile_remote_consistent_lsn;
     // we don't want to remove WAL that is not yet offloaded to s3
     horizon_lsn = min(horizon_lsn, state.cfile_backup_lsn);
+    // oggit_required_lsn mirrors logical slot restart_lsn semantics. When no
+    // oggit worker is registered it is Lsn::MAX and does not affect the min.
+    horizon_lsn = min(horizon_lsn, state.cfile_oggit_required_lsn);
     // Min by local commit_lsn to be able to begin reading WAL from somewhere on
     // sk start. Technically we don't allow local commit_lsn to be higher than
     // flush_lsn, but let's be double safe by including it as well.
