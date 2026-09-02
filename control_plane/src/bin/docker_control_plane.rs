@@ -929,3 +929,836 @@ async fn endpoint_generate_jwt(
         Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
+
+fn parse_compute_claims_scope(scope: &str) -> Result<ComputeClaimsScope> {
+    match scope {
+        "admin" => Ok(ComputeClaimsScope::Admin),
+        other => ComputeClaimsScope::from_str(other),
+    }
+}
+
+async fn tenant_list(State(state): State<Arc<AppState>>) -> Response {
+    match proxy_get_json(&state, "/control/v1/tenant?limit=10000").await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_create(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TenantCreateRequest>,
+) -> Response {
+    match handle_tenant_create(&state, req).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn tenant_describe(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller.tenant_describe(tenant_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller
+        .tenant_delete(tenant_id)
+        .await
+        .and_then(|_| cleanup_deleted_tenant_state(&state.state_dir, tenant_id))
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_locate(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+) -> Response {
+    match proxy_get_json(&state, &format!("/debug/v1/tenant/{tenant_id}/locate")).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_set_default(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let mut store = DockerStateStore::new(&state.state_dir);
+    match store
+        .set_default_tenant(tenant_id)
+        .and_then(|_| read_or_write_default_env(&state))
+    {
+        Ok(env) => Json(env).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn tenant_config_set(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+    Json(req): Json<TenantConfigSetRequest>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let config_req = TenantConfigRequest {
+        tenant_id,
+        config: req.config.unwrap_or_default(),
+    };
+    match storage_controller.set_tenant_config(&config_req).await {
+        Ok(()) => {
+            Json(json!({ "tenant_id": tenant_id, "config": config_req.config })).into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_import(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller.tenant_import(tenant_id).await {
+        Ok(response) => Json(json!({ "tenant_id": tenant_id, "import": response })).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_policy_set(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+    Json(req): Json<TenantPolicySetRequest>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let placement = match req
+        .placement
+        .as_deref()
+        .map(parse_placement_policy)
+        .transpose()
+    {
+        Ok(placement) => placement,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let scheduling = match req
+        .scheduling
+        .as_deref()
+        .map(parse_shard_scheduling_policy)
+        .transpose()
+    {
+        Ok(scheduling) => scheduling,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller
+        .tenant_policy(
+            tenant_id,
+            TenantPolicyRequest {
+                placement,
+                scheduling,
+            },
+        )
+        .await
+    {
+        Ok(()) => match storage_controller.tenant_describe(tenant_id).await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_shard_split(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+    Json(req): Json<TenantShardSplitDockerRequest>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller
+        .tenant_shard_split(
+            tenant_id,
+            TenantShardSplitRequest {
+                new_shard_count: req.shard_count,
+                new_stripe_size: req.stripe_size.map(ShardStripeSize),
+            },
+        )
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn tenant_set_preferred_az(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_id): AxumPath<String>,
+    Json(req): Json<TenantPreferredAzRequest>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match set_tenant_preferred_az(&storage_controller, tenant_id, req.preferred_az).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn timeline_list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TimelineListQuery>,
+) -> Response {
+    match handle_timeline_list(&state, query).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn timeline_create(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TimelineCreateRequest>,
+) -> Response {
+    match handle_timeline_create(&state, req).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn timeline_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath((tenant_id, timeline_id)): AxumPath<(String, String)>,
+) -> Response {
+    let tenant_id = match TenantId::from_str(&tenant_id).context("parsing tenant_id") {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let timeline_id = match TimelineId::from_str(&timeline_id).context("parsing timeline_id") {
+        Ok(timeline_id) => timeline_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    match handle_timeline_delete(&state, tenant_id, timeline_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn timeline_branch(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TimelineBranchRequest>,
+) -> Response {
+    match handle_timeline_branch(&state, req).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn timeline_import(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TimelineImportRequest>,
+) -> Response {
+    match handle_timeline_import(&state, req).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn mappings_list(State(state): State<Arc<AppState>>) -> Response {
+    match load_mappings(&state.state_dir) {
+        Ok(mappings) => Json(mappings).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn mapping_map(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TimelineBranchRequest>,
+) -> Response {
+    let tenant_id = match req
+        .tenant_id
+        .as_deref()
+        .map(TenantId::from_str)
+        .transpose()
+        .context("parsing tenant_id")
+    {
+        Ok(Some(tenant_id)) => tenant_id,
+        Ok(None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                anyhow!("tenant_id is required for mapping"),
+            );
+        }
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let timeline_id = match req
+        .timeline_id
+        .as_deref()
+        .map(TimelineId::from_str)
+        .transpose()
+        .context("parsing timeline_id")
+    {
+        Ok(Some(timeline_id)) => timeline_id,
+        Ok(None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                anyhow!("timeline_id is required for mapping"),
+            );
+        }
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let mut store = DockerStateStore::new(&state.state_dir);
+    match map_branch(&mut store, req.branch_name, tenant_id, timeline_id)
+        .and_then(|_| load_mappings(&state.state_dir))
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn handle_timeline_list(state: &AppState, query: TimelineListQuery) -> Result<Value> {
+    let mappings = load_mappings(&state.state_dir)?;
+    let storage_controller = docker_storage_controller_api(state)?;
+    let nodes = load_pageserver_nodes(state).await?;
+    let tenants = storage_controller.tenant_list(Some(10000)).await?;
+    let requested_tenant_id = query
+        .tenant_id
+        .as_deref()
+        .map(TenantId::from_str)
+        .transpose()
+        .context("parsing tenant_id")?;
+    let mut rows = Vec::new();
+
+    for tenant in tenants {
+        if requested_tenant_id.is_some_and(|wanted| wanted != tenant.tenant_id) {
+            continue;
+        }
+        for shard in tenant.shards {
+            let Some(node_id) = shard.node_attached else {
+                continue;
+            };
+            let Some(node) = nodes.get(&node_id.0) else {
+                continue;
+            };
+            let timelines = list_pageserver_timelines(state, node, shard.tenant_shard_id).await?;
+            for timeline in timelines {
+                let mut value = serde_json::to_value(&timeline)?;
+                if let Some(branch_name) = mapping_name_for_timeline(
+                    &mappings,
+                    timeline.tenant_id.tenant_id,
+                    timeline.timeline_id,
+                ) {
+                    value["branch_name"] = Value::String(branch_name);
+                }
+                value["pageserver_id"] = Value::String(node_id.to_string());
+                rows.push(value);
+            }
+        }
+    }
+
+    Ok(json!({
+        "timelines": rows,
+        "mappings": mappings,
+    }))
+}
+
+async fn list_pageserver_timelines(
+    state: &AppState,
+    node: &NodeDescribeResponse,
+    tenant_shard_id: TenantShardId,
+) -> Result<Vec<TimelineInfo>> {
+    let url = format!(
+        "http://{}:{}/v1/tenant/{}/timeline",
+        node.listen_http_addr, node.listen_http_port, tenant_shard_id
+    );
+    state
+        .client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<TimelineInfo>>()
+        .await
+        .with_context(|| format!("decoding pageserver timeline list from {url}"))
+}
+
+async fn delete_pageserver_timeline(
+    state: &AppState,
+    node: &NodeDescribeResponse,
+    tenant_shard_id: TenantShardId,
+    timeline_id: TimelineId,
+) -> Result<()> {
+    let url = format!(
+        "http://{}:{}/v1/tenant/{}/timeline/{}",
+        node.listen_http_addr, node.listen_http_port, tenant_shard_id, timeline_id
+    );
+    state
+        .client
+        .delete(&url)
+        .send()
+        .await?
+        .error_from_body()
+        .await
+        .with_context(|| format!("deleting pageserver timeline via {url}"))?;
+    Ok(())
+}
+
+fn mapping_name_for_timeline(
+    mappings: &Value,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+) -> Option<String> {
+    let tenant_id = tenant_id.to_string();
+    let timeline_id = timeline_id.to_string();
+    mappings
+        .as_object()?
+        .iter()
+        .find_map(|(branch_name, mapping)| {
+            let mapping_tenant_id = mapping.get("tenant_id").and_then(Value::as_str)?;
+            let mapping_timeline_id = mapping.get("timeline_id").and_then(Value::as_str)?;
+            (mapping_tenant_id == tenant_id && mapping_timeline_id == timeline_id)
+                .then(|| branch_name.clone())
+        })
+}
+
+async fn pageserver_list(State(state): State<Arc<AppState>>) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match list_pageservers(&storage_controller).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_add(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PageServerAddRequest>,
+) -> Response {
+    match handle_pageserver_add(&state, req) {
+        Ok(value) => (StatusCode::CREATED, Json(value)).into_response(),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+async fn pageserver_shards(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PageServerShardsQuery>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let tenant_id = match query
+        .tenant_id
+        .as_deref()
+        .map(TenantId::from_str)
+        .transpose()
+        .context("parsing tenant_id")
+    {
+        Ok(tenant_id) => tenant_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    match list_tenant_shards(&storage_controller, tenant_id, Some(10000)).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_drain(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node_id): AxumPath<u64>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match drain_pageserver(&storage_controller, utils::id::NodeId(node_id)).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_cancel_drain(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node_id): AxumPath<u64>,
+    Json(req): Json<PageServerCancelRequest>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let node_id = utils::id::NodeId(node_id);
+    let cancel_result = storage_controller.node_cancel_drain(node_id).await;
+    let cancel_result = match cancel_result {
+        Ok(()) => Ok(()),
+        Err(err) if err.to_string().contains("no drain in progress") => {
+            storage_controller
+                .node_configure(NodeConfigureRequest {
+                    node_id,
+                    availability: None,
+                    scheduling: Some(NodeSchedulingPolicy::Active),
+                })
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    match cancel_result {
+        Ok(()) => match wait_node_scheduling_policy(
+            &storage_controller,
+            node_id,
+            req.timeout_seconds.unwrap_or(120),
+            |sched| {
+                matches!(
+                    sched,
+                    NodeSchedulingPolicy::Active | NodeSchedulingPolicy::PauseForRestart
+                )
+            },
+        )
+        .await
+        {
+            Ok(policy) => Json(json!({ "node_id": node_id, "scheduling": policy })).into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_fill(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node_id): AxumPath<u64>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match fill_pageserver(&storage_controller, utils::id::NodeId(node_id)).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_cancel_fill(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node_id): AxumPath<u64>,
+    Json(req): Json<PageServerCancelRequest>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let node_id = utils::id::NodeId(node_id);
+    let cancel_result = storage_controller.node_cancel_fill(node_id).await;
+    let cancel_result = match cancel_result {
+        Ok(()) => Ok(()),
+        Err(err) if err.to_string().contains("no fill in progress") => {
+            storage_controller
+                .node_configure(NodeConfigureRequest {
+                    node_id,
+                    availability: None,
+                    scheduling: Some(NodeSchedulingPolicy::Active),
+                })
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    match cancel_result {
+        Ok(()) => match wait_node_scheduling_policy(
+            &storage_controller,
+            node_id,
+            req.timeout_seconds.unwrap_or(120),
+            |sched| matches!(sched, NodeSchedulingPolicy::Active),
+        )
+        .await
+        {
+            Ok(policy) => Json(json!({ "node_id": node_id, "scheduling": policy })).into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node_id): AxumPath<u64>,
+    Json(req): Json<PageServerDeleteRequest>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match start_pageserver_delete(
+        &storage_controller,
+        utils::id::NodeId(node_id),
+        req.force.unwrap_or(false),
+    )
+    .await
+    {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_bulk_migrate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PageServerBulkMigrateRequest>,
+) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match bulk_migrate_pageservers(&storage_controller, req).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_migrate(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_shard_id): AxumPath<String>,
+    Json(req): Json<PageServerMigrateRequest>,
+) -> Response {
+    let tenant_shard_id = match TenantShardId::from_str(&tenant_shard_id)
+        .with_context(|| format!("parsing tenant_shard_id {tenant_shard_id}"))
+    {
+        Ok(tenant_shard_id) => tenant_shard_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match migrate_tenant_shard(
+        &storage_controller,
+        TenantShardMigrateOptions {
+            tenant_shard_id,
+            node_id: utils::id::NodeId(req.node_id),
+            origin_node_id: req.origin_node_id.map(utils::id::NodeId),
+            prewarm: req.prewarm,
+            override_scheduler: req.override_scheduler.unwrap_or(false),
+        },
+    )
+    .await
+    {
+        Ok(value) => match wait_tenant_shard_attached(
+            &storage_controller,
+            tenant_shard_id,
+            utils::id::NodeId(req.node_id),
+            req.timeout_seconds.unwrap_or(900),
+        )
+        .await
+        {
+            Ok(tenant) => Json(json!({
+                "migration": value,
+                "tenant_shard_id": tenant_shard_id,
+                "node_attached": utils::id::NodeId(req.node_id),
+                "tenant": tenant,
+            }))
+            .into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_migrate_secondary(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_shard_id): AxumPath<String>,
+    Json(req): Json<PageServerMigrateRequest>,
+) -> Response {
+    let tenant_shard_id = match TenantShardId::from_str(&tenant_shard_id)
+        .with_context(|| format!("parsing tenant_shard_id {tenant_shard_id}"))
+    {
+        Ok(tenant_shard_id) => tenant_shard_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let mut migration_config = MigrationConfig {
+        override_scheduler: req.override_scheduler.unwrap_or(false),
+        ..Default::default()
+    };
+    if let Some(prewarm) = req.prewarm {
+        migration_config.prewarm = prewarm;
+    }
+    match storage_controller
+        .tenant_shard_migrate_secondary(
+            tenant_shard_id,
+            TenantShardMigrateRequest {
+                node_id: utils::id::NodeId(req.node_id),
+                origin_node_id: req.origin_node_id.map(utils::id::NodeId),
+                migration_config,
+            },
+        )
+        .await
+    {
+        Ok(value) => match wait_tenant_shard_secondary(
+            &storage_controller,
+            tenant_shard_id,
+            utils::id::NodeId(req.node_id),
+            req.timeout_seconds.unwrap_or(900),
+        )
+        .await
+        {
+            Ok(tenant) => Json(json!({
+                "migration": value,
+                "tenant_shard_id": tenant_shard_id,
+                "node_secondary": utils::id::NodeId(req.node_id),
+                "tenant": tenant,
+            }))
+            .into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn pageserver_cancel_reconcile(
+    State(state): State<Arc<AppState>>,
+    AxumPath(tenant_shard_id): AxumPath<String>,
+) -> Response {
+    let tenant_shard_id = match TenantShardId::from_str(&tenant_shard_id)
+        .with_context(|| format!("parsing tenant_shard_id {tenant_shard_id}"))
+    {
+        Ok(tenant_shard_id) => tenant_shard_id,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller
+        .tenant_shard_cancel_reconcile(tenant_shard_id)
+        .await
+    {
+        Ok(()) => Json(json!({ "tenant_shard_id": tenant_shard_id })).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn safekeeper_list(State(state): State<Arc<AppState>>) -> Response {
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match storage_controller.safekeeper_list().await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn safekeeper_scheduling(
+    State(state): State<Arc<AppState>>,
+    AxumPath(node_id): AxumPath<u64>,
+    Json(req): Json<SafekeeperSchedulingRequest>,
+) -> Response {
+    let scheduling_policy = match SkSchedulingPolicy::from_str(&req.scheduling_policy) {
+        Ok(policy) => policy,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+    };
+    let storage_controller = match docker_storage_controller_api(&state) {
+        Ok(storage_controller) => storage_controller,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let node_id = utils::id::NodeId(node_id);
+    match storage_controller
+        .safekeeper_scheduling(
+            node_id,
+            SafekeeperSchedulingPolicyRequest { scheduling_policy },
+        )
+        .await
+    {
+        Ok(()) => match storage_controller.safekeeper_list().await {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+        },
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+async fn safekeeper_timeline_migrate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SafekeeperTimelineMigrateRequest>,
+) -> Response {
+    match handle_safekeeper_timeline_migrate(&state, req).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+fn parse_placement_policy(value: &str) -> Result<PlacementPolicy> {
+    match value {
+        "detached" => Ok(PlacementPolicy::Detached),
+        "secondary" => Ok(PlacementPolicy::Secondary),
+        _ if value.starts_with("attached:") => {
+            let count = value
+                .split_once(':')
+                .and_then(|(_, count)| count.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    anyhow!("invalid placement policy {value}, expected attached:<n>")
+                })?;
+            Ok(PlacementPolicy::Attached(count))
+        }
+        _ => {
+            bail!("unknown placement policy {value}, expected detached, secondary, or attached:<n>")
+        }
+    }
+}
