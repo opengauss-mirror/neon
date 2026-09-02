@@ -3396,3 +3396,707 @@ async fn tenant_pageserver_connstring(
 
     Ok(parts.join(","))
 }
+
+async fn render_endpoint_config(state: &AppState, endpoint: &EndpointRecord) -> Result<()> {
+    ensure_auth_keys(&state.state_dir)?;
+    let config: Value =
+        serde_json::from_str(BASE_COMPUTE_CONFIG).context("decoding base compute config")?;
+    let pageserver_connstring = tenant_pageserver_connstring(
+        state,
+        &endpoint.tenant_id,
+        endpoint.endpoint_pageserver_id,
+        endpoint.grpc,
+    )
+    .await?;
+    let mut endpoint = endpoint.clone();
+    endpoint.auth_token = Some(generate_storage_auth_token(&state.state_dir, &endpoint)?);
+    endpoint.endpoint_storage_addr = Some(
+        endpoint
+            .endpoint_storage_addr
+            .clone()
+            .unwrap_or_else(|| "endpoint_storage:9993".to_string()),
+    );
+    endpoint.endpoint_storage_token = Some(generate_endpoint_storage_token(
+        &state.state_dir,
+        &endpoint,
+        Duration::from_secs(86400),
+    )?);
+    let mappings = load_mappings(&state.state_dir).unwrap_or_else(|_| json!({}));
+    let branch_mapping = mappings.get(&endpoint.branch_name);
+    let ancestor_timeline_id = branch_mapping
+        .and_then(|mapping| mapping.get("ancestor_timeline_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let ancestor_start_lsn = branch_mapping
+        .and_then(|mapping| mapping.get("ancestor_start_lsn"))
+        .and_then(Value::as_str)
+        .unwrap_or("0/0");
+    let (safekeeper_connstrings, safekeepers_generation) =
+        effective_safekeeper_connstrings(state, &endpoint)?;
+    let oggit_safekeeper_http_urls = safekeeper_http_urls_for_connstrings(&safekeeper_connstrings);
+    let config = render_endpoint_config_spec(EndpointRenderInput {
+        base_config: config,
+        tenant_id: endpoint.tenant_id.clone(),
+        timeline_id: endpoint.timeline_id.clone(),
+        endpoint_id: endpoint.endpoint_id.clone(),
+        pageserver_connstring,
+        safekeeper_connstrings,
+        safekeepers_generation,
+        storage_auth_token: endpoint.auth_token.clone(),
+        endpoint_storage_addr: endpoint.endpoint_storage_addr.clone(),
+        endpoint_storage_token: endpoint.endpoint_storage_token.clone(),
+        autoprewarm: endpoint.autoprewarm,
+        offload_lfc_interval_seconds: endpoint.offload_lfc_interval_seconds,
+        pg_version: endpoint.pg_version,
+        static_lsn: endpoint.static_lsn.clone(),
+        hot_standby: endpoint.hot_standby,
+        enable_oggit: endpoint.enable_oggit,
+        oggit_database: endpoint.oggit_database.clone(),
+        oggit_ancestor_timeline_id: ancestor_timeline_id.to_string(),
+        oggit_branch_start_lsn: ancestor_start_lsn.to_string(),
+        oggit_safekeeper_http_urls,
+    })?;
+    let mut config = config;
+    apply_endpoint_record_options(&mut config, &endpoint)?;
+
+    let path = resolve_state_path(&state.state_dir, &endpoint.config_path);
+    write_json_file(&path, &config)?;
+    write_endpoint_record(&state.state_dir, &endpoint)?;
+    Ok(())
+}
+
+fn effective_safekeeper_connstrings(
+    state: &AppState,
+    endpoint: &EndpointRecord,
+) -> Result<(Vec<String>, u32)> {
+    if let Some(connstrings) = &endpoint.safekeeper_connstrings {
+        return Ok((
+            connstrings.clone(),
+            endpoint.safekeepers_generation.unwrap_or(1),
+        ));
+    }
+
+    if let Some(value) = load_timeline_safekeepers_value(
+        &state.state_dir,
+        &endpoint.tenant_id,
+        &endpoint.timeline_id,
+    )? {
+        if let Some((connstrings, generation)) = timeline_safekeeper_connstrings_from_value(&value)
+        {
+            return Ok((connstrings, generation));
+        }
+    }
+
+    Ok((default_safekeeper_connstrings(), 1))
+}
+
+fn default_safekeeper_connstrings() -> Vec<String> {
+    vec!["safekeeper:5454".to_string()]
+}
+
+fn safekeeper_http_urls_for_connstrings(connstrings: &[String]) -> String {
+    connstrings
+        .iter()
+        .map(|connstring| {
+            let host = connstring
+                .split_once(':')
+                .map(|(host, _port)| host)
+                .unwrap_or(connstring);
+            format!("http://{host}:7676")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn apply_endpoint_record_options(config: &mut Value, endpoint: &EndpointRecord) -> Result<()> {
+    let spec = config
+        .get_mut("spec")
+        .ok_or_else(|| anyhow!("base compute config has no spec field"))?;
+    spec["config_only"] = json!(endpoint.config_only);
+    spec["grpc"] = json!(endpoint.grpc);
+    if let Some(remote_ext_base_url) = &endpoint.remote_ext_base_url {
+        spec["remote_ext_base_url"] = json!(remote_ext_base_url);
+    }
+    if let Some(privileged_role_name) = &endpoint.privileged_role_name {
+        spec["privileged_role_name"] = json!(privileged_role_name);
+    }
+    if endpoint.create_test_user {
+        let cluster = spec
+            .get_mut("cluster")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow!("spec.cluster is missing or not an object"))?;
+        let roles = cluster
+            .entry("roles")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("spec.cluster.roles is not an array"))?;
+        if !roles
+            .iter()
+            .any(|role| role.get("name").and_then(Value::as_str) == Some("test"))
+        {
+            roles.push(json!({
+                "name": "test",
+                "encrypted_password": null,
+                "options": null
+            }));
+        }
+        let databases = cluster
+            .entry("databases")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("spec.cluster.databases is not an array"))?;
+        if !databases
+            .iter()
+            .any(|database| database.get("name").and_then(Value::as_str) == Some("neondb"))
+        {
+            databases.push(json!({
+                "name": "neondb",
+                "owner": "test",
+                "options": null,
+                "restrict_conn": false,
+                "invalid": false
+            }));
+        }
+    }
+    if let Some(extra_config) = &endpoint.extra_config {
+        apply_extra_config(config, extra_config)?;
+    }
+    let spec = config
+        .get_mut("spec")
+        .ok_or_else(|| anyhow!("compute config has no spec field after applying extra_config"))?;
+    let final_skip_pg_catalog_updates =
+        skip_pg_catalog_updates(spec, endpoint.skip_pg_catalog_updates);
+    spec["skip_pg_catalog_updates"] = json!(final_skip_pg_catalog_updates);
+    Ok(())
+}
+
+fn skip_pg_catalog_updates(spec: &Value, endpoint_skip_pg_catalog_updates: bool) -> bool {
+    if oggit_enabled(spec) {
+        false
+    } else {
+        endpoint_skip_pg_catalog_updates
+    }
+}
+
+fn oggit_enabled(spec: &Value) -> bool {
+    spec.get("cluster")
+        .and_then(|cluster| cluster.get("settings"))
+        .and_then(Value::as_array)
+        .and_then(|settings| {
+            settings.iter().rev().find(|setting| {
+                setting.get("name").and_then(Value::as_str) == Some("neon.oggit_enabled")
+            })
+        })
+        .and_then(|setting| setting.get("value"))
+        .map_or(false, setting_value_enabled)
+}
+
+fn setting_value_enabled(value: &Value) -> bool {
+    match value {
+        Value::Bool(enabled) => *enabled,
+        Value::String(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "on" | "true" | "1" | "yes"
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_with_oggit_setting(value: Value) -> Value {
+        json!({
+            "cluster": {
+                "settings": [{
+                    "name": "neon.oggit_enabled",
+                    "value": value,
+                    "vartype": "bool"
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn oggit_on_forces_catalog_updates() {
+        let spec = spec_with_oggit_setting(json!("on"));
+
+        assert!(!skip_pg_catalog_updates(&spec, true));
+    }
+
+    #[test]
+    fn oggit_off_preserves_endpoint_skip_catalog_updates() {
+        let spec = spec_with_oggit_setting(json!("off"));
+
+        assert!(skip_pg_catalog_updates(&spec, true));
+    }
+
+    #[test]
+    fn oggit_enabled_accepts_supported_string_values_ignoring_case() {
+        for value in ["ON", "True", "1", "YeS"] {
+            let spec = spec_with_oggit_setting(json!(value));
+
+            assert!(oggit_enabled(&spec), "expected {value:?} to enable oggit");
+        }
+    }
+
+    #[test]
+    fn oggit_enabled_accepts_json_boolean_true() {
+        let spec = spec_with_oggit_setting(json!(true));
+
+        assert!(oggit_enabled(&spec));
+    }
+
+    #[test]
+    fn extra_config_is_applied_before_catalog_update_decision() {
+        let mut config = json!({
+            "spec": {
+                "cluster": {
+                    "settings": []
+                }
+            }
+        });
+        let extra_config = json!({
+            "spec.cluster.settings": [{
+                "name": "neon.oggit_enabled",
+                "value": true,
+                "vartype": "bool"
+            }]
+        });
+
+        apply_extra_config(&mut config, &extra_config).unwrap();
+
+        assert!(!skip_pg_catalog_updates(&config["spec"], true));
+    }
+}
+
+fn apply_extra_config(config: &mut Value, extra_config: &Value) -> Result<()> {
+    let Some(items) = extra_config.as_object() else {
+        bail!("extra_config must be a JSON object");
+    };
+    for (path, value) in items {
+        set_json_path(config, path, value.clone())?;
+    }
+    Ok(())
+}
+
+fn set_json_path(root: &mut Value, path: &str, value: Value) -> Result<()> {
+    let mut current = root;
+    let mut parts = path.split('.').peekable();
+    while let Some(part) = parts.next() {
+        if part.is_empty() {
+            bail!("empty path segment in extra config key {path:?}");
+        }
+        if parts.peek().is_none() {
+            let object = current
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("extra config path {path:?} traverses non-object"))?;
+            object.insert(part.to_string(), value);
+            return Ok(());
+        }
+        let object = current
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("extra config path {path:?} traverses non-object"))?;
+        current = object.entry(part).or_insert_with(|| json!({}));
+    }
+    bail!("empty extra config path")
+}
+
+fn render_endpoint_override(state: &AppState, endpoint: &EndpointRecord) -> Result<()> {
+    let service_name = &endpoint.service_name;
+    let endpoint_id = &endpoint.endpoint_id;
+    let safekeeper_depends = endpoint_safekeeper_depends(state, endpoint)?
+        .into_iter()
+        .map(|service| format!("      - {service}\n"))
+        .collect::<String>();
+    let data_dir = endpoint
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| format!(".neon/{service_name}"));
+    let host_pg_port = endpoint.host_pg_port.unwrap_or(55433);
+    let host_http_port = endpoint.host_http_port.unwrap_or(3080);
+    let internal_http_port = endpoint.internal_http_port.unwrap_or(3080);
+    let override_path = state
+        .state_dir
+        .join("overrides/endpoints")
+        .join(format!("{endpoint_id}.yml"));
+    let content = format!(
+        r#"services:
+  {service_name}:
+    restart: "no"
+    image: ${{COMPUTE_IMAGE:-{compute_image}}}
+    pull_policy: never
+    environment:
+      - OG_VERSION=${{OG_VERSION:-{og_version}}}
+      - PATH=/usr/local/${{OG_VERSION:-{og_version}}}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - OTEL_SDK_DISABLED=true
+      - DOCKER_CONTROL_PLANE_MODE=true
+      - COMPUTE_CONFIG_FILE=/control_plane/endpoints/{endpoint_id}/config.json
+      - ENDPOINT_ID={endpoint_id}
+      - ENDPOINT_SERVICE_NAME={service_name}
+      - ENDPOINT_STATUS_DIR=/control_plane/endpoints/{endpoint_id}
+      - INSTANCE_ID=docker-local-{endpoint_id}
+      - COMPUTE_REMOTE_HBA_CIDR=${{COMPUTE_REMOTE_HBA_CIDR:-172.30.0.0/20}}
+      - BRANCH_MERGE_USER_ENABLED=${{BRANCH_MERGE_USER_ENABLED:-true}}
+      - BRANCH_MERGE_USER=${{BRANCH_MERGE_USER:-branch_merge}}
+      - BRANCH_MERGE_PASSWORD=${{BRANCH_MERGE_PASSWORD:-Branch_merge@123}}
+      - OGGIT_FDW_USERMAPPING_KEY=${{OGGIT_FDW_USERMAPPING_KEY:-MapKey@123}}
+      - STORAGE_CONTROLLER_HTTP=${{STORAGE_CONTROLLER_HTTP:-http://storage_controller:1234}}
+    volumes:
+      - ./{data_dir}:/var/db/gaussdb
+      - ./.neon/control_plane:/control_plane
+      - ../compute/shell/compute.sh:/shell/compute.sh:ro
+    ports:
+      - {host_pg_port}:55433
+      - {host_http_port}:{internal_http_port}
+    entrypoint: ["/shell/compute.sh"]
+    networks:
+      default:
+        aliases:
+          - {service_name}
+    depends_on:
+{safekeeper_depends}      - pageserver
+      - endpoint_storage
+"#,
+        compute_image = state.compute_image,
+        og_version = state.og_version,
+    );
+    std::fs::create_dir_all(override_path.parent().unwrap())?;
+    std::fs::write(&override_path, content)
+        .with_context(|| format!("writing {}", override_path.display()))?;
+    Ok(())
+}
+
+fn endpoint_safekeeper_depends(state: &AppState, endpoint: &EndpointRecord) -> Result<Vec<String>> {
+    let (connstrings, _generation) = effective_safekeeper_connstrings(state, endpoint)?;
+    let mut services = Vec::new();
+    for connstring in connstrings {
+        let host = connstring
+            .split_once(':')
+            .map(|(host, _port)| host)
+            .unwrap_or(connstring.as_str());
+        let is_local_safekeeper = host == "safekeeper"
+            || host
+                .strip_prefix("safekeeper")
+                .map(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+                .unwrap_or(false);
+        if is_local_safekeeper && !services.iter().any(|service| service == host) {
+            services.push(host.to_string());
+        }
+    }
+    if services.is_empty() {
+        services.push("safekeeper".to_string());
+    }
+    Ok(services)
+}
+
+fn render_runtime_override(state: &AppState) -> Result<()> {
+    let path = state.state_dir.join("overrides/runtime.yml");
+    let content = format!(
+        "# Runtime services are defined in docker-compose.yml for the current PoC.\n# docker_local includes this file so dynamically generated endpoint overrides\n# can share the same invocation shape.\nservices: {{}}\n# storage_image={}\n# compute_image={}\n",
+        state.storage_image, state.compute_image
+    );
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn running_endpoints_for_tenant(state_dir: &Path, tenant_id: &str) -> Result<Vec<EndpointRecord>> {
+    let endpoints = load_endpoints(state_dir)?
+        .into_iter()
+        .filter(|endpoint| endpoint.tenant_id == tenant_id && endpoint.status == "Running")
+        .collect();
+    Ok(endpoints)
+}
+
+fn load_endpoint(state_dir: &Path, endpoint_id: &str) -> Result<EndpointRecord> {
+    let path = state_dir
+        .join("endpoints")
+        .join(endpoint_id)
+        .join("endpoint.json");
+    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    serde_json::from_reader(file).with_context(|| format!("decoding {}", path.display()))
+}
+
+fn ensure_auth_keys(state_dir: &Path) -> Result<()> {
+    let private_key_path = state_dir.join("auth_private_key.pem");
+    let public_key_path = state_dir.join("auth_public_key.pem");
+    if let Some(parent) = private_key_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if !private_key_path.exists() {
+        std::fs::write(&private_key_path, DOCKER_DEV_PRIVATE_KEY)
+            .with_context(|| format!("writing {}", private_key_path.display()))?;
+    }
+    if !public_key_path.exists() {
+        std::fs::write(&public_key_path, DOCKER_DEV_PUBLIC_KEY)
+            .with_context(|| format!("writing {}", public_key_path.display()))?;
+    }
+    DecodingKey::from_ed_pem(
+        &std::fs::read(&public_key_path)
+            .with_context(|| format!("reading {}", public_key_path.display()))?,
+    )
+    .context("validating docker dev public key")?;
+    let _ = Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    Ok(())
+}
+
+fn auth_private_pem(state_dir: &Path) -> Result<pem::Pem> {
+    ensure_auth_keys(state_dir)?;
+    let private_key_path = state_dir.join("auth_private_key.pem");
+    pem::parse(
+        std::fs::read(&private_key_path)
+            .with_context(|| format!("reading {}", private_key_path.display()))?,
+    )
+    .context("parsing docker dev private key")
+}
+
+fn generate_compute_token(
+    state_dir: &Path,
+    endpoint: &EndpointRecord,
+    scope: Option<ComputeClaimsScope>,
+) -> Result<String> {
+    let claims = ComputeClaims {
+        audience: match scope {
+            Some(ComputeClaimsScope::Admin) => Some(vec![COMPUTE_AUDIENCE.to_string()]),
+            _ => None,
+        },
+        compute_id: match scope {
+            Some(ComputeClaimsScope::Admin) => None,
+            _ => Some(endpoint.endpoint_id.clone()),
+        },
+        scope,
+    };
+    encode_from_key_file(&claims, &auth_private_pem(state_dir)?)
+}
+
+fn generate_storage_auth_token(state_dir: &Path, endpoint: &EndpointRecord) -> Result<String> {
+    let tenant_id = TenantId::from_str(&endpoint.tenant_id)
+        .with_context(|| format!("parsing tenant id {}", endpoint.tenant_id))?;
+    let claims = Claims::new(Some(tenant_id), Scope::Tenant);
+    encode_from_key_file(&claims, &auth_private_pem(state_dir)?)
+}
+
+fn generate_endpoint_storage_token(
+    state_dir: &Path,
+    endpoint: &EndpointRecord,
+    ttl: Duration,
+) -> Result<String> {
+    let exp = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)? + ttl).as_secs();
+    let claims = EndpointStorageClaims {
+        tenant_id: TenantId::from_str(&endpoint.tenant_id)
+            .with_context(|| format!("parsing tenant id {}", endpoint.tenant_id))?,
+        timeline_id: TimelineId::from_str(&endpoint.timeline_id)
+            .with_context(|| format!("parsing timeline id {}", endpoint.timeline_id))?,
+        endpoint_id: EndpointId::from(endpoint.endpoint_id.clone()),
+        exp,
+    };
+    encode_from_key_file(&claims, &auth_private_pem(state_dir)?)
+}
+
+fn branch_endpoint_connstr(
+    endpoint: &EndpointRecord,
+    user: &str,
+    database: &str,
+) -> Result<String> {
+    let password = if user == "branch_merge" {
+        std::env::var("BRANCH_MERGE_PASSWORD").unwrap_or_else(|_| "Branch_merge@123".to_string())
+    } else {
+        std::env::var("BRANCH_TARGET_PASSWORD").unwrap_or_default()
+    };
+    let escaped_password = urlencoding::encode(&password);
+    let compute_pg = endpoint
+        .compute_pg
+        .clone()
+        .unwrap_or_else(|| format!("{}:55433", endpoint.service_name));
+    let auth = if password.is_empty() {
+        user.to_string()
+    } else {
+        format!("{user}:{escaped_password}")
+    };
+    Ok(format!(
+        "postgresql://{auth}@{compute_pg}/{database}?sslmode=disable"
+    ))
+}
+
+fn branch_target_endpoint_ref_by_endpoint(
+    state: &AppState,
+    endpoint_id: &str,
+    user: &str,
+    database: &str,
+) -> Result<BranchEndpointRef> {
+    let endpoint = load_endpoint(&state.state_dir, endpoint_id)?;
+    if endpoint.status != "Running" {
+        bail!("endpoint {endpoint_id} is not Running");
+    }
+    let connstr = branch_endpoint_connstr(&endpoint, user, database)?;
+    BranchEndpointRef::from_connstr(
+        &connstr,
+        Some(&endpoint.branch_name),
+        endpoint_id,
+        user,
+        database,
+    )
+}
+
+fn branch_target_endpoint_ref_by_branch(
+    state: &AppState,
+    branch_name: &str,
+    tenant_id: Option<&str>,
+    user: &str,
+    database: &str,
+) -> Result<BranchEndpointRef> {
+    let endpoints = load_endpoints(&state.state_dir)?;
+    let matches = endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.branch_name == branch_name
+                && endpoint.status == "Running"
+                && tenant_id.map_or(true, |tenant_id| endpoint.tenant_id == tenant_id)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [endpoint] => {
+            let connstr = branch_endpoint_connstr(endpoint, user, database)?;
+            BranchEndpointRef::from_connstr(
+                &connstr,
+                Some(&endpoint.branch_name),
+                &endpoint.endpoint_id,
+                user,
+                database,
+            )
+        }
+        [] => bail!("no Running endpoint found for branch {branch_name}"),
+        _ => bail!(
+            "multiple Running endpoints found for branch {branch_name}; use --target-endpoint"
+        ),
+    }
+}
+
+fn branch_target_endpoint_ref_from_selector(
+    state: &AppState,
+    tenant_id: Option<&str>,
+    target_branch: Option<&str>,
+    target_endpoint: Option<&str>,
+    target_connstr: Option<&str>,
+    user: Option<&str>,
+    database: Option<&str>,
+) -> Result<BranchEndpointRef> {
+    let user = user.unwrap_or("branch_merge");
+    let database = database.context("database is required")?;
+    let selector_count = [
+        target_branch.is_some(),
+        target_endpoint.is_some(),
+        target_connstr.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if selector_count != 1 {
+        bail!("specify exactly one of --target-branch, --target-endpoint, or --target-connstr");
+    }
+
+    if let Some(connstr) = target_connstr {
+        let branch_name = target_branch.map(str::to_string);
+        return BranchEndpointRef::from_connstr(
+            connstr,
+            branch_name.as_ref(),
+            "target",
+            user,
+            database,
+        );
+    }
+    if let Some(endpoint_id) = target_endpoint {
+        let endpoint = load_endpoint(&state.state_dir, endpoint_id)?;
+        if let Some(tenant_id) = tenant_id {
+            if endpoint.tenant_id != tenant_id {
+                bail!(
+                    "endpoint {endpoint_id} belongs to tenant {}, not {tenant_id}",
+                    endpoint.tenant_id
+                );
+            }
+        }
+        if let Some(branch_name) = target_branch {
+            if endpoint.branch_name != branch_name {
+                bail!(
+                    "endpoint {endpoint_id} runs branch {}, not {branch_name}",
+                    endpoint.branch_name
+                );
+            }
+        }
+        return branch_target_endpoint_ref_by_endpoint(state, endpoint_id, user, database);
+    }
+    branch_target_endpoint_ref_by_branch(
+        state,
+        target_branch.context("target_branch is required")?,
+        tenant_id,
+        user,
+        database,
+    )
+}
+
+fn branch_target_endpoint_ref_from_request(
+    state: &AppState,
+    req: &BranchTargetRequest,
+) -> Result<BranchEndpointRef> {
+    branch_target_endpoint_ref_from_selector(
+        state,
+        req.tenant_id.as_deref(),
+        req.target_branch.as_deref(),
+        req.target_endpoint.as_deref(),
+        req.target_connstr.as_deref(),
+        req.user.as_deref(),
+        req.database.as_deref(),
+    )
+}
+
+fn branch_run_endpoint_refs(
+    state: &AppState,
+    req: &BranchRunRequest,
+) -> Result<(BranchEndpointRef, BranchEndpointRef)> {
+    let source_endpoint_id = req
+        .source_endpoint
+        .as_deref()
+        .context("source_endpoint is required")?;
+    let target_endpoint_id = req
+        .target_endpoint
+        .as_deref()
+        .context("target_endpoint is required")?;
+    Ok((
+        branch_target_endpoint_ref_by_endpoint(
+            state,
+            source_endpoint_id,
+            "branch_merge",
+            &req.database,
+        )?,
+        branch_target_endpoint_ref_by_endpoint(
+            state,
+            target_endpoint_id,
+            "branch_merge",
+            &req.database,
+        )?,
+    ))
+}
+
+fn branch_target_request_options(
+    state: &AppState,
+    merge_id: String,
+    req: BranchTargetRequest,
+) -> Result<BranchResolveOptions> {
+    let target_endpoint = branch_target_endpoint_ref_from_request(state, &req)?;
+    let conflict_id = req.conflict_id.context("conflict_id is required")?;
+    let resolution = req
+        .resolution
+        .as_deref()
+        .map(BranchConflictResolution::from_str)
+        .transpose()?;
+    Ok(BranchResolveOptions {
+        target_endpoint,
+        merge_id,
+        conflict_id,
+        resolution,
+        custom_sql: req.custom_sql,
+    })
+}
