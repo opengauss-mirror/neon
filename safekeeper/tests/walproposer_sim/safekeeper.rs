@@ -164,6 +164,8 @@ pub fn run_server(os: NodeOs, disk: Arc<SafekeeperDisk>) -> Result<()> {
         max_timeline_disk_usage_bytes: 0,
         /* END_HADRON */
         wal_backup_enabled: false,
+        remote_wal_gc_enabled: false,
+        remote_wal_gc_interval: Duration::from_secs(60),
         listen_pg_addr_tenant_only: None,
         advertise_pg_addr: None,
         availability_zone: None,

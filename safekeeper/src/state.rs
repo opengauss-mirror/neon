@@ -62,6 +62,10 @@ pub struct TimelinePersistentState {
     /// pushed to s3. We don't remove WAL beyond it. Persisted only for
     /// informational purposes, we receive it from pageserver (or broker).
     pub remote_consistent_lsn: Lsn,
+    /// Remote complete WAL deletion watermark. Objects below this LSN must not
+    /// be required for future recovery of this timeline.
+    #[serde(default)]
+    pub remote_wal_gc_lsn: Lsn,
     /// Oldest WAL LSN still needed by an oggit logical decoding worker.
     /// Lsn::MAX means that no oggit worker retention horizon is registered.
     pub oggit_required_lsn: Lsn,
@@ -147,6 +151,7 @@ impl TimelinePersistentState {
             backup_lsn: start_lsn,
             peer_horizon_lsn: start_lsn,
             remote_consistent_lsn: Lsn(0),
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
@@ -178,6 +183,7 @@ pub struct TimelineMemState {
     pub backup_lsn: Lsn,
     pub peer_horizon_lsn: Lsn,
     pub remote_consistent_lsn: Lsn,
+    pub remote_wal_gc_lsn: Lsn,
     pub oggit_required_lsn: Lsn,
     #[serde(with = "hex")]
     pub proposer_uuid: PgUuid,
@@ -206,6 +212,7 @@ where
                 backup_lsn: state.backup_lsn,
                 peer_horizon_lsn: state.peer_horizon_lsn,
                 remote_consistent_lsn: state.remote_consistent_lsn,
+                remote_wal_gc_lsn: state.remote_wal_gc_lsn,
                 oggit_required_lsn: state.oggit_required_lsn,
                 proposer_uuid: state.proposer_uuid,
             },
@@ -222,6 +229,7 @@ where
         s.backup_lsn = self.inmem.backup_lsn;
         s.peer_horizon_lsn = self.inmem.peer_horizon_lsn;
         s.remote_consistent_lsn = self.inmem.remote_consistent_lsn;
+        s.remote_wal_gc_lsn = self.inmem.remote_wal_gc_lsn;
         s.oggit_required_lsn = self.inmem.oggit_required_lsn;
         s.proposer_uuid = self.inmem.proposer_uuid;
         s
@@ -240,6 +248,7 @@ where
         self.inmem.backup_lsn = s.backup_lsn;
         self.inmem.peer_horizon_lsn = s.peer_horizon_lsn;
         self.inmem.remote_consistent_lsn = s.remote_consistent_lsn;
+        self.inmem.remote_wal_gc_lsn = s.remote_wal_gc_lsn;
         self.inmem.oggit_required_lsn = s.oggit_required_lsn;
         self.inmem.proposer_uuid = s.proposer_uuid;
         Ok(())
@@ -276,6 +285,22 @@ where
     /// current one.
     pub async fn membership_switch(&mut self, to: Configuration) -> Result<MembershipSwitchResult> {
         let before = self.mconf.clone();
+        let adds_member = to
+            .members
+            .m
+            .iter()
+            .chain(
+                to.new_members
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|set| set.m.iter()),
+            )
+            .any(|member| !before.contains(member.id));
+        if self.remote_wal_gc_lsn != Lsn::INVALID && adds_member {
+            bail!(
+                "cannot add a Safekeeper after remote WAL GC has advanced; create the member before enabling remote WAL GC"
+            );
+        }
         // Is switch allowed?
         if to.generation <= self.mconf.generation {
             info!(

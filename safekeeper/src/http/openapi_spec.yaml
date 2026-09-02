@@ -283,6 +283,22 @@ components:
           type: string
         peer_horizon_lsn:
           type: string
+        remote_wal_gc_lsn:
+          type: string
+        membership_generation:
+          type: integer
+        membership_is_joint:
+          type: boolean
+        cfile_commit_lsn:
+          type: string
+        cfile_backup_lsn:
+          type: string
+        cfile_remote_consistent_lsn:
+          type: string
+        cfile_peer_horizon_lsn:
+          type: string
+        cfile_oggit_required_lsn:
+          type: string
         safekeeper_connstr:
           type: string
 
@@ -326,6 +342,8 @@ components:
         peer_horizon_lsn:
           type: string
         remote_consistent_lsn:
+          type: string
+        remote_wal_gc_lsn:
           type: string
 
     AcceptorStateStatus:

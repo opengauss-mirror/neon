@@ -52,6 +52,17 @@ fn peer_info_from_sk_info(sk_info: &SafekeeperTimelineInfo, ts: Instant) -> Peer
         last_log_term: sk_info.last_log_term,
         flush_lsn: Lsn(sk_info.flush_lsn),
         commit_lsn: Lsn(sk_info.commit_lsn),
+        backup_lsn: Lsn(sk_info.backup_lsn),
+        remote_consistent_lsn: Lsn(sk_info.remote_consistent_lsn),
+        peer_horizon_lsn: Lsn(sk_info.peer_horizon_lsn),
+        remote_wal_gc_lsn: Lsn(sk_info.remote_wal_gc_lsn),
+        membership_generation: sk_info.membership_generation,
+        membership_is_joint: sk_info.membership_is_joint,
+        cfile_commit_lsn: Lsn(sk_info.cfile_commit_lsn),
+        cfile_backup_lsn: Lsn(sk_info.cfile_backup_lsn),
+        cfile_remote_consistent_lsn: Lsn(sk_info.cfile_remote_consistent_lsn),
+        cfile_peer_horizon_lsn: Lsn(sk_info.cfile_peer_horizon_lsn),
+        cfile_oggit_required_lsn: Lsn(sk_info.cfile_oggit_required_lsn),
         local_start_lsn: Lsn(sk_info.local_start_lsn),
         pg_connstr: sk_info.safekeeper_connstr.clone(),
         http_connstr: sk_info.http_connstr.clone(),
@@ -380,6 +391,14 @@ impl SharedState {
             https_connstr: conf.listen_https_addr.to_owned(),
             backup_lsn: self.sk.state().inmem.backup_lsn.0,
             local_start_lsn: self.sk.state().local_start_lsn.0,
+            remote_wal_gc_lsn: self.sk.state().inmem.remote_wal_gc_lsn.0,
+            membership_generation: self.sk.state().mconf.generation.into_inner(),
+            membership_is_joint: self.sk.state().mconf.new_members.is_some(),
+            cfile_commit_lsn: self.sk.state().commit_lsn.0,
+            cfile_backup_lsn: self.sk.state().backup_lsn.0,
+            cfile_remote_consistent_lsn: self.sk.state().remote_consistent_lsn.0,
+            cfile_peer_horizon_lsn: self.sk.state().peer_horizon_lsn.0,
+            cfile_oggit_required_lsn: self.sk.state().oggit_required_lsn.0,
             availability_zone: conf.availability_zone.clone(),
             standby_horizon: standby_apply_lsn.0,
         }
@@ -790,6 +809,24 @@ impl Timeline {
         // we should check whether to shut down offloader, but this will be done
         // soon by peer communication anyway.
         Ok(())
+    }
+
+    /// Persist the remote complete WAL deletion watermark before deleting any
+    /// corresponding objects. A persisted watermark makes a partial deletion
+    /// after a crash fail closed: callers must never rely on those objects again.
+    pub async fn set_remote_wal_gc_lsn(self: &Arc<Self>, gc_lsn: Lsn) -> Result<()> {
+        let mut shared_state = self.write_shared_state().await;
+        if gc_lsn <= shared_state.sk.state().inmem.remote_wal_gc_lsn {
+            return Ok(());
+        }
+
+        let mut persistent_state = shared_state.sk.state().start_change();
+        persistent_state.remote_wal_gc_lsn = gc_lsn;
+        shared_state
+            .sk
+            .state_mut()
+            .finish_change(&persistent_state)
+            .await
     }
 
     /// Get safekeeper info for broadcasting to broker and other peers.

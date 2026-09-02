@@ -164,6 +164,12 @@ struct Args {
     /// WAL backup horizon.
     #[arg(long)]
     disable_wal_backup: bool,
+    /// Enable conservative garbage collection of complete WAL objects from remote storage.
+    #[arg(long)]
+    enable_remote_wal_gc: bool,
+    /// Interval between remote complete WAL garbage collection attempts.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "60s")]
+    remote_wal_gc_interval: Duration,
     /// If given, enables auth on incoming connections to WAL service endpoint
     /// (--listen-pg). Value specifies path to a .pem public key used for
     /// validations of JWT tokens. Empty string is allowed and means disabling
@@ -433,6 +439,8 @@ async fn main() -> anyhow::Result<()> {
         max_timeline_disk_usage_bytes: args.max_timeline_disk_usage_bytes,
         /* END_HADRON */
         wal_backup_enabled: !args.disable_wal_backup,
+        remote_wal_gc_enabled: args.enable_remote_wal_gc,
+        remote_wal_gc_interval: args.remote_wal_gc_interval,
         backup_parallel_jobs: args.wal_backup_parallel_jobs,
         pg_auth,
         pg_tenant_only_auth,
