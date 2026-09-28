@@ -1,0 +1,2074 @@
+THIRD PARTY OPEN SOURCE SOFTWARE NOTICE
+
+Project: neon_docker (Neon integration with openGauss)
+Inventory date: 2026-09-28
+
+This notice identifies third-party open source components visible in this checkout and
+its dependency lockfiles. Rights and licenses belong to their respective owners.
+The project itself is licensed under Apache-2.0; see LICENSE and NOTICE.
+
+Scope and provenance
+--------------------
+Sources: Cargo.lock, poetry.lock, build-tools/package-lock.json,
+compute/package-lock.json, test_runner/pg_clients/typescript/serverless-driver/package-lock.json,
+.gitmodules, the included openGauss and connector submodules, and the openGauss Dockerfiles.
+Registry package licenses are the declarations in the exact-version Cargo.toml,
+PyPI release metadata, or package-lock.json. OR and AND expressions are copied
+as declared; no license choice is implied. Version lists include development and
+test dependencies, so they are not a claim that every item ships in every image.
+Image OS packages are listed separately because their exact versions are selected
+when the image is built. The PostgreSQL vendor submodules and the
+test_runner/pg_clients/typescript/postgresql-client tree are outside this review.
+Other packages whose names contain 'postgres' are included only where they occur
+in the non-vendor dependency lockfiles.
+
+Warranty disclaimer
+-------------------
+THE OPEN SOURCE SOFTWARE IS PROVIDED BY ITS RESPECTIVE COPYRIGHT HOLDERS
+UNDER THE TERMS OF ITS APPLICABLE LICENSES. REFER TO THOSE LICENSES FOR
+WARRANTY DISCLAIMERS AND LIMITATIONS OF LIABILITY.
+
+Copyright notices and license texts for directly included source
+---------------------------------------------------------------
+
+Software: openGauss server
+Source: https://gitcode.com/opengauss/openGauss-server
+Included source: vendor/openGauss
+Checked-out revision: e317fe9f4a52fda8c1c4cfefcbc70debb23ddb7c
+License: MulanPSL-2.0
+Copyright notice: vendor/openGauss/COPYRIGHT.
+License text: vendor/openGauss/License and the appendix below.
+Its third-party notices: vendor/openGauss/Third_Party_Open_Source_Software_Notice.
+
+Software: openGauss Rust connector
+Source: https://gitcode.com/opengauss/openGauss-connector-rust
+Included source: vendor/openGauss-connector-rust
+Checked-out revision: 2748b862461ff1c364cc724ce3356a3d9f4746a7
+License: MIT OR Apache-2.0 (component declarations)
+Copyright and license texts: see vendor/openGauss-connector-rust/LICENSE
+and the LICENSE-MIT / LICENSE-APACHE files within its component crates; representative
+texts are reproduced in the appendix below.
+
+Software: diesel-async 0.5.2
+Source: https://gitcode.com/wlff234/diesel-async
+Included source: vendor/diesel-async-0.5.2
+Checked-out revision: 7b592787b60a6ccb69d32ded7df5750b0d409fd4
+License: MIT OR Apache-2.0
+Copyright and license texts: see vendor/diesel-async-0.5.2/LICENSE-MIT
+and vendor/diesel-async-0.5.2/LICENSE-APACHE; both are reproduced below.
+
+Rust packages (Cargo.lock)
+--------------------------
+Format: Software | Version | Declared license | Source
+The 54 lockfile entries without a registry or Git source are workspace/local
+packages, not listed as third-party registry packages.
+addr2line | 0.24.2 | Apache-2.0 OR MIT | https://crates.io/crates/addr2line/0.24.2
+adler | 1.0.2 | 0BSD OR MIT OR Apache-2.0 | https://crates.io/crates/adler/1.0.2
+adler2 | 2.0.0 | 0BSD OR MIT OR Apache-2.0 | https://crates.io/crates/adler2/2.0.0
+ahash | 0.8.11 | MIT OR Apache-2.0 | https://crates.io/crates/ahash/0.8.11
+aho-corasick | 1.0.1 | Unlicense OR MIT | https://crates.io/crates/aho-corasick/1.0.1
+aliasable | 0.1.3 | MIT | https://crates.io/crates/aliasable/0.1.3
+aligned-vec | 0.6.1 | MIT | https://crates.io/crates/aligned-vec/0.6.1
+allocator-api2 | 0.2.16 | MIT OR Apache-2.0 | https://crates.io/crates/allocator-api2/0.2.16
+android-tzdata | 0.1.1 | MIT OR Apache-2.0 | https://crates.io/crates/android-tzdata/0.1.1
+android_system_properties | 0.1.5 | MIT/Apache-2.0 | https://crates.io/crates/android_system_properties/0.1.5
+anes | 0.1.6 | MIT OR Apache-2.0 | https://crates.io/crates/anes/0.1.6
+anstream | 0.6.15 | MIT OR Apache-2.0 | https://crates.io/crates/anstream/0.6.15
+anstyle | 1.0.8 | MIT OR Apache-2.0 | https://crates.io/crates/anstyle/1.0.8
+anstyle-parse | 0.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/anstyle-parse/0.2.0
+anstyle-query | 1.0.0 | MIT OR Apache-2.0 | https://crates.io/crates/anstyle-query/1.0.0
+anstyle-wincon | 3.0.4 | MIT OR Apache-2.0 | https://crates.io/crates/anstyle-wincon/3.0.4
+anyhow | 1.0.94 | MIT OR Apache-2.0 | https://crates.io/crates/anyhow/1.0.94
+approx | 0.3.2 | Apache-2.0 | https://crates.io/crates/approx/0.3.2
+approx | 0.5.1 | Apache-2.0 | https://crates.io/crates/approx/0.5.1
+arc-swap | 1.7.1 | MIT OR Apache-2.0 | https://crates.io/crates/arc-swap/1.7.1
+archery | 0.5.0 | MPL-2.0 | https://crates.io/crates/archery/0.5.0
+array-init | 2.1.0 | MIT OR Apache-2.0 | https://crates.io/crates/array-init/2.1.0
+arrayvec | 0.7.6 | MIT OR Apache-2.0 | https://crates.io/crates/arrayvec/0.7.6
+assert-json-diff | 2.0.2 | MIT | https://crates.io/crates/assert-json-diff/2.0.2
+astral-tokio-tar | 0.5.6 | MIT OR Apache-2.0 | https://crates.io/crates/astral-tokio-tar/0.5.6
+async-channel | 1.9.0 | Apache-2.0 OR MIT | https://crates.io/crates/async-channel/1.9.0
+async-compression | 0.4.5 | MIT OR Apache-2.0 | https://crates.io/crates/async-compression/0.4.5
+async-lock | 3.2.0 | Apache-2.0 OR MIT | https://crates.io/crates/async-lock/3.2.0
+async-stream | 0.3.5 | MIT | https://crates.io/crates/async-stream/0.3.5
+async-stream-impl | 0.3.5 | MIT | https://crates.io/crates/async-stream-impl/0.3.5
+async-trait | 0.1.68 | MIT OR Apache-2.0 | https://crates.io/crates/async-trait/0.1.68
+atomic-take | 1.1.0 | MIT | https://crates.io/crates/atomic-take/1.1.0
+atomic-waker | 1.1.2 | Apache-2.0 OR MIT | https://crates.io/crates/atomic-waker/1.1.2
+atty | 0.2.14 | MIT | https://crates.io/crates/atty/0.2.14
+autocfg | 1.1.0 | Apache-2.0 OR MIT | https://crates.io/crates/autocfg/1.1.0
+aws-config | 1.5.10 | Apache-2.0 | https://crates.io/crates/aws-config/1.5.10
+aws-credential-types | 1.2.1 | Apache-2.0 | https://crates.io/crates/aws-credential-types/1.2.1
+aws-runtime | 1.4.4 | Apache-2.0 | https://crates.io/crates/aws-runtime/1.4.4
+aws-sdk-iam | 1.53.0 | Apache-2.0 | https://crates.io/crates/aws-sdk-iam/1.53.0
+aws-sdk-kms | 1.51.0 | Apache-2.0 | https://crates.io/crates/aws-sdk-kms/1.51.0
+aws-sdk-s3 | 1.65.0 | Apache-2.0 | https://crates.io/crates/aws-sdk-s3/1.65.0
+aws-sdk-sso | 1.50.0 | Apache-2.0 | https://crates.io/crates/aws-sdk-sso/1.50.0
+aws-sdk-ssooidc | 1.51.0 | Apache-2.0 | https://crates.io/crates/aws-sdk-ssooidc/1.51.0
+aws-sdk-sts | 1.51.0 | Apache-2.0 | https://crates.io/crates/aws-sdk-sts/1.51.0
+aws-sigv4 | 1.2.6 | Apache-2.0 | https://crates.io/crates/aws-sigv4/1.2.6
+aws-smithy-async | 1.2.1 | Apache-2.0 | https://crates.io/crates/aws-smithy-async/1.2.1
+aws-smithy-checksums | 0.60.13 | Apache-2.0 | https://crates.io/crates/aws-smithy-checksums/0.60.13
+aws-smithy-eventstream | 0.60.5 | Apache-2.0 | https://crates.io/crates/aws-smithy-eventstream/0.60.5
+aws-smithy-http | 0.60.11 | Apache-2.0 | https://crates.io/crates/aws-smithy-http/0.60.11
+aws-smithy-json | 0.60.7 | Apache-2.0 | https://crates.io/crates/aws-smithy-json/0.60.7
+aws-smithy-json | 0.61.1 | Apache-2.0 | https://crates.io/crates/aws-smithy-json/0.61.1
+aws-smithy-query | 0.60.7 | Apache-2.0 | https://crates.io/crates/aws-smithy-query/0.60.7
+aws-smithy-runtime | 1.7.4 | Apache-2.0 | https://crates.io/crates/aws-smithy-runtime/1.7.4
+aws-smithy-runtime-api | 1.7.3 | Apache-2.0 | https://crates.io/crates/aws-smithy-runtime-api/1.7.3
+aws-smithy-types | 1.2.9 | Apache-2.0 | https://crates.io/crates/aws-smithy-types/1.2.9
+aws-smithy-xml | 0.60.9 | Apache-2.0 | https://crates.io/crates/aws-smithy-xml/0.60.9
+aws-types | 1.3.3 | Apache-2.0 | https://crates.io/crates/aws-types/1.3.3
+axum | 0.8.1 | MIT | https://crates.io/crates/axum/0.8.1
+axum-core | 0.5.0 | MIT | https://crates.io/crates/axum-core/0.5.0
+axum-extra | 0.10.0 | MIT | https://crates.io/crates/axum-extra/0.10.0
+azure_core | 0.21.0 | MIT | git+https://github.com/neondatabase/azure-sdk-for-rust.git?branch=neon#f64bd57262ced51afce5d8909c06dcb11a6dd85a
+azure_identity | 0.21.0 | MIT | git+https://github.com/neondatabase/azure-sdk-for-rust.git?branch=neon#f64bd57262ced51afce5d8909c06dcb11a6dd85a
+azure_storage | 0.21.0 | MIT | git+https://github.com/neondatabase/azure-sdk-for-rust.git?branch=neon#f64bd57262ced51afce5d8909c06dcb11a6dd85a
+azure_storage_blobs | 0.21.0 | MIT | git+https://github.com/neondatabase/azure-sdk-for-rust.git?branch=neon#f64bd57262ced51afce5d8909c06dcb11a6dd85a
+azure_svc_blobstorage | 0.21.0 | MIT | git+https://github.com/neondatabase/azure-sdk-for-rust.git?branch=neon#f64bd57262ced51afce5d8909c06dcb11a6dd85a
+backtrace | 0.3.74 | MIT OR Apache-2.0 | https://crates.io/crates/backtrace/0.3.74
+base-x | 0.2.11 | MIT | https://crates.io/crates/base-x/0.2.11
+base16ct | 0.1.1 | Apache-2.0 OR MIT | https://crates.io/crates/base16ct/0.1.1
+base16ct | 0.2.0 | Apache-2.0 OR MIT | https://crates.io/crates/base16ct/0.2.0
+base64 | 0.13.1 | MIT/Apache-2.0 | https://crates.io/crates/base64/0.13.1
+base64 | 0.21.7 | MIT OR Apache-2.0 | https://crates.io/crates/base64/0.21.7
+base64 | 0.22.1 | MIT OR Apache-2.0 | https://crates.io/crates/base64/0.22.1
+base64-simd | 0.8.0 | MIT | https://crates.io/crates/base64-simd/0.8.0
+base64ct | 1.6.0 | Apache-2.0 OR MIT | https://crates.io/crates/base64ct/1.6.0
+bb8 | 0.8.6 | MIT | https://crates.io/crates/bb8/0.8.6
+bcder | 0.7.4 | BSD-3-Clause | https://crates.io/crates/bcder/0.7.4
+bincode | 1.3.3 | MIT | https://crates.io/crates/bincode/1.3.3
+bindgen | 0.71.1 | BSD-3-Clause | https://crates.io/crates/bindgen/0.71.1
+bit-vec | 0.6.3 | MIT/Apache-2.0 | https://crates.io/crates/bit-vec/0.6.3
+bit_field | 0.10.2 | Apache-2.0/MIT | https://crates.io/crates/bit_field/0.10.2
+bitflags | 1.3.2 | MIT/Apache-2.0 | https://crates.io/crates/bitflags/1.3.2
+bitflags | 2.8.0 | MIT OR Apache-2.0 | https://crates.io/crates/bitflags/2.8.0
+block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://crates.io/crates/block-buffer/0.10.4
+block-buffer | 0.9.0 | MIT OR Apache-2.0 | https://crates.io/crates/block-buffer/0.9.0
+bstr | 1.5.0 | MIT OR Apache-2.0 | https://crates.io/crates/bstr/1.5.0
+bumpalo | 3.13.0 | MIT/Apache-2.0 | https://crates.io/crates/bumpalo/3.13.0
+bytemuck | 1.16.3 | Zlib OR Apache-2.0 OR MIT | https://crates.io/crates/bytemuck/1.16.3
+byteorder | 1.4.3 | Unlicense OR MIT | https://crates.io/crates/byteorder/1.4.3
+bytes | 1.9.0 | MIT | https://crates.io/crates/bytes/1.9.0
+bytes-utils | 0.1.3 | Apache-2.0/MIT | https://crates.io/crates/bytes-utils/0.1.3
+camino | 1.1.6 | MIT OR Apache-2.0 | https://crates.io/crates/camino/1.1.6
+camino-tempfile | 1.0.2 | MIT OR Apache-2.0 | https://crates.io/crates/camino-tempfile/1.0.2
+cast | 0.3.0 | MIT OR Apache-2.0 | https://crates.io/crates/cast/0.3.0
+cbindgen | 0.29.0 | MPL-2.0 | https://crates.io/crates/cbindgen/0.29.0
+cc | 1.2.16 | MIT OR Apache-2.0 | https://crates.io/crates/cc/1.2.16
+cexpr | 0.6.0 | Apache-2.0/MIT | https://crates.io/crates/cexpr/0.6.0
+cfg-if | 1.0.0 | MIT/Apache-2.0 | https://crates.io/crates/cfg-if/1.0.0
+cfg_aliases | 0.2.1 | MIT | https://crates.io/crates/cfg_aliases/0.2.1
+cgroups-rs | 0.3.3 | MIT OR Apache-2.0 | https://crates.io/crates/cgroups-rs/0.3.3
+chrono | 0.4.38 | MIT OR Apache-2.0 | https://crates.io/crates/chrono/0.4.38
+ciborium | 0.2.2 | Apache-2.0 | https://crates.io/crates/ciborium/0.2.2
+ciborium-io | 0.2.2 | Apache-2.0 | https://crates.io/crates/ciborium-io/0.2.2
+ciborium-ll | 0.2.2 | Apache-2.0 | https://crates.io/crates/ciborium-ll/0.2.2
+clang-sys | 1.6.1 | Apache-2.0 | https://crates.io/crates/clang-sys/1.6.1
+clap | 2.34.0 | MIT | https://crates.io/crates/clap/2.34.0
+clap | 4.5.22 | MIT OR Apache-2.0 | https://crates.io/crates/clap/4.5.22
+clap_builder | 4.5.22 | MIT OR Apache-2.0 | https://crates.io/crates/clap_builder/4.5.22
+clap_derive | 4.5.18 | MIT OR Apache-2.0 | https://crates.io/crates/clap_derive/4.5.18
+clap_lex | 0.7.3 | MIT OR Apache-2.0 | https://crates.io/crates/clap_lex/0.7.3
+clashmap | 1.0.0 | MIT | https://crates.io/crates/clashmap/1.0.0
+colorchoice | 1.0.0 | MIT OR Apache-2.0 | https://crates.io/crates/colorchoice/1.0.0
+combine | 4.6.6 | MIT | https://crates.io/crates/combine/4.6.6
+comfy-table | 7.1.1 | MIT | https://crates.io/crates/comfy-table/7.1.1
+concurrent-queue | 2.3.0 | Apache-2.0 OR MIT | https://crates.io/crates/concurrent-queue/2.3.0
+const-oid | 0.9.6 | Apache-2.0 OR MIT | https://crates.io/crates/const-oid/0.9.6
+const-random | 0.1.17 | MIT OR Apache-2.0 | https://crates.io/crates/const-random/0.1.17
+const-random-macro | 0.1.16 | MIT OR Apache-2.0 | https://crates.io/crates/const-random-macro/0.1.16
+const_fn | 0.4.11 | Apache-2.0 OR MIT | https://crates.io/crates/const_fn/0.4.11
+const_format | 0.2.30 | Zlib | https://crates.io/crates/const_format/0.2.30
+const_format_proc_macros | 0.2.29 | Zlib | https://crates.io/crates/const_format_proc_macros/0.2.29
+core-foundation | 0.9.3 | MIT / Apache-2.0 | https://crates.io/crates/core-foundation/0.9.3
+core-foundation-sys | 0.8.4 | MIT / Apache-2.0 | https://crates.io/crates/core-foundation-sys/0.8.4
+cpp_demangle | 0.4.4 | MIT OR Apache-2.0 | https://crates.io/crates/cpp_demangle/0.4.4
+cpufeatures | 0.2.9 | MIT OR Apache-2.0 | https://crates.io/crates/cpufeatures/0.2.9
+crc32c | 0.6.8 | Apache-2.0/MIT | https://crates.io/crates/crc32c/0.6.8
+crc32fast | 1.3.2 | MIT OR Apache-2.0 | https://crates.io/crates/crc32fast/1.3.2
+criterion | 0.3.6 | Apache-2.0/MIT | https://crates.io/crates/criterion/0.3.6
+criterion | 0.5.1 | Apache-2.0 OR MIT | https://crates.io/crates/criterion/0.5.1
+criterion-plot | 0.4.5 | MIT/Apache-2.0 | https://crates.io/crates/criterion-plot/0.4.5
+criterion-plot | 0.5.0 | MIT/Apache-2.0 | https://crates.io/crates/criterion-plot/0.5.0
+cron | 0.15.0 | MIT OR Apache-2.0 | https://crates.io/crates/cron/0.15.0
+crossbeam-channel | 0.5.8 | MIT OR Apache-2.0 | https://crates.io/crates/crossbeam-channel/0.5.8
+crossbeam-deque | 0.8.5 | MIT OR Apache-2.0 | https://crates.io/crates/crossbeam-deque/0.8.5
+crossbeam-epoch | 0.9.18 | MIT OR Apache-2.0 | https://crates.io/crates/crossbeam-epoch/0.9.18
+crossbeam-utils | 0.8.19 | MIT OR Apache-2.0 | https://crates.io/crates/crossbeam-utils/0.8.19
+crossterm | 0.27.0 | MIT | https://crates.io/crates/crossterm/0.27.0
+crossterm_winapi | 0.9.1 | MIT | https://crates.io/crates/crossterm_winapi/0.9.1
+crunchy | 0.2.2 | MIT | https://crates.io/crates/crunchy/0.2.2
+crypto-bigint | 0.4.9 | Apache-2.0 OR MIT | https://crates.io/crates/crypto-bigint/0.4.9
+crypto-bigint | 0.5.5 | Apache-2.0 OR MIT | https://crates.io/crates/crypto-bigint/0.5.5
+crypto-common | 0.1.6 | MIT OR Apache-2.0 | https://crates.io/crates/crypto-common/0.1.6
+crypto-mac | 0.11.0 | MIT OR Apache-2.0 | https://crates.io/crates/crypto-mac/0.11.0
+csv | 1.4.0 | Unlicense/MIT | https://crates.io/crates/csv/1.4.0
+csv-core | 0.1.13 | Unlicense/MIT | https://crates.io/crates/csv-core/0.1.13
+curve25519-dalek | 4.1.3 | BSD-3-Clause | https://crates.io/crates/curve25519-dalek/4.1.3
+curve25519-dalek-derive | 0.1.1 | MIT/Apache-2.0 | https://crates.io/crates/curve25519-dalek-derive/0.1.1
+darling | 0.20.1 | MIT | https://crates.io/crates/darling/0.20.1
+darling_core | 0.20.1 | MIT | https://crates.io/crates/darling_core/0.20.1
+darling_macro | 0.20.1 | MIT | https://crates.io/crates/darling_macro/0.20.1
+dashmap | 5.5.0 | MIT | https://crates.io/crates/dashmap/5.5.0
+dashmap | 6.1.0 | MIT | https://crates.io/crates/dashmap/6.1.0
+data-encoding | 2.4.0 | MIT | https://crates.io/crates/data-encoding/2.4.0
+debugid | 0.8.0 | Apache-2.0 | https://crates.io/crates/debugid/0.8.0
+der | 0.6.1 | Apache-2.0 OR MIT | https://crates.io/crates/der/0.6.1
+der | 0.7.8 | Apache-2.0 OR MIT | https://crates.io/crates/der/0.7.8
+der_derive | 0.7.3 | Apache-2.0 OR MIT | https://crates.io/crates/der_derive/0.7.3
+deranged | 0.3.11 | MIT OR Apache-2.0 | https://crates.io/crates/deranged/0.3.11
+diatomic-waker | 0.2.3 | MIT OR Apache-2.0 | https://crates.io/crates/diatomic-waker/0.2.3
+diesel | 2.2.6 | MIT OR Apache-2.0 | https://crates.io/crates/diesel/2.2.6
+diesel_derives | 2.2.1 | MIT OR Apache-2.0 | https://crates.io/crates/diesel_derives/2.2.1
+diesel_migrations | 2.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/diesel_migrations/2.2.0
+diesel_table_macro_syntax | 0.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/diesel_table_macro_syntax/0.2.0
+difflib | 0.4.0 | MIT | https://crates.io/crates/difflib/0.4.0
+digest | 0.10.7 | MIT OR Apache-2.0 | https://crates.io/crates/digest/0.10.7
+digest | 0.9.0 | MIT OR Apache-2.0 | https://crates.io/crates/digest/0.9.0
+discard | 1.0.4 | MIT | https://crates.io/crates/discard/1.0.4
+displaydoc | 0.2.4 | MIT OR Apache-2.0 | https://crates.io/crates/displaydoc/0.2.4
+dlv-list | 0.5.2 | MIT OR Apache-2.0 | https://crates.io/crates/dlv-list/0.5.2
+dsl_auto_type | 0.1.1 | MIT OR Apache-2.0 | https://crates.io/crates/dsl_auto_type/0.1.1
+dyn-clone | 1.0.14 | MIT OR Apache-2.0 | https://crates.io/crates/dyn-clone/1.0.14
+ecdsa | 0.14.8 | Apache-2.0 OR MIT | https://crates.io/crates/ecdsa/0.14.8
+ecdsa | 0.16.9 | Apache-2.0 OR MIT | https://crates.io/crates/ecdsa/0.16.9
+ed25519 | 2.2.3 | Apache-2.0 OR MIT | https://crates.io/crates/ed25519/2.2.3
+ed25519-dalek | 2.1.1 | BSD-3-Clause | https://crates.io/crates/ed25519-dalek/2.1.1
+either | 1.8.1 | MIT OR Apache-2.0 | https://crates.io/crates/either/1.8.1
+elliptic-curve | 0.12.3 | Apache-2.0 OR MIT | https://crates.io/crates/elliptic-curve/0.12.3
+elliptic-curve | 0.13.8 | Apache-2.0 OR MIT | https://crates.io/crates/elliptic-curve/0.13.8
+enum-map | 2.5.0 | MIT OR Apache-2.0 | https://crates.io/crates/enum-map/2.5.0
+enum-map-derive | 0.11.0 | MIT OR Apache-2.0 | https://crates.io/crates/enum-map-derive/0.11.0
+enumset | 1.1.2 | MIT/Apache-2.0 | https://crates.io/crates/enumset/1.1.2
+enumset_derive | 0.8.1 | MIT/Apache-2.0 | https://crates.io/crates/enumset_derive/0.8.1
+env_filter | 0.1.3 | MIT OR Apache-2.0 | https://crates.io/crates/env_filter/0.1.3
+env_logger | 0.11.7 | MIT OR Apache-2.0 | https://crates.io/crates/env_logger/0.11.7
+env_logger | 0.9.3 | MIT OR Apache-2.0 | https://crates.io/crates/env_logger/0.9.3
+equator | 0.2.2 | MIT | https://crates.io/crates/equator/0.2.2
+equator-macro | 0.2.1 | MIT | https://crates.io/crates/equator-macro/0.2.1
+equivalent | 1.0.1 | Apache-2.0 OR MIT | https://crates.io/crates/equivalent/1.0.1
+errno | 0.3.14 | MIT OR Apache-2.0 | https://crates.io/crates/errno/0.3.14
+eui48 | 0.4.6 | MIT/Apache-2.0 | https://crates.io/crates/eui48/0.4.6
+eui48 | 1.1.0 | MIT/Apache-2.0 | https://crates.io/crates/eui48/1.1.0
+event-listener | 2.5.3 | Apache-2.0 OR MIT | https://crates.io/crates/event-listener/2.5.3
+event-listener | 4.0.0 | Apache-2.0 OR MIT | https://crates.io/crates/event-listener/4.0.0
+event-listener-strategy | 0.4.0 | Apache-2.0 OR MIT | https://crates.io/crates/event-listener-strategy/0.4.0
+fail | 0.5.1 | Apache-2.0 | https://crates.io/crates/fail/0.5.1
+fallible-iterator | 0.2.0 | MIT/Apache-2.0 | https://crates.io/crates/fallible-iterator/0.2.0
+fastrand | 1.9.0 | Apache-2.0 OR MIT | https://crates.io/crates/fastrand/1.9.0
+fastrand | 2.2.0 | Apache-2.0 OR MIT | https://crates.io/crates/fastrand/2.2.0
+ff | 0.12.1 | MIT/Apache-2.0 | https://crates.io/crates/ff/0.12.1
+ff | 0.13.0 | MIT/Apache-2.0 | https://crates.io/crates/ff/0.13.0
+fiat-crypto | 0.2.9 | MIT OR Apache-2.0 OR BSD-1-Clause | https://crates.io/crates/fiat-crypto/0.2.9
+filetime | 0.2.22 | MIT/Apache-2.0 | https://crates.io/crates/filetime/0.2.22
+findshlibs | 0.10.2 | MIT OR Apache-2.0 | https://crates.io/crates/findshlibs/0.10.2
+fixedbitset | 0.4.2 | MIT/Apache-2.0 | https://crates.io/crates/fixedbitset/0.4.2
+flagset | 0.4.6 | Apache-2.0 | https://crates.io/crates/flagset/0.4.6
+flate2 | 1.0.26 | MIT OR Apache-2.0 | https://crates.io/crates/flate2/1.0.26
+fnv | 1.0.7 | Apache-2.0 / MIT | https://crates.io/crates/fnv/1.0.7
+form_urlencoded | 1.2.1 | MIT OR Apache-2.0 | https://crates.io/crates/form_urlencoded/1.2.1
+framed-websockets | 0.1.0 | Apache-2.0 | git+https://github.com/neondatabase/framed-websockets#34eff3d6f8cfccbc5f35e4f65314ff7328621127
+fsevent-sys | 4.1.0 | MIT | https://crates.io/crates/fsevent-sys/4.1.0
+fuchsia-cprng | 0.1.1 | BSD-3-Clause-style text in bundled LICENSE file | https://crates.io/crates/fuchsia-cprng/0.1.1
+futures | 0.3.28 | MIT OR Apache-2.0 | https://crates.io/crates/futures/0.3.28
+futures-channel | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-channel/0.3.31
+futures-core | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-core/0.3.31
+futures-executor | 0.3.28 | MIT OR Apache-2.0 | https://crates.io/crates/futures-executor/0.3.28
+futures-io | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-io/0.3.31
+futures-lite | 1.13.0 | Apache-2.0 OR MIT | https://crates.io/crates/futures-lite/1.13.0
+futures-macro | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-macro/0.3.31
+futures-sink | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-sink/0.3.31
+futures-task | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-task/0.3.31
+futures-timer | 3.0.3 | MIT/Apache-2.0 | https://crates.io/crates/futures-timer/3.0.3
+futures-util | 0.3.31 | MIT OR Apache-2.0 | https://crates.io/crates/futures-util/0.3.31
+gcc | 0.3.55 | MIT/Apache-2.0 | https://crates.io/crates/gcc/0.3.55
+gen_ops | 0.4.0 | MIT | https://crates.io/crates/gen_ops/0.4.0
+generic-array | 0.14.7 | MIT | https://crates.io/crates/generic-array/0.14.7
+geo-types | 0.6.2 | MIT/Apache-2.0 | https://crates.io/crates/geo-types/0.6.2
+geo-types | 0.7.17 | MIT OR Apache-2.0 | https://crates.io/crates/geo-types/0.7.17
+getrandom | 0.1.16 | MIT OR Apache-2.0 | https://crates.io/crates/getrandom/0.1.16
+getrandom | 0.2.11 | MIT OR Apache-2.0 | https://crates.io/crates/getrandom/0.2.11
+getrandom | 0.3.3 | MIT OR Apache-2.0 | https://crates.io/crates/getrandom/0.3.3
+gettid | 0.1.3 | 0BSD | https://crates.io/crates/gettid/0.1.3
+gimli | 0.31.1 | MIT OR Apache-2.0 | https://crates.io/crates/gimli/0.31.1
+git-version | 0.3.9 | BSD-2-Clause | https://crates.io/crates/git-version/0.3.9
+git-version-macro | 0.3.9 | BSD-2-Clause | https://crates.io/crates/git-version-macro/0.3.9
+glob | 0.3.1 | MIT OR Apache-2.0 | https://crates.io/crates/glob/0.3.1
+governor | 0.8.0 | MIT | https://crates.io/crates/governor/0.8.0
+group | 0.12.1 | MIT/Apache-2.0 | https://crates.io/crates/group/0.12.1
+group | 0.13.0 | MIT/Apache-2.0 | https://crates.io/crates/group/0.13.0
+h2 | 0.3.26 | MIT | https://crates.io/crates/h2/0.3.26
+h2 | 0.4.4 | MIT | https://crates.io/crates/h2/0.4.4
+half | 1.8.3 | MIT OR Apache-2.0 | https://crates.io/crates/half/1.8.3
+half | 2.4.1 | MIT OR Apache-2.0 | https://crates.io/crates/half/2.4.1
+hashbrown | 0.12.3 | MIT OR Apache-2.0 | https://crates.io/crates/hashbrown/0.12.3
+hashbrown | 0.13.2 | MIT OR Apache-2.0 | https://crates.io/crates/hashbrown/0.13.2
+hashbrown | 0.14.5 | MIT OR Apache-2.0 | https://crates.io/crates/hashbrown/0.14.5
+hashbrown | 0.15.2 | MIT OR Apache-2.0 | https://crates.io/crates/hashbrown/0.15.2
+hashlink | 0.9.1 | MIT OR Apache-2.0 | https://crates.io/crates/hashlink/0.9.1
+hdrhistogram | 7.5.4 | MIT/Apache-2.0 | https://crates.io/crates/hdrhistogram/7.5.4
+headers | 0.4.0 | MIT | https://crates.io/crates/headers/0.4.0
+headers-core | 0.3.0 | MIT | https://crates.io/crates/headers-core/0.3.0
+heck | 0.4.1 | MIT OR Apache-2.0 | https://crates.io/crates/heck/0.4.1
+heck | 0.5.0 | MIT OR Apache-2.0 | https://crates.io/crates/heck/0.5.0
+hermit-abi | 0.1.19 | MIT/Apache-2.0 | https://crates.io/crates/hermit-abi/0.1.19
+hermit-abi | 0.3.3 | MIT OR Apache-2.0 | https://crates.io/crates/hermit-abi/0.3.3
+hex | 0.4.3 | MIT OR Apache-2.0 | https://crates.io/crates/hex/0.4.3
+hex-literal | 0.4.1 | MIT OR Apache-2.0 | https://crates.io/crates/hex-literal/0.4.1
+higher-kinded-types | 0.1.1 | Zlib OR MIT OR Apache-2.0 | https://crates.io/crates/higher-kinded-types/0.1.1
+hmac | 0.11.0 | MIT OR Apache-2.0 | https://crates.io/crates/hmac/0.11.0
+hmac | 0.12.1 | MIT OR Apache-2.0 | https://crates.io/crates/hmac/0.12.1
+hostname | 0.4.0 | MIT | https://crates.io/crates/hostname/0.4.0
+hostname-validator | 1.1.1 | MIT | https://crates.io/crates/hostname-validator/1.1.1
+http | 0.2.9 | MIT OR Apache-2.0 | https://crates.io/crates/http/0.2.9
+http | 1.4.0 | MIT OR Apache-2.0 | https://crates.io/crates/http/1.4.0
+http-body | 0.4.5 | MIT | https://crates.io/crates/http-body/0.4.5
+http-body | 1.0.0 | MIT | https://crates.io/crates/http-body/1.0.0
+http-body-util | 0.1.2 | MIT | https://crates.io/crates/http-body-util/0.1.2
+http-types | 2.12.0 | MIT OR Apache-2.0 | https://crates.io/crates/http-types/2.12.0
+httparse | 1.10.1 | MIT OR Apache-2.0 | https://crates.io/crates/httparse/1.10.1
+httpdate | 1.0.2 | MIT/Apache-2.0 | https://crates.io/crates/httpdate/1.0.2
+humantime | 2.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/humantime/2.2.0
+humantime-serde | 1.1.1 | MIT OR Apache-2.0 | https://crates.io/crates/humantime-serde/1.1.1
+hyper | 0.14.30 | MIT | https://crates.io/crates/hyper/0.14.30
+hyper | 1.8.1 | MIT | https://crates.io/crates/hyper/1.8.1
+hyper-rustls | 0.24.0 | Apache-2.0/ISC/MIT | https://crates.io/crates/hyper-rustls/0.24.0
+hyper-rustls | 0.26.0 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/hyper-rustls/0.26.0
+hyper-timeout | 0.5.1 | MIT OR Apache-2.0 | https://crates.io/crates/hyper-timeout/0.5.1
+hyper-util | 0.1.19 | MIT | https://crates.io/crates/hyper-util/0.1.19
+iana-time-zone | 0.1.61 | MIT OR Apache-2.0 | https://crates.io/crates/iana-time-zone/0.1.61
+iana-time-zone-haiku | 0.1.2 | MIT OR Apache-2.0 | https://crates.io/crates/iana-time-zone-haiku/0.1.2
+icu_collections | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_collections/1.5.0
+icu_locid | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_locid/1.5.0
+icu_locid_transform | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_locid_transform/1.5.0
+icu_locid_transform_data | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_locid_transform_data/1.5.0
+icu_normalizer | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_normalizer/1.5.0
+icu_normalizer_data | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_normalizer_data/1.5.0
+icu_properties | 1.5.1 | Unicode-3.0 | https://crates.io/crates/icu_properties/1.5.1
+icu_properties_data | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_properties_data/1.5.0
+icu_provider | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_provider/1.5.0
+icu_provider_macros | 1.5.0 | Unicode-3.0 | https://crates.io/crates/icu_provider_macros/1.5.0
+ident_case | 1.0.1 | MIT/Apache-2.0 | https://crates.io/crates/ident_case/1.0.1
+idna | 1.0.3 | MIT OR Apache-2.0 | https://crates.io/crates/idna/1.0.3
+idna_adapter | 1.2.0 | Apache-2.0 OR MIT | https://crates.io/crates/idna_adapter/1.2.0
+indexmap | 1.9.3 | Apache-2.0 OR MIT | https://crates.io/crates/indexmap/1.9.3
+indexmap | 2.10.0 | Apache-2.0 OR MIT | https://crates.io/crates/indexmap/2.10.0
+indoc | 2.0.5 | MIT OR Apache-2.0 | https://crates.io/crates/indoc/2.0.5
+infer | 0.2.3 | MIT | https://crates.io/crates/infer/0.2.3
+inferno | 0.11.21 | CDDL-1.0 | https://crates.io/crates/inferno/0.11.21
+inferno | 0.12.0 | CDDL-1.0 | https://crates.io/crates/inferno/0.12.0
+inotify | 0.9.6 | ISC | https://crates.io/crates/inotify/0.9.6
+inotify-sys | 0.1.5 | ISC | https://crates.io/crates/inotify-sys/0.1.5
+instant | 0.1.12 | BSD-3-Clause | https://crates.io/crates/instant/0.1.12
+integer-encoding | 3.0.4 | MIT | https://crates.io/crates/integer-encoding/3.0.4
+io-uring | 0.6.2 | MIT/Apache-2.0 | https://crates.io/crates/io-uring/0.6.2
+ipnet | 2.10.1 | MIT OR Apache-2.0 | https://crates.io/crates/ipnet/2.10.1
+is-terminal | 0.4.12 | MIT | https://crates.io/crates/is-terminal/0.4.12
+is_terminal_polyfill | 1.70.1 | MIT OR Apache-2.0 | https://crates.io/crates/is_terminal_polyfill/1.70.1
+itertools | 0.10.5 | MIT/Apache-2.0 | https://crates.io/crates/itertools/0.10.5
+itertools | 0.12.1 | MIT OR Apache-2.0 | https://crates.io/crates/itertools/0.12.1
+itoa | 1.0.11 | MIT OR Apache-2.0 | https://crates.io/crates/itoa/1.0.11
+jemalloc_pprof | 0.7.0 | Apache-2.0 | https://crates.io/crates/jemalloc_pprof/0.7.0
+jiff | 0.2.4 | Unlicense OR MIT | https://crates.io/crates/jiff/0.2.4
+jiff-static | 0.2.4 | Unlicense OR MIT | https://crates.io/crates/jiff-static/0.2.4
+jobserver | 0.1.32 | MIT OR Apache-2.0 | https://crates.io/crates/jobserver/0.1.32
+jose-b64 | 0.1.2 | Apache-2.0 OR MIT | https://crates.io/crates/jose-b64/0.1.2
+jose-jwa | 0.1.2 | Apache-2.0 OR MIT | https://crates.io/crates/jose-jwa/0.1.2
+jose-jwk | 0.1.2 | Apache-2.0 OR MIT | https://crates.io/crates/jose-jwk/0.1.2
+js-sys | 0.3.69 | MIT OR Apache-2.0 | https://crates.io/crates/js-sys/0.3.69
+json-structural-diff | 0.2.0 | MIT | https://crates.io/crates/json-structural-diff/0.2.0
+jsonwebtoken | 9.2.0 | MIT | https://crates.io/crates/jsonwebtoken/9.2.0
+kqueue | 1.0.8 | MIT | https://crates.io/crates/kqueue/1.0.8
+kqueue-sys | 1.0.4 | MIT | https://crates.io/crates/kqueue-sys/1.0.4
+lasso | 0.7.2 | MIT OR Apache-2.0 | https://crates.io/crates/lasso/0.7.2
+lazy_static | 1.5.0 | MIT OR Apache-2.0 | https://crates.io/crates/lazy_static/1.5.0
+libc | 0.2.172 | MIT OR Apache-2.0 | https://crates.io/crates/libc/0.2.172
+libloading | 0.7.4 | ISC | https://crates.io/crates/libloading/0.7.4
+libm | 0.2.8 | MIT OR Apache-2.0 | https://crates.io/crates/libm/0.2.8
+linux-raw-sys | 0.11.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/linux-raw-sys/0.11.0
+linux-raw-sys | 0.4.14 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/linux-raw-sys/0.4.14
+linux-raw-sys | 0.6.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/linux-raw-sys/0.6.4
+litemap | 0.7.4 | Unicode-3.0 | https://crates.io/crates/litemap/0.7.4
+lock_api | 0.4.13 | MIT OR Apache-2.0 | https://crates.io/crates/lock_api/0.4.13
+log | 0.4.26 | MIT OR Apache-2.0 | https://crates.io/crates/log/0.4.26
+lru | 0.12.3 | MIT | https://crates.io/crates/lru/0.12.3
+mappings | 0.7.0 | Apache-2.0 | https://crates.io/crates/mappings/0.7.0
+matchers | 0.1.0 | MIT | https://crates.io/crates/matchers/0.1.0
+matchit | 0.8.4 | MIT AND BSD-3-Clause | https://crates.io/crates/matchit/0.8.4
+md-5 | 0.10.5 | MIT OR Apache-2.0 | https://crates.io/crates/md-5/0.10.5
+md-5 | 0.9.1 | MIT OR Apache-2.0 | https://crates.io/crates/md-5/0.9.1
+md5 | 0.7.0 | Apache-2.0/MIT | https://crates.io/crates/md5/0.7.0
+measured | 0.0.22 | MIT OR Apache-2.0 | https://crates.io/crates/measured/0.0.22
+measured-derive | 0.0.22 | MIT OR Apache-2.0 | https://crates.io/crates/measured-derive/0.0.22
+measured-process | 0.0.22 | MIT OR Apache-2.0 | https://crates.io/crates/measured-process/0.0.22
+memchr | 2.6.4 | Unlicense OR MIT | https://crates.io/crates/memchr/2.6.4
+memmap2 | 0.9.3 | MIT OR Apache-2.0 | https://crates.io/crates/memmap2/0.9.3
+memoffset | 0.7.1 | MIT | https://crates.io/crates/memoffset/0.7.1
+memoffset | 0.9.0 | MIT | https://crates.io/crates/memoffset/0.9.0
+migrations_internals | 2.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/migrations_internals/2.2.0
+migrations_macros | 2.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/migrations_macros/2.2.0
+mime | 0.3.17 | MIT OR Apache-2.0 | https://crates.io/crates/mime/0.3.17
+minimal-lexical | 0.2.1 | MIT/Apache-2.0 | https://crates.io/crates/minimal-lexical/0.2.1
+miniz_oxide | 0.7.1 | MIT OR Zlib OR Apache-2.0 | https://crates.io/crates/miniz_oxide/0.7.1
+miniz_oxide | 0.8.0 | MIT OR Zlib OR Apache-2.0 | https://crates.io/crates/miniz_oxide/0.8.0
+mio | 0.8.11 | MIT | https://crates.io/crates/mio/0.8.11
+mio | 1.0.3 | MIT | https://crates.io/crates/mio/1.0.3
+multimap | 0.8.3 | MIT/Apache-2.0 | https://crates.io/crates/multimap/0.8.3
+never-say-never | 6.6.666 | Zlib OR MIT OR Apache-2.0 | https://crates.io/crates/never-say-never/6.6.666
+nix | 0.25.1 | MIT | https://crates.io/crates/nix/0.25.1
+nix | 0.26.4 | MIT | https://crates.io/crates/nix/0.26.4
+nix | 0.30.1 | MIT | https://crates.io/crates/nix/0.30.1
+no-std-compat | 0.4.1 | MIT | https://crates.io/crates/no-std-compat/0.4.1
+nom | 7.1.3 | MIT | https://crates.io/crates/nom/7.1.3
+nonzero_ext | 0.3.0 | Apache-2.0 | https://crates.io/crates/nonzero_ext/0.3.0
+notify | 6.1.1 | CC0-1.0 | https://crates.io/crates/notify/6.1.1
+ntapi | 0.4.1 | Apache-2.0 OR MIT | https://crates.io/crates/ntapi/0.4.1
+nu-ansi-term | 0.46.0 | MIT | https://crates.io/crates/nu-ansi-term/0.46.0
+num | 0.4.1 | MIT OR Apache-2.0 | https://crates.io/crates/num/0.4.1
+num-bigint | 0.4.6 | MIT OR Apache-2.0 | https://crates.io/crates/num-bigint/0.4.6
+num-bigint-dig | 0.8.4 | MIT/Apache-2.0 | https://crates.io/crates/num-bigint-dig/0.8.4
+num-complex | 0.4.4 | MIT OR Apache-2.0 | https://crates.io/crates/num-complex/0.4.4
+num-conv | 0.1.0 | MIT OR Apache-2.0 | https://crates.io/crates/num-conv/0.1.0
+num-format | 0.4.4 | MIT/Apache-2.0 | https://crates.io/crates/num-format/0.4.4
+num-integer | 0.1.46 | MIT OR Apache-2.0 | https://crates.io/crates/num-integer/0.1.46
+num-iter | 0.1.43 | MIT OR Apache-2.0 | https://crates.io/crates/num-iter/0.1.43
+num-rational | 0.4.1 | MIT OR Apache-2.0 | https://crates.io/crates/num-rational/0.4.1
+num-traits | 0.2.19 | MIT OR Apache-2.0 | https://crates.io/crates/num-traits/0.2.19
+num_cpus | 1.16.0 | MIT OR Apache-2.0 | https://crates.io/crates/num_cpus/1.16.0
+oauth2 | 4.4.2 | MIT OR Apache-2.0 | https://crates.io/crates/oauth2/4.4.2
+object | 0.36.5 | Apache-2.0 OR MIT | https://crates.io/crates/object/0.36.5
+once_cell | 1.20.2 | MIT OR Apache-2.0 | https://crates.io/crates/once_cell/1.20.2
+oorandom | 11.1.3 | MIT | https://crates.io/crates/oorandom/11.1.3
+opaque-debug | 0.3.1 | MIT OR Apache-2.0 | https://crates.io/crates/opaque-debug/0.3.1
+openssl-probe | 0.1.5 | MIT/Apache-2.0 | https://crates.io/crates/openssl-probe/0.1.5
+opentelemetry | 0.30.0 | Apache-2.0 | https://crates.io/crates/opentelemetry/0.30.0
+opentelemetry-http | 0.30.0 | Apache-2.0 | https://crates.io/crates/opentelemetry-http/0.30.0
+opentelemetry-otlp | 0.30.0 | Apache-2.0 | https://crates.io/crates/opentelemetry-otlp/0.30.0
+opentelemetry-proto | 0.30.0 | Apache-2.0 | https://crates.io/crates/opentelemetry-proto/0.30.0
+opentelemetry-semantic-conventions | 0.30.0 | Apache-2.0 | https://crates.io/crates/opentelemetry-semantic-conventions/0.30.0
+opentelemetry_sdk | 0.30.0 | Apache-2.0 | https://crates.io/crates/opentelemetry_sdk/0.30.0
+ordered-float | 2.10.1 | MIT | https://crates.io/crates/ordered-float/2.10.1
+ordered-multimap | 0.7.3 | MIT | https://crates.io/crates/ordered-multimap/0.7.3
+os_info | 3.7.0 | MIT | https://crates.io/crates/os_info/3.7.0
+ouroboros | 0.18.5 | MIT OR Apache-2.0 | https://crates.io/crates/ouroboros/0.18.5
+ouroboros_macro | 0.18.5 | MIT OR Apache-2.0 | https://crates.io/crates/ouroboros_macro/0.18.5
+outref | 0.5.1 | MIT | https://crates.io/crates/outref/0.5.1
+overload | 0.1.1 | MIT | https://crates.io/crates/overload/0.1.1
+p256 | 0.11.1 | Apache-2.0 OR MIT | https://crates.io/crates/p256/0.11.1
+p256 | 0.13.2 | Apache-2.0 OR MIT | https://crates.io/crates/p256/0.13.2
+p384 | 0.13.0 | Apache-2.0 OR MIT | https://crates.io/crates/p384/0.13.0
+papaya | 0.2.1 | MIT | https://crates.io/crates/papaya/0.2.1
+parking | 2.1.1 | Apache-2.0 OR MIT | https://crates.io/crates/parking/2.1.1
+parking_lot | 0.11.2 | Apache-2.0/MIT | https://crates.io/crates/parking_lot/0.11.2
+parking_lot | 0.12.1 | MIT OR Apache-2.0 | https://crates.io/crates/parking_lot/0.12.1
+parking_lot_core | 0.8.6 | Apache-2.0/MIT | https://crates.io/crates/parking_lot_core/0.8.6
+parking_lot_core | 0.9.8 | MIT OR Apache-2.0 | https://crates.io/crates/parking_lot_core/0.9.8
+parquet | 53.0.0 | Apache-2.0 | https://crates.io/crates/parquet/53.0.0
+parquet_derive | 53.0.0 | Apache-2.0 | https://crates.io/crates/parquet_derive/53.0.0
+password-hash | 0.5.0 | MIT OR Apache-2.0 | https://crates.io/crates/password-hash/0.5.0
+paste | 1.0.14 | MIT OR Apache-2.0 | https://crates.io/crates/paste/1.0.14
+pbkdf2 | 0.12.2 | MIT OR Apache-2.0 | https://crates.io/crates/pbkdf2/0.12.2
+pem | 3.0.3 | MIT | https://crates.io/crates/pem/3.0.3
+pem-rfc7468 | 0.7.0 | Apache-2.0 OR MIT | https://crates.io/crates/pem-rfc7468/0.7.0
+percent-encoding | 2.3.1 | MIT OR Apache-2.0 | https://crates.io/crates/percent-encoding/2.3.1
+petgraph | 0.6.3 | MIT OR Apache-2.0 | https://crates.io/crates/petgraph/0.6.3
+phf | 0.10.1 | MIT | https://crates.io/crates/phf/0.10.1
+phf | 0.11.1 | MIT | https://crates.io/crates/phf/0.11.1
+phf_shared | 0.10.0 | MIT | https://crates.io/crates/phf_shared/0.10.0
+phf_shared | 0.11.1 | MIT | https://crates.io/crates/phf_shared/0.11.1
+pin-project | 1.1.9 | Apache-2.0 OR MIT | https://crates.io/crates/pin-project/1.1.9
+pin-project-internal | 1.1.9 | Apache-2.0 OR MIT | https://crates.io/crates/pin-project-internal/1.1.9
+pin-project-lite | 0.2.13 | Apache-2.0 OR MIT | https://crates.io/crates/pin-project-lite/0.2.13
+pin-utils | 0.1.0 | MIT OR Apache-2.0 | https://crates.io/crates/pin-utils/0.1.0
+pkcs1 | 0.7.5 | Apache-2.0 OR MIT | https://crates.io/crates/pkcs1/0.7.5
+pkcs8 | 0.10.2 | Apache-2.0 OR MIT | https://crates.io/crates/pkcs8/0.10.2
+pkcs8 | 0.9.0 | Apache-2.0 OR MIT | https://crates.io/crates/pkcs8/0.9.0
+pkg-config | 0.3.27 | MIT OR Apache-2.0 | https://crates.io/crates/pkg-config/0.3.27
+plotters | 0.3.4 | MIT | https://crates.io/crates/plotters/0.3.4
+plotters-backend | 0.3.4 | MIT | https://crates.io/crates/plotters-backend/0.3.4
+plotters-svg | 0.3.3 | MIT | https://crates.io/crates/plotters-svg/0.3.3
+polonius-the-crab | 0.4.2 | Zlib OR MIT OR Apache-2.0 | https://crates.io/crates/polonius-the-crab/0.4.2
+portable-atomic | 1.10.0 | Apache-2.0 OR MIT | https://crates.io/crates/portable-atomic/1.10.0
+portable-atomic-util | 0.2.4 | Apache-2.0 OR MIT | https://crates.io/crates/portable-atomic-util/0.2.4
+postgres | 0.19.7 | MIT OR Apache-2.0 | git+https://github.com/neondatabase/rust-postgres.git?branch=neon#f3cf448febde5fd298071d54d568a9c875a7a62b
+postgres-protocol | 0.6.6 | MIT OR Apache-2.0 | git+https://github.com/neondatabase/rust-postgres.git?branch=neon#f3cf448febde5fd298071d54d568a9c875a7a62b
+postgres-types | 0.2.6 | MIT OR Apache-2.0 | git+https://github.com/neondatabase/rust-postgres.git?branch=neon#f3cf448febde5fd298071d54d568a9c875a7a62b
+powerfmt | 0.2.0 | MIT OR Apache-2.0 | https://crates.io/crates/powerfmt/0.2.0
+pprof | 0.14.0 | Apache-2.0 | https://crates.io/crates/pprof/0.14.0
+pprof_util | 0.7.0 | Apache-2.0 | https://crates.io/crates/pprof_util/0.7.0
+ppv-lite86 | 0.2.17 | MIT/Apache-2.0 | https://crates.io/crates/ppv-lite86/0.2.17
+prettyplease | 0.2.17 | MIT OR Apache-2.0 | https://crates.io/crates/prettyplease/0.2.17
+primeorder | 0.13.6 | Apache-2.0 OR MIT | https://crates.io/crates/primeorder/0.13.6
+proc-macro-hack | 0.5.20+deprecated | MIT OR Apache-2.0 | https://crates.io/crates/proc-macro-hack/0.5.20+deprecated
+proc-macro2 | 1.0.94 | MIT OR Apache-2.0 | https://crates.io/crates/proc-macro2/1.0.94
+proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 | https://crates.io/crates/proc-macro2-diagnostics/0.10.1
+procfs | 0.16.0 | MIT OR Apache-2.0 | https://crates.io/crates/procfs/0.16.0
+procfs-core | 0.16.0 | MIT OR Apache-2.0 | https://crates.io/crates/procfs-core/0.16.0
+prometheus | 0.13.4 | Apache-2.0 | https://crates.io/crates/prometheus/0.13.4
+prost | 0.12.6 | Apache-2.0 | https://crates.io/crates/prost/0.12.6
+prost | 0.13.5 | Apache-2.0 | https://crates.io/crates/prost/0.13.5
+prost-build | 0.12.6 | Apache-2.0 | https://crates.io/crates/prost-build/0.12.6
+prost-build | 0.13.3 | Apache-2.0 | https://crates.io/crates/prost-build/0.13.3
+prost-derive | 0.12.6 | Apache-2.0 | https://crates.io/crates/prost-derive/0.12.6
+prost-derive | 0.13.5 | Apache-2.0 | https://crates.io/crates/prost-derive/0.13.5
+prost-types | 0.12.6 | Apache-2.0 | https://crates.io/crates/prost-types/0.12.6
+prost-types | 0.13.5 | Apache-2.0 | https://crates.io/crates/prost-types/0.13.5
+quanta | 0.12.5 | MIT | https://crates.io/crates/quanta/0.12.5
+quick-xml | 0.26.0 | MIT | https://crates.io/crates/quick-xml/0.26.0
+quick-xml | 0.31.0 | MIT | https://crates.io/crates/quick-xml/0.31.0
+quick-xml | 0.37.1 | MIT | https://crates.io/crates/quick-xml/0.37.1
+quote | 1.0.39 | MIT OR Apache-2.0 | https://crates.io/crates/quote/1.0.39
+r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | https://crates.io/crates/r-efi/5.3.0
+rand | 0.3.23 | MIT/Apache-2.0 | https://crates.io/crates/rand/0.3.23
+rand | 0.4.6 | MIT/Apache-2.0 | https://crates.io/crates/rand/0.4.6
+rand | 0.7.3 | MIT OR Apache-2.0 | https://crates.io/crates/rand/0.7.3
+rand | 0.8.5 | MIT OR Apache-2.0 | https://crates.io/crates/rand/0.8.5
+rand | 0.9.1 | MIT OR Apache-2.0 | https://crates.io/crates/rand/0.9.1
+rand_chacha | 0.2.2 | MIT OR Apache-2.0 | https://crates.io/crates/rand_chacha/0.2.2
+rand_chacha | 0.3.1 | MIT OR Apache-2.0 | https://crates.io/crates/rand_chacha/0.3.1
+rand_chacha | 0.9.0 | MIT OR Apache-2.0 | https://crates.io/crates/rand_chacha/0.9.0
+rand_core | 0.3.1 | MIT/Apache-2.0 | https://crates.io/crates/rand_core/0.3.1
+rand_core | 0.4.2 | MIT/Apache-2.0 | https://crates.io/crates/rand_core/0.4.2
+rand_core | 0.5.1 | MIT OR Apache-2.0 | https://crates.io/crates/rand_core/0.5.1
+rand_core | 0.6.4 | MIT OR Apache-2.0 | https://crates.io/crates/rand_core/0.6.4
+rand_core | 0.9.3 | MIT OR Apache-2.0 | https://crates.io/crates/rand_core/0.9.3
+rand_distr | 0.5.1 | MIT OR Apache-2.0 | https://crates.io/crates/rand_distr/0.5.1
+rand_hc | 0.2.0 | MIT/Apache-2.0 | https://crates.io/crates/rand_hc/0.2.0
+range-set-blaze | 0.1.16 | MIT OR Apache-2.0 | https://crates.io/crates/range-set-blaze/0.1.16
+raw-cpuid | 11.3.0 | MIT | https://crates.io/crates/raw-cpuid/11.3.0
+rayon | 1.7.0 | MIT OR Apache-2.0 | https://crates.io/crates/rayon/1.7.0
+rayon-core | 1.11.0 | MIT OR Apache-2.0 | https://crates.io/crates/rayon-core/1.11.0
+rcgen | 0.13.1 | MIT OR Apache-2.0 | https://crates.io/crates/rcgen/0.13.1
+rdrand | 0.4.0 | ISC | https://crates.io/crates/rdrand/0.4.0
+redis | 0.29.2 | BSD-3-Clause | https://crates.io/crates/redis/0.29.2
+redox_syscall | 0.2.16 | MIT | https://crates.io/crates/redox_syscall/0.2.16
+redox_syscall | 0.3.5 | MIT | https://crates.io/crates/redox_syscall/0.3.5
+redox_syscall | 0.4.1 | MIT | https://crates.io/crates/redox_syscall/0.4.1
+regex | 1.11.1 | MIT OR Apache-2.0 | https://crates.io/crates/regex/1.11.1
+regex-automata | 0.1.10 | Unlicense/MIT | https://crates.io/crates/regex-automata/0.1.10
+regex-automata | 0.4.9 | MIT OR Apache-2.0 | https://crates.io/crates/regex-automata/0.4.9
+regex-lite | 0.1.5 | MIT OR Apache-2.0 | https://crates.io/crates/regex-lite/0.1.5
+regex-syntax | 0.6.29 | MIT OR Apache-2.0 | https://crates.io/crates/regex-syntax/0.6.29
+regex-syntax | 0.8.5 | MIT OR Apache-2.0 | https://crates.io/crates/regex-syntax/0.8.5
+relative-path | 1.9.0 | MIT/Apache-2.0 | https://crates.io/crates/relative-path/1.9.0
+replace_with | 0.1.7 | MIT OR Apache-2.0 | https://crates.io/crates/replace_with/0.1.7
+reqwest | 0.12.4 | MIT OR Apache-2.0 | https://crates.io/crates/reqwest/0.12.4
+reqwest-middleware | 0.4.0 | MIT OR Apache-2.0 | https://crates.io/crates/reqwest-middleware/0.4.0
+reqwest-retry | 0.7.0 | MIT OR Apache-2.0 | https://crates.io/crates/reqwest-retry/0.7.0
+reqwest-tracing | 0.5.8 | MIT OR Apache-2.0 | https://crates.io/crates/reqwest-tracing/0.5.8
+retry-policies | 0.4.0 | MIT OR Apache-2.0 | https://crates.io/crates/retry-policies/0.4.0
+rfc6979 | 0.3.1 | Apache-2.0 OR MIT | https://crates.io/crates/rfc6979/0.3.1
+rfc6979 | 0.4.0 | Apache-2.0 OR MIT | https://crates.io/crates/rfc6979/0.4.0
+rgb | 0.8.50 | MIT | https://crates.io/crates/rgb/0.8.50
+ring | 0.16.20 | mixed ISC/OpenSSL/SSLeay/MIT terms in bundled LICENSE file | https://crates.io/crates/ring/0.16.20
+ring | 0.17.14 | Apache-2.0 AND ISC | https://crates.io/crates/ring/0.17.14
+rlimit | 0.10.1 | MIT | https://crates.io/crates/rlimit/0.10.1
+routerify | 3.0.0 | MIT | https://crates.io/crates/routerify/3.0.0
+rpds | 0.13.0 | MPL-2.0 | https://crates.io/crates/rpds/0.13.0
+rsa | 0.9.6 | MIT OR Apache-2.0 | https://crates.io/crates/rsa/0.9.6
+rstest | 0.18.2 | MIT OR Apache-2.0 | https://crates.io/crates/rstest/0.18.2
+rstest_macros | 0.18.2 | MIT OR Apache-2.0 | https://crates.io/crates/rstest_macros/0.18.2
+rust-crypto | 0.2.36 | MIT/Apache-2.0 | https://crates.io/crates/rust-crypto/0.2.36
+rust-ini | 0.20.0 | MIT | https://crates.io/crates/rust-ini/0.20.0
+rustc-demangle | 0.1.24 | MIT/Apache-2.0 | https://crates.io/crates/rustc-demangle/0.1.24
+rustc-hash | 1.1.0 | Apache-2.0/MIT | https://crates.io/crates/rustc-hash/1.1.0
+rustc-hash | 2.1.1 | Apache-2.0 OR MIT | https://crates.io/crates/rustc-hash/2.1.1
+rustc-serialize | 0.3.25 | MIT/Apache-2.0 | https://crates.io/crates/rustc-serialize/0.3.25
+rustc_version | 0.2.3 | MIT/Apache-2.0 | https://crates.io/crates/rustc_version/0.2.3
+rustc_version | 0.4.0 | MIT/Apache-2.0 | https://crates.io/crates/rustc_version/0.4.0
+rustix | 0.38.41 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/rustix/0.38.41
+rustix | 1.1.2 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/rustix/1.1.2
+rustls | 0.21.12 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls/0.21.12
+rustls | 0.22.4 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls/0.22.4
+rustls | 0.23.29 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls/0.23.29
+rustls-native-certs | 0.6.2 | Apache-2.0/ISC/MIT | https://crates.io/crates/rustls-native-certs/0.6.2
+rustls-native-certs | 0.7.0 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls-native-certs/0.7.0
+rustls-native-certs | 0.8.0 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls-native-certs/0.8.0
+rustls-pemfile | 1.0.2 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls-pemfile/1.0.2
+rustls-pemfile | 2.1.1 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/rustls-pemfile/2.1.1
+rustls-pki-types | 1.12.0 | MIT OR Apache-2.0 | https://crates.io/crates/rustls-pki-types/1.12.0
+rustls-webpki | 0.101.7 | ISC | https://crates.io/crates/rustls-webpki/0.101.7
+rustls-webpki | 0.102.8 | ISC | https://crates.io/crates/rustls-webpki/0.102.8
+rustls-webpki | 0.103.4 | ISC | https://crates.io/crates/rustls-webpki/0.103.4
+rustversion | 1.0.12 | MIT OR Apache-2.0 | https://crates.io/crates/rustversion/1.0.12
+RustyXML | 0.3.0 | MIT/Apache-2.0 | https://crates.io/crates/RustyXML/0.3.0
+ryu | 1.0.13 | Apache-2.0 OR BSL-1.0 | https://crates.io/crates/ryu/1.0.13
+same-file | 1.0.6 | Unlicense/MIT | https://crates.io/crates/same-file/1.0.6
+schannel | 0.1.23 | MIT | https://crates.io/crates/schannel/0.1.23
+scoped-futures | 0.1.4 | MIT OR Apache-2.0 | https://crates.io/crates/scoped-futures/0.1.4
+scopeguard | 1.1.0 | MIT/Apache-2.0 | https://crates.io/crates/scopeguard/1.1.0
+sct | 0.7.1 | Apache-2.0 OR ISC OR MIT | https://crates.io/crates/sct/0.7.1
+sd-notify | 0.4.1 | MIT OR Apache-2.0 | https://crates.io/crates/sd-notify/0.4.1
+sec1 | 0.3.0 | Apache-2.0 OR MIT | https://crates.io/crates/sec1/0.3.0
+sec1 | 0.7.3 | Apache-2.0 OR MIT | https://crates.io/crates/sec1/0.7.3
+security-framework | 2.9.1 | MIT OR Apache-2.0 | https://crates.io/crates/security-framework/2.9.1
+security-framework-sys | 2.9.0 | MIT OR Apache-2.0 | https://crates.io/crates/security-framework-sys/2.9.0
+seize | 0.5.0 | MIT | https://crates.io/crates/seize/0.5.0
+semver | 0.9.0 | MIT/Apache-2.0 | https://crates.io/crates/semver/0.9.0
+semver | 1.0.17 | MIT OR Apache-2.0 | https://crates.io/crates/semver/1.0.17
+semver-parser | 0.7.0 | MIT/Apache-2.0 | https://crates.io/crates/semver-parser/0.7.0
+send-future | 0.1.0 | MIT OR Apache-2.0 | https://crates.io/crates/send-future/0.1.0
+sentry | 0.37.0 | MIT | https://crates.io/crates/sentry/0.37.0
+sentry-backtrace | 0.37.0 | MIT | https://crates.io/crates/sentry-backtrace/0.37.0
+sentry-contexts | 0.37.0 | MIT | https://crates.io/crates/sentry-contexts/0.37.0
+sentry-core | 0.37.0 | MIT | https://crates.io/crates/sentry-core/0.37.0
+sentry-panic | 0.37.0 | MIT | https://crates.io/crates/sentry-panic/0.37.0
+sentry-tracing | 0.37.0 | MIT | https://crates.io/crates/sentry-tracing/0.37.0
+sentry-types | 0.37.0 | MIT | https://crates.io/crates/sentry-types/0.37.0
+seq-macro | 0.3.5 | MIT OR Apache-2.0 | https://crates.io/crates/seq-macro/0.3.5
+serde | 1.0.228 | MIT OR Apache-2.0 | https://crates.io/crates/serde/1.0.228
+serde_assert | 0.5.0 | MIT OR Apache-2.0 | https://crates.io/crates/serde_assert/0.5.0
+serde_cbor | 0.11.2 | MIT/Apache-2.0 | https://crates.io/crates/serde_cbor/0.11.2
+serde_core | 1.0.228 | MIT OR Apache-2.0 | https://crates.io/crates/serde_core/1.0.228
+serde_derive | 1.0.228 | MIT OR Apache-2.0 | https://crates.io/crates/serde_derive/1.0.228
+serde_html_form | 0.2.7 | MIT | https://crates.io/crates/serde_html_form/0.2.7
+serde_json | 1.0.125 | MIT OR Apache-2.0 | https://crates.io/crates/serde_json/1.0.125
+serde_path_to_error | 0.1.14 | MIT OR Apache-2.0 | https://crates.io/crates/serde_path_to_error/0.1.14
+serde_qs | 0.8.5 | MIT/Apache-2.0 | https://crates.io/crates/serde_qs/0.8.5
+serde_repr | 0.1.20 | MIT OR Apache-2.0 | https://crates.io/crates/serde_repr/0.1.20
+serde_spanned | 0.6.6 | MIT OR Apache-2.0 | https://crates.io/crates/serde_spanned/0.6.6
+serde_urlencoded | 0.7.1 | MIT/Apache-2.0 | https://crates.io/crates/serde_urlencoded/0.7.1
+serde_with | 3.12.0 | MIT OR Apache-2.0 | https://crates.io/crates/serde_with/3.12.0
+serde_with_macros | 3.12.0 | MIT OR Apache-2.0 | https://crates.io/crates/serde_with_macros/3.12.0
+serdect | 0.2.0 | Apache-2.0 OR MIT | https://crates.io/crates/serdect/0.2.0
+sha1 | 0.10.6 | MIT OR Apache-2.0 | https://crates.io/crates/sha1/0.10.6
+sha1 | 0.6.1 | BSD-3-Clause | https://crates.io/crates/sha1/0.6.1
+sha1_smol | 1.0.0 | BSD-3-Clause | https://crates.io/crates/sha1_smol/1.0.0
+sha2 | 0.10.8 | MIT OR Apache-2.0 | https://crates.io/crates/sha2/0.10.8
+sha2 | 0.9.9 | MIT OR Apache-2.0 | https://crates.io/crates/sha2/0.9.9
+sha2-asm | 0.6.3 | MIT | https://crates.io/crates/sha2-asm/0.6.3
+sharded-slab | 0.1.4 | MIT | https://crates.io/crates/sharded-slab/0.1.4
+shlex | 1.3.0 | MIT OR Apache-2.0 | https://crates.io/crates/shlex/1.3.0
+signal-hook | 0.3.15 | Apache-2.0/MIT | https://crates.io/crates/signal-hook/0.3.15
+signal-hook-registry | 1.4.1 | Apache-2.0/MIT | https://crates.io/crates/signal-hook-registry/1.4.1
+signature | 1.6.4 | Apache-2.0 OR MIT | https://crates.io/crates/signature/1.6.4
+signature | 2.2.0 | Apache-2.0 OR MIT | https://crates.io/crates/signature/2.2.0
+simple_asn1 | 0.6.2 | ISC | https://crates.io/crates/simple_asn1/0.6.2
+siphasher | 0.3.10 | MIT/Apache-2.0 | https://crates.io/crates/siphasher/0.3.10
+slab | 0.4.11 | MIT | https://crates.io/crates/slab/0.4.11
+smallvec | 1.13.2 | MIT OR Apache-2.0 | https://crates.io/crates/smallvec/1.13.2
+smol_str | 0.2.1 | MIT OR Apache-2.0 | https://crates.io/crates/smol_str/0.2.1
+socket2 | 0.4.10 | MIT OR Apache-2.0 | https://crates.io/crates/socket2/0.4.10
+socket2 | 0.5.5 | MIT OR Apache-2.0 | https://crates.io/crates/socket2/0.5.5
+socket2 | 0.6.1 | MIT OR Apache-2.0 | https://crates.io/crates/socket2/0.6.1
+spin | 0.5.2 | MIT | https://crates.io/crates/spin/0.5.2
+spin | 0.9.8 | MIT | https://crates.io/crates/spin/0.9.8
+spinning_top | 0.3.0 | MIT/Apache-2.0 | https://crates.io/crates/spinning_top/0.3.0
+spki | 0.6.0 | Apache-2.0 OR MIT | https://crates.io/crates/spki/0.6.0
+spki | 0.7.3 | Apache-2.0 OR MIT | https://crates.io/crates/spki/0.7.3
+stable_deref_trait | 1.2.0 | MIT/Apache-2.0 | https://crates.io/crates/stable_deref_trait/1.2.0
+standback | 0.2.17 | MIT OR Apache-2.0 | https://crates.io/crates/standback/0.2.17
+static_assertions | 1.1.0 | MIT OR Apache-2.0 | https://crates.io/crates/static_assertions/1.1.0
+stdweb | 0.4.20 | MIT/Apache-2.0 | https://crates.io/crates/stdweb/0.4.20
+stdweb-derive | 0.5.3 | MIT/Apache-2.0 | https://crates.io/crates/stdweb-derive/0.5.3
+stdweb-internal-macros | 0.2.9 | MIT/Apache-2.0 | https://crates.io/crates/stdweb-internal-macros/0.2.9
+stdweb-internal-runtime | 0.1.5 | MIT/Apache-2.0 | https://crates.io/crates/stdweb-internal-runtime/0.1.5
+str_stack | 0.1.0 | MIT/Apache-2.0 | https://crates.io/crates/str_stack/0.1.0
+stringprep | 0.1.2 | MIT/Apache-2.0 | https://crates.io/crates/stringprep/0.1.2
+strsim | 0.10.0 | MIT | https://crates.io/crates/strsim/0.10.0
+strsim | 0.11.1 | MIT | https://crates.io/crates/strsim/0.11.1
+strum | 0.26.3 | MIT | https://crates.io/crates/strum/0.26.3
+strum_macros | 0.26.4 | MIT | https://crates.io/crates/strum_macros/0.26.4
+subtle | 2.5.0 | BSD-3-Clause | https://crates.io/crates/subtle/2.5.0
+svg_fmt | 0.4.3 | MIT/Apache-2.0 | https://crates.io/crates/svg_fmt/0.4.3
+symbolic-common | 12.12.0 | MIT | https://crates.io/crates/symbolic-common/12.12.0
+symbolic-demangle | 12.12.0 | MIT | https://crates.io/crates/symbolic-demangle/12.12.0
+syn | 1.0.109 | MIT OR Apache-2.0 | https://crates.io/crates/syn/1.0.109
+syn | 2.0.100 | MIT OR Apache-2.0 | https://crates.io/crates/syn/2.0.100
+sync_wrapper | 0.1.2 | Apache-2.0 | https://crates.io/crates/sync_wrapper/0.1.2
+sync_wrapper | 1.0.1 | Apache-2.0 | https://crates.io/crates/sync_wrapper/1.0.1
+synstructure | 0.13.1 | MIT | https://crates.io/crates/synstructure/0.13.1
+sysinfo | 0.29.7 | MIT | https://crates.io/crates/sysinfo/0.29.7
+tar | 0.4.44 | MIT OR Apache-2.0 | https://crates.io/crates/tar/0.4.44
+tempfile | 3.14.0 | MIT OR Apache-2.0 | https://crates.io/crates/tempfile/3.14.0
+termcolor | 1.4.1 | Unlicense OR MIT | https://crates.io/crates/termcolor/1.4.1
+test-context | 0.3.0 | MIT | https://crates.io/crates/test-context/0.3.0
+test-context-macros | 0.3.0 | MIT | https://crates.io/crates/test-context-macros/0.3.0
+test-log | 0.2.17 | Apache-2.0 OR MIT | https://crates.io/crates/test-log/0.2.17
+test-log-macros | 0.2.17 | Apache-2.0 OR MIT | https://crates.io/crates/test-log-macros/0.2.17
+textwrap | 0.11.0 | MIT | https://crates.io/crates/textwrap/0.11.0
+thiserror | 1.0.69 | MIT OR Apache-2.0 | https://crates.io/crates/thiserror/1.0.69
+thiserror | 2.0.11 | MIT OR Apache-2.0 | https://crates.io/crates/thiserror/2.0.11
+thiserror-impl | 1.0.69 | MIT OR Apache-2.0 | https://crates.io/crates/thiserror-impl/1.0.69
+thiserror-impl | 2.0.11 | MIT OR Apache-2.0 | https://crates.io/crates/thiserror-impl/2.0.11
+thread_local | 1.1.7 | MIT OR Apache-2.0 | https://crates.io/crates/thread_local/1.1.7
+thrift | 0.17.0 | Apache-2.0 | https://crates.io/crates/thrift/0.17.0
+tikv-jemalloc-ctl | 0.6.0 | MIT/Apache-2.0 | https://crates.io/crates/tikv-jemalloc-ctl/0.6.0
+tikv-jemalloc-sys | 0.6.0+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7 | MIT/Apache-2.0 | https://crates.io/crates/tikv-jemalloc-sys/0.6.0+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7
+tikv-jemallocator | 0.6.0 | MIT/Apache-2.0 | https://crates.io/crates/tikv-jemallocator/0.6.0
+time | 0.1.45 | MIT/Apache-2.0 | https://crates.io/crates/time/0.1.45
+time | 0.2.27 | MIT OR Apache-2.0 | https://crates.io/crates/time/0.2.27
+time | 0.3.36 | MIT OR Apache-2.0 | https://crates.io/crates/time/0.3.36
+time-core | 0.1.2 | MIT OR Apache-2.0 | https://crates.io/crates/time-core/0.1.2
+time-macros | 0.1.1 | MIT OR Apache-2.0 | https://crates.io/crates/time-macros/0.1.1
+time-macros | 0.2.18 | MIT OR Apache-2.0 | https://crates.io/crates/time-macros/0.2.18
+time-macros-impl | 0.1.2 | MIT OR Apache-2.0 | https://crates.io/crates/time-macros-impl/0.1.2
+tiny-keccak | 2.0.2 | CC0-1.0 | https://crates.io/crates/tiny-keccak/2.0.2
+tinystr | 0.7.6 | Unicode-3.0 | https://crates.io/crates/tinystr/0.7.6
+tinytemplate | 1.2.1 | Apache-2.0 OR MIT | https://crates.io/crates/tinytemplate/1.2.1
+tinyvec | 1.8.0 | Zlib OR Apache-2.0 OR MIT | https://crates.io/crates/tinyvec/1.8.0
+tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib | https://crates.io/crates/tinyvec_macros/0.1.1
+tls_codec | 0.4.2 | Apache-2.0 OR MIT | https://crates.io/crates/tls_codec/0.4.2
+tls_codec_derive | 0.4.2 | Apache-2.0 OR MIT | https://crates.io/crates/tls_codec_derive/0.4.2
+tokio | 1.43.1 | MIT | https://crates.io/crates/tokio/1.43.1
+tokio-epoll-uring | 0.1.0 | MIT OR Apache-2.0 | git+https://github.com/neondatabase/tokio-epoll-uring.git?branch=main#781989bb540a1408b0b93daa1e9d1fa452195497
+tokio-io-timeout | 1.2.0 | MIT/Apache-2.0 | https://crates.io/crates/tokio-io-timeout/1.2.0
+tokio-macros | 2.5.0 | MIT | https://crates.io/crates/tokio-macros/2.5.0
+tokio-postgres | 0.7.10 | MIT OR Apache-2.0 | git+https://github.com/neondatabase/rust-postgres.git?branch=neon#f3cf448febde5fd298071d54d568a9c875a7a62b
+tokio-postgres-rustls | 0.12.0 | MIT | https://crates.io/crates/tokio-postgres-rustls/0.12.0
+tokio-rustls | 0.24.0 | MIT/Apache-2.0 | https://crates.io/crates/tokio-rustls/0.24.0
+tokio-rustls | 0.25.0 | MIT/Apache-2.0 | https://crates.io/crates/tokio-rustls/0.25.0
+tokio-rustls | 0.26.2 | MIT OR Apache-2.0 | https://crates.io/crates/tokio-rustls/0.26.2
+tokio-stream | 0.1.16 | MIT | https://crates.io/crates/tokio-stream/0.1.16
+tokio-tungstenite | 0.21.0 | MIT | https://crates.io/crates/tokio-tungstenite/0.21.0
+tokio-tungstenite | 0.26.1 | MIT | https://crates.io/crates/tokio-tungstenite/0.26.1
+tokio-util | 0.6.10 | MIT | https://crates.io/crates/tokio-util/0.6.10
+tokio-util | 0.7.10 | MIT | https://crates.io/crates/tokio-util/0.7.10
+toml | 0.8.14 | MIT OR Apache-2.0 | https://crates.io/crates/toml/0.8.14
+toml_datetime | 0.6.6 | MIT OR Apache-2.0 | https://crates.io/crates/toml_datetime/0.6.6
+toml_edit | 0.22.14 | MIT OR Apache-2.0 | https://crates.io/crates/toml_edit/0.22.14
+tonic | 0.13.1 | MIT | https://crates.io/crates/tonic/0.13.1
+tonic-build | 0.13.1 | MIT | https://crates.io/crates/tonic-build/0.13.1
+tonic-reflection | 0.13.1 | MIT | https://crates.io/crates/tonic-reflection/0.13.1
+tower | 0.5.3 | MIT | https://crates.io/crates/tower/0.5.3
+tower-http | 0.6.2 | MIT | https://crates.io/crates/tower-http/0.6.2
+tower-layer | 0.3.3 | MIT | https://crates.io/crates/tower-layer/0.3.3
+tower-otel | 0.6.0 | Apache-2.0 OR MIT | https://crates.io/crates/tower-otel/0.6.0
+tower-service | 0.3.3 | MIT | https://crates.io/crates/tower-service/0.3.3
+tracing | 0.1.41 | MIT | https://crates.io/crates/tracing/0.1.41
+tracing-appender | 0.2.3 | MIT | https://crates.io/crates/tracing-appender/0.2.3
+tracing-attributes | 0.1.28 | MIT | https://crates.io/crates/tracing-attributes/0.1.28
+tracing-core | 0.1.33 | MIT | https://crates.io/crates/tracing-core/0.1.33
+tracing-error | 0.2.0 | MIT | https://crates.io/crates/tracing-error/0.2.0
+tracing-log | 0.2.0 | MIT | https://crates.io/crates/tracing-log/0.2.0
+tracing-opentelemetry | 0.31.0 | MIT | https://crates.io/crates/tracing-opentelemetry/0.31.0
+tracing-serde | 0.2.0 | MIT | https://crates.io/crates/tracing-serde/0.2.0
+tracing-subscriber | 0.3.19 | MIT | https://crates.io/crates/tracing-subscriber/0.3.19
+tracing-test | 0.2.5 | MIT | https://crates.io/crates/tracing-test/0.2.5
+tracing-test-macro | 0.2.5 | MIT | https://crates.io/crates/tracing-test-macro/0.2.5
+try-lock | 0.2.5 | MIT | https://crates.io/crates/try-lock/0.2.5
+tungstenite | 0.21.0 | MIT OR Apache-2.0 | https://crates.io/crates/tungstenite/0.21.0
+tungstenite | 0.26.1 | MIT OR Apache-2.0 | https://crates.io/crates/tungstenite/0.26.1
+twox-hash | 1.6.3 | MIT | https://crates.io/crates/twox-hash/1.6.3
+typed-json | 0.1.1 | MIT OR Apache-2.0 | https://crates.io/crates/typed-json/0.1.1
+typenum | 1.16.0 | MIT OR Apache-2.0 | https://crates.io/crates/typenum/1.16.0
+uname | 0.1.1 | MIT/Apache-2.0 | https://crates.io/crates/uname/0.1.1
+unicode-bidi | 0.3.17 | MIT OR Apache-2.0 | https://crates.io/crates/unicode-bidi/0.3.17
+unicode-ident | 1.0.14 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://crates.io/crates/unicode-ident/1.0.14
+unicode-normalization | 0.1.24 | MIT/Apache-2.0 | https://crates.io/crates/unicode-normalization/0.1.24
+unicode-width | 0.1.10 | MIT/Apache-2.0 | https://crates.io/crates/unicode-width/0.1.10
+unicode-xid | 0.2.4 | MIT OR Apache-2.0 | https://crates.io/crates/unicode-xid/0.2.4
+untrusted | 0.7.1 | ISC | https://crates.io/crates/untrusted/0.7.1
+untrusted | 0.9.0 | ISC | https://crates.io/crates/untrusted/0.9.0
+ureq | 2.10.1 | MIT OR Apache-2.0 | https://crates.io/crates/ureq/2.10.1
+uring-common | 0.1.0 | MIT | git+https://github.com/neondatabase/tokio-epoll-uring.git?branch=main#781989bb540a1408b0b93daa1e9d1fa452195497
+url | 2.5.4 | MIT OR Apache-2.0 | https://crates.io/crates/url/2.5.4
+urlencoding | 2.1.2 | MIT | https://crates.io/crates/urlencoding/2.1.2
+utf-8 | 0.7.6 | MIT OR Apache-2.0 | https://crates.io/crates/utf-8/0.7.6
+utf16_iter | 1.0.5 | Apache-2.0 OR MIT | https://crates.io/crates/utf16_iter/1.0.5
+utf8_iter | 1.0.4 | Apache-2.0 OR MIT | https://crates.io/crates/utf8_iter/1.0.4
+utf8parse | 0.2.1 | Apache-2.0 OR MIT | https://crates.io/crates/utf8parse/0.2.1
+uuid | 0.8.2 | Apache-2.0 OR MIT | https://crates.io/crates/uuid/0.8.2
+uuid | 1.10.0 | Apache-2.0 OR MIT | https://crates.io/crates/uuid/1.10.0
+valuable | 0.1.0 | MIT | https://crates.io/crates/valuable/0.1.0
+version_check | 0.9.4 | MIT/Apache-2.0 | https://crates.io/crates/version_check/0.9.4
+vsimd | 0.8.0 | MIT | https://crates.io/crates/vsimd/0.8.0
+waker-fn | 1.1.1 | Apache-2.0 OR MIT | https://crates.io/crates/waker-fn/1.1.1
+walkdir | 2.5.0 | Unlicense/MIT | https://crates.io/crates/walkdir/2.5.0
+want | 0.3.0 | MIT | https://crates.io/crates/want/0.3.0
+wasi | 0.10.0+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/wasi/0.10.0+wasi-snapshot-preview1
+wasi | 0.11.0+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/wasi/0.11.0+wasi-snapshot-preview1
+wasi | 0.14.2+wasi-0.2.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/wasi/0.14.2+wasi-0.2.4
+wasi | 0.9.0+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/wasi/0.9.0+wasi-snapshot-preview1
+wasite | 0.1.0 | Apache-2.0 OR BSL-1.0 OR MIT | https://crates.io/crates/wasite/0.1.0
+wasm-bindgen | 0.2.92 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-bindgen/0.2.92
+wasm-bindgen-backend | 0.2.92 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-bindgen-backend/0.2.92
+wasm-bindgen-futures | 0.4.42 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-bindgen-futures/0.4.42
+wasm-bindgen-macro | 0.2.92 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-bindgen-macro/0.2.92
+wasm-bindgen-macro-support | 0.2.92 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-bindgen-macro-support/0.2.92
+wasm-bindgen-shared | 0.2.92 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-bindgen-shared/0.2.92
+wasm-streams | 0.4.0 | MIT OR Apache-2.0 | https://crates.io/crates/wasm-streams/0.4.0
+wasm-timer | 0.2.5 | MIT | https://crates.io/crates/wasm-timer/0.2.5
+web-sys | 0.3.69 | MIT OR Apache-2.0 | https://crates.io/crates/web-sys/0.3.69
+web-time | 1.1.0 | MIT OR Apache-2.0 | https://crates.io/crates/web-time/1.1.0
+webpki-roots | 0.26.1 | MPL-2.0 | https://crates.io/crates/webpki-roots/0.26.1
+whoami | 1.5.1 | Apache-2.0 OR BSL-1.0 OR MIT | https://crates.io/crates/whoami/1.5.1
+winapi | 0.3.9 | MIT/Apache-2.0 | https://crates.io/crates/winapi/0.3.9
+winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 | https://crates.io/crates/winapi-i686-pc-windows-gnu/0.4.0
+winapi-util | 0.1.5 | Unlicense/MIT | https://crates.io/crates/winapi-util/0.1.5
+winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 | https://crates.io/crates/winapi-x86_64-pc-windows-gnu/0.4.0
+windows | 0.52.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows/0.52.0
+windows-core | 0.52.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows-core/0.52.0
+windows-link | 0.2.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows-link/0.2.1
+windows-sys | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows-sys/0.48.0
+windows-sys | 0.52.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows-sys/0.52.0
+windows-sys | 0.59.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows-sys/0.59.0
+windows-sys | 0.60.2 | MIT OR Apache-2.0 | https://crates.io/crates/windows-sys/0.60.2
+windows-targets | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows-targets/0.48.0
+windows-targets | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows-targets/0.52.6
+windows-targets | 0.53.5 | MIT OR Apache-2.0 | https://crates.io/crates/windows-targets/0.53.5
+windows_aarch64_gnullvm | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_aarch64_gnullvm/0.48.0
+windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_aarch64_gnullvm/0.52.6
+windows_aarch64_gnullvm | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_aarch64_gnullvm/0.53.1
+windows_aarch64_msvc | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_aarch64_msvc/0.48.0
+windows_aarch64_msvc | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_aarch64_msvc/0.52.6
+windows_aarch64_msvc | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_aarch64_msvc/0.53.1
+windows_i686_gnu | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_gnu/0.48.0
+windows_i686_gnu | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_gnu/0.52.6
+windows_i686_gnu | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_gnu/0.53.1
+windows_i686_gnullvm | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_gnullvm/0.52.6
+windows_i686_gnullvm | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_gnullvm/0.53.1
+windows_i686_msvc | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_msvc/0.48.0
+windows_i686_msvc | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_msvc/0.52.6
+windows_i686_msvc | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_i686_msvc/0.53.1
+windows_x86_64_gnu | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_gnu/0.48.0
+windows_x86_64_gnu | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_gnu/0.52.6
+windows_x86_64_gnu | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_gnu/0.53.1
+windows_x86_64_gnullvm | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_gnullvm/0.48.0
+windows_x86_64_gnullvm | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_gnullvm/0.52.6
+windows_x86_64_gnullvm | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_gnullvm/0.53.1
+windows_x86_64_msvc | 0.48.0 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_msvc/0.48.0
+windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_msvc/0.52.6
+windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 | https://crates.io/crates/windows_x86_64_msvc/0.53.1
+winnow | 0.6.26 | MIT | https://crates.io/crates/winnow/0.6.26
+winreg | 0.52.0 | MIT | https://crates.io/crates/winreg/0.52.0
+wit-bindgen-rt | 0.39.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://crates.io/crates/wit-bindgen-rt/0.39.0
+write16 | 1.0.0 | Apache-2.0 OR MIT | https://crates.io/crates/write16/1.0.0
+writeable | 0.5.5 | Unicode-3.0 | https://crates.io/crates/writeable/0.5.5
+x509-cert | 0.2.5 | Apache-2.0 OR MIT | https://crates.io/crates/x509-cert/0.2.5
+x509-certificate | 0.23.1 | MPL-2.0 | https://crates.io/crates/x509-certificate/0.23.1
+xattr | 1.6.1 | MIT OR Apache-2.0 | https://crates.io/crates/xattr/1.6.1
+xmlparser | 0.13.5 | MIT/Apache-2.0 | https://crates.io/crates/xmlparser/0.13.5
+yansi | 1.0.1 | MIT OR Apache-2.0 | https://crates.io/crates/yansi/1.0.1
+yasna | 0.5.2 | MIT OR Apache-2.0 | https://crates.io/crates/yasna/0.5.2
+yoke | 0.7.5 | Unicode-3.0 | https://crates.io/crates/yoke/0.7.5
+yoke-derive | 0.7.5 | Unicode-3.0 | https://crates.io/crates/yoke-derive/0.7.5
+zerocopy | 0.7.31 | BSD-2-Clause OR Apache-2.0 OR MIT | https://crates.io/crates/zerocopy/0.7.31
+zerocopy | 0.8.24 | BSD-2-Clause OR Apache-2.0 OR MIT | https://crates.io/crates/zerocopy/0.8.24
+zerocopy-derive | 0.7.31 | BSD-2-Clause OR Apache-2.0 OR MIT | https://crates.io/crates/zerocopy-derive/0.7.31
+zerocopy-derive | 0.8.24 | BSD-2-Clause OR Apache-2.0 OR MIT | https://crates.io/crates/zerocopy-derive/0.8.24
+zerofrom | 0.1.5 | Unicode-3.0 | https://crates.io/crates/zerofrom/0.1.5
+zerofrom-derive | 0.1.5 | Unicode-3.0 | https://crates.io/crates/zerofrom-derive/0.1.5
+zeroize | 1.8.1 | Apache-2.0 OR MIT | https://crates.io/crates/zeroize/1.8.1
+zeroize_derive | 1.4.2 | Apache-2.0 OR MIT | https://crates.io/crates/zeroize_derive/1.4.2
+zerovec | 0.10.4 | Unicode-3.0 | https://crates.io/crates/zerovec/0.10.4
+zerovec-derive | 0.10.3 | Unicode-3.0 | https://crates.io/crates/zerovec-derive/0.10.3
+zstd | 0.13.0 | MIT | https://crates.io/crates/zstd/0.13.0
+zstd-safe | 7.0.0 | MIT/Apache-2.0 | https://crates.io/crates/zstd-safe/7.0.0
+zstd-sys | 2.0.9+zstd.1.5.5 | MIT/Apache-2.0 | https://crates.io/crates/zstd-sys/2.0.9+zstd.1.5.5
+
+Python packages (poetry.lock)
+-----------------------------
+Format: Software | Version | Declared license | Source
+These include testing and development packages.
+aiohappyeyeballs | 2.6.1 | PSF-2.0 | https://pypi.org/project/aiohappyeyeballs/2.6.1/
+aiohttp | 3.12.14 | Apache-2.0 | https://pypi.org/project/aiohttp/3.12.14/
+aiopg | 1.4.0 | BSD | https://pypi.org/project/aiopg/1.4.0/
+aiosignal | 1.4.0 | Apache 2.0 | https://pypi.org/project/aiosignal/1.4.0/
+allure-pytest | 2.13.5 | Apache-2.0 | https://pypi.org/project/allure-pytest/2.13.5/
+allure-python-commons | 2.13.5 | Apache-2.0 | https://pypi.org/project/allure-python-commons/2.13.5/
+annotated-types | 0.6.0 | OSI Approved :: MIT License | https://pypi.org/project/annotated-types/0.6.0/
+antlr4-python3-runtime | 4.13.1 | BSD | https://pypi.org/project/antlr4-python3-runtime/4.13.1/
+anyio | 4.3.0 | MIT | https://pypi.org/project/anyio/4.3.0/
+async-timeout | 4.0.3 | Apache 2 | https://pypi.org/project/async-timeout/4.0.3/
+asyncpg | 0.30.0 | Apache License, Version 2.0 | https://pypi.org/project/asyncpg/0.30.0/
+attrs | 21.4.0 | MIT | https://pypi.org/project/attrs/21.4.0/
+aws-sam-translator | 1.88.0 | Apache License 2.0 | https://pypi.org/project/aws-sam-translator/1.88.0/
+aws-xray-sdk | 2.10.0 | Apache License 2.0 | https://pypi.org/project/aws-xray-sdk/2.10.0/
+backoff | 2.2.1 | MIT | https://pypi.org/project/backoff/2.2.1/
+boto3 | 1.34.11 | Apache License 2.0 | https://pypi.org/project/boto3/1.34.11/
+boto3-stubs | 1.26.16 | MIT License | https://pypi.org/project/boto3-stubs/1.26.16/
+botocore | 1.34.162 | Apache License 2.0 | https://pypi.org/project/botocore/1.34.162/
+botocore-stubs | 1.27.38 | MIT License | https://pypi.org/project/botocore-stubs/1.27.38/
+certifi | 2024.7.4 | MPL-2.0 | https://pypi.org/project/certifi/2024.7.4/
+cffi | 1.17.1 | MIT | https://pypi.org/project/cffi/1.17.1/
+cfn-lint | 0.87.1 | MIT no attribution | https://pypi.org/project/cfn-lint/0.87.1/
+charset-normalizer | 2.1.0 | MIT | https://pypi.org/project/charset-normalizer/2.1.0/
+click | 8.1.3 | BSD-3-Clause | https://pypi.org/project/click/8.1.3/
+clickhouse-connect | 0.7.17 | Apache License 2.0 | https://pypi.org/project/clickhouse-connect/0.7.17/
+colorama | 0.4.5 | BSD | https://pypi.org/project/colorama/0.4.5/
+cryptography | 44.0.1 | Apache-2.0 OR BSD-3-Clause | https://pypi.org/project/cryptography/44.0.1/
+docker | 7.1.0 | OSI Approved :: Apache Software License | https://pypi.org/project/docker/7.1.0/
+execnet | 1.9.0 | MIT | https://pypi.org/project/execnet/1.9.0/
+flask | 2.2.5 | BSD-3-Clause | https://pypi.org/project/flask/2.2.5/
+flask-cors | 6.0.0 | MIT (upstream tag 6.0.0 LICENSE) | https://pypi.org/project/flask-cors/6.0.0/
+frozenlist | 1.5.0 | Apache 2 | https://pypi.org/project/frozenlist/1.5.0/
+graphql-core | 3.2.1 | MIT license | https://pypi.org/project/graphql-core/3.2.1/
+h11 | 0.16.0 | MIT | https://pypi.org/project/h11/0.16.0/
+h2 | 4.2.0 | OSI Approved :: MIT License | https://pypi.org/project/h2/4.2.0/
+hpack | 4.1.0 | OSI Approved :: MIT License | https://pypi.org/project/hpack/4.1.0/
+httpcore | 1.0.9 | BSD-3-Clause | https://pypi.org/project/httpcore/1.0.9/
+httpx | 0.26.0 | OSI Approved :: BSD License | https://pypi.org/project/httpx/0.26.0/
+hyperframe | 6.1.0 | OSI Approved :: MIT License | https://pypi.org/project/hyperframe/6.1.0/
+idna | 3.7 | OSI Approved :: BSD License | https://pypi.org/project/idna/3.7/
+iniconfig | 1.1.1 | MIT License | https://pypi.org/project/iniconfig/1.1.1/
+itsdangerous | 2.1.2 | BSD-3-Clause | https://pypi.org/project/itsdangerous/2.1.2/
+jinja2 | 3.1.6 | OSI Approved :: BSD License | https://pypi.org/project/jinja2/3.1.6/
+jmespath | 1.0.1 | MIT | https://pypi.org/project/jmespath/1.0.1/
+joserfc | 0.9.0 | BSD-3-Clause | https://pypi.org/project/joserfc/0.9.0/
+jschema-to-python | 1.2.3 | MIT | https://pypi.org/project/jschema-to-python/1.2.3/
+jsondiff | 2.0.0 | OSI Approved :: MIT License | https://pypi.org/project/jsondiff/2.0.0/
+jsonnet | 0.21.0rc2 | Apache License 2.0 | https://pypi.org/project/jsonnet/0.21.0rc2/
+jsonpatch | 1.32 | Modified BSD License | https://pypi.org/project/jsonpatch/1.32/
+jsonpath-ng | 1.6.1 | Apache 2.0 | https://pypi.org/project/jsonpath-ng/1.6.1/
+jsonpickle | 2.2.0 | OSI Approved :: BSD License | https://pypi.org/project/jsonpickle/2.2.0/
+jsonpointer | 2.3 | Modified BSD License | https://pypi.org/project/jsonpointer/2.3/
+jsonschema | 4.17.3 | MIT | https://pypi.org/project/jsonschema/4.17.3/
+jsonschema-spec | 0.1.6 | Apache-2.0 | https://pypi.org/project/jsonschema-spec/0.1.6/
+junit-xml | 1.9 | MIT | https://pypi.org/project/junit-xml/1.9/
+jwcrypto | 1.5.6 | LGPLv3+ | https://pypi.org/project/jwcrypto/1.5.6/
+kafka-python | 2.0.2 | Apache License 2.0 | https://pypi.org/project/kafka-python/2.0.2/
+lazy-object-proxy | 1.10.0 | BSD-2-Clause | https://pypi.org/project/lazy-object-proxy/1.10.0/
+lz4 | 4.3.3 | OSI Approved :: BSD License | https://pypi.org/project/lz4/4.3.3/
+markupsafe | 2.1.1 | BSD-3-Clause | https://pypi.org/project/markupsafe/2.1.1/
+moto | 5.0.6 | Apache License 2.0 | https://pypi.org/project/moto/5.0.6/
+mpmath | 1.3.0 | BSD | https://pypi.org/project/mpmath/1.3.0/
+multidict | 6.0.5 | Apache 2 | https://pypi.org/project/multidict/6.0.5/
+mypy | 1.13.0 | MIT | https://pypi.org/project/mypy/1.13.0/
+mypy-boto3-kms | 1.26.147 | MIT License | https://pypi.org/project/mypy-boto3-kms/1.26.147/
+mypy-boto3-s3 | 1.26.0.post1 | MIT License | https://pypi.org/project/mypy-boto3-s3/1.26.0.post1/
+mypy-extensions | 1.0.0 | MIT License | https://pypi.org/project/mypy-extensions/1.0.0/
+networkx | 2.8.5 | OSI Approved :: BSD License | https://pypi.org/project/networkx/2.8.5/
+openapi-schema-validator | 0.4.4 | BSD-3-Clause | https://pypi.org/project/openapi-schema-validator/0.4.4/
+openapi-spec-validator | 0.5.7 | Apache-2.0 | https://pypi.org/project/openapi-spec-validator/0.5.7/
+packaging | 24.2 | OSI Approved :: Apache Software License | OSI Approved :: BSD License | https://pypi.org/project/packaging/24.2/
+pathable | 0.4.3 | Apache License, Version 2.0 | https://pypi.org/project/pathable/0.4.3/
+pbr | 5.9.0 | OSI Approved :: Apache Software License | https://pypi.org/project/pbr/5.9.0/
+pluggy | 1.0.0 | MIT | https://pypi.org/project/pluggy/1.0.0/
+ply | 3.11 | BSD | https://pypi.org/project/ply/3.11/
+prometheus-client | 0.14.1 | Apache Software License 2.0 | https://pypi.org/project/prometheus-client/0.14.1/
+propcache | 0.2.0 | Apache-2.0 | https://pypi.org/project/propcache/0.2.0/
+psutil | 5.9.4 | BSD-3-Clause | https://pypi.org/project/psutil/5.9.4/
+psycopg2-binary | 2.9.10 | LGPL with exceptions | https://pypi.org/project/psycopg2-binary/2.9.10/
+py-partiql-parser | 0.5.4 | MIT | https://pypi.org/project/py-partiql-parser/0.5.4/
+pycparser | 2.21 | BSD | https://pypi.org/project/pycparser/2.21/
+pydantic | 2.10.4 | OSI Approved :: MIT License | https://pypi.org/project/pydantic/2.10.4/
+pydantic-core | 2.27.2 | MIT | https://pypi.org/project/pydantic-core/2.27.2/
+pyjwt | 2.4.0 | MIT | https://pypi.org/project/pyjwt/2.4.0/
+pyparsing | 3.0.9 | OSI Approved :: MIT License | https://pypi.org/project/pyparsing/3.0.9/
+pyrsistent | 0.18.1 | MIT | https://pypi.org/project/pyrsistent/0.18.1/
+pytest | 7.4.4 | MIT | https://pypi.org/project/pytest/7.4.4/
+pytest-asyncio | 0.21.0 | Apache 2.0 | https://pypi.org/project/pytest-asyncio/0.21.0/
+pytest-httpserver | 1.0.8 | MIT | https://pypi.org/project/pytest-httpserver/1.0.8/
+pytest-lazy-fixture | 0.6.3 | MIT | https://pypi.org/project/pytest-lazy-fixture/0.6.3/
+pytest-order | 1.1.0 | MIT | https://pypi.org/project/pytest-order/1.1.0/
+pytest-repeat | 0.9.3 | OSI Approved :: Mozilla Public License 2.0 (MPL 2.0) | https://pypi.org/project/pytest-repeat/0.9.3/
+pytest-rerunfailures | 15.0 | Mozilla Public License 2.0 (MPL 2.0) | https://pypi.org/project/pytest-rerunfailures/15.0/
+pytest-split | 0.8.1 | MIT | https://pypi.org/project/pytest-split/0.8.1/
+pytest-timeout | 2.3.1 | MIT | https://pypi.org/project/pytest-timeout/2.3.1/
+pytest-xdist | 3.3.1 | MIT | https://pypi.org/project/pytest-xdist/3.3.1/
+python-dateutil | 2.8.2 | Dual License | https://pypi.org/project/python-dateutil/2.8.2/
+python-dotenv | 1.0.1 | BSD-3-Clause | https://pypi.org/project/python-dotenv/1.0.1/
+pytz | 2024.1 | MIT | https://pypi.org/project/pytz/2024.1/
+pywin32 | 308 | PSF | https://pypi.org/project/pywin32/308/
+pyyaml | 6.0.2 | MIT | https://pypi.org/project/pyyaml/6.0.2/
+regex | 2024.4.28 | Apache Software License | https://pypi.org/project/regex/2024.4.28/
+requests | 2.32.4 | Apache-2.0 | https://pypi.org/project/requests/2.32.4/
+requests-unixsocket | 0.4.1 | Apache-2.0 (source distribution LICENSE) | https://pypi.org/project/requests-unixsocket/0.4.1/
+responses | 0.25.3 | Apache 2.0 | https://pypi.org/project/responses/0.25.3/
+rfc3339-validator | 0.1.4 | MIT license | https://pypi.org/project/rfc3339-validator/0.1.4/
+ruff | 0.11.2 | MIT | https://pypi.org/project/ruff/0.11.2/
+s3transfer | 0.10.0 | Apache License 2.0 | https://pypi.org/project/s3transfer/0.10.0/
+sarif-om | 1.0.4 | MIT | https://pypi.org/project/sarif-om/1.0.4/
+setuptools | 78.1.1 | MIT (upstream v78.1.1 LICENSE; bundled code may have additional terms) | https://pypi.org/project/setuptools/78.1.1/
+six | 1.16.0 | MIT | https://pypi.org/project/six/1.16.0/
+sniffio | 1.3.0 | MIT OR Apache-2.0 | https://pypi.org/project/sniffio/1.3.0/
+sympy | 1.12 | BSD | https://pypi.org/project/sympy/1.12/
+testcontainers | 4.9.0 | OSI Approved :: Apache Software License | https://pypi.org/project/testcontainers/4.9.0/
+toml | 0.10.2 | MIT | https://pypi.org/project/toml/0.10.2/
+types-jwcrypto | 1.5.0.20240925 | Apache-2.0 | https://pypi.org/project/types-jwcrypto/1.5.0.20240925/
+types-psutil | 5.9.5.12 | Apache-2.0 license | https://pypi.org/project/types-psutil/5.9.5.12/
+types-psycopg2 | 2.9.21.20241019 | Apache-2.0 | https://pypi.org/project/types-psycopg2/2.9.21.20241019/
+types-pytest-lazy-fixture | 0.6.3.3 | Apache-2.0 license | https://pypi.org/project/types-pytest-lazy-fixture/0.6.3.3/
+types-pyyaml | 6.0.12.20240917 | Apache-2.0 | https://pypi.org/project/types-pyyaml/6.0.12.20240917/
+types-requests | 2.31.0.0 | Apache-2.0 license | https://pypi.org/project/types-requests/2.31.0.0/
+types-s3transfer | 0.6.0.post3 | MIT | https://pypi.org/project/types-s3transfer/0.6.0.post3/
+types-toml | 0.10.8.6 | Apache-2.0 license | https://pypi.org/project/types-toml/0.10.8.6/
+types-urllib3 | 1.26.17 | Apache-2.0 license | https://pypi.org/project/types-urllib3/1.26.17/
+typing-extensions | 4.12.2 | OSI Approved :: Python Software Foundation License | https://pypi.org/project/typing-extensions/4.12.2/
+urllib3 | 2.5.0 | MIT | https://pypi.org/project/urllib3/2.5.0/
+websockets | 12.0 | BSD-3-Clause | https://pypi.org/project/websockets/12.0/
+werkzeug | 3.0.6 | OSI Approved :: BSD License | https://pypi.org/project/werkzeug/3.0.6/
+wrapt | 1.14.1 | BSD | https://pypi.org/project/wrapt/1.14.1/
+xmltodict | 0.13.0 | MIT | https://pypi.org/project/xmltodict/0.13.0/
+yarl | 1.17.2 | Apache-2.0 | https://pypi.org/project/yarl/1.17.2/
+zstandard | 0.23.0 | BSD | https://pypi.org/project/zstandard/0.23.0/
+
+Node packages (package-lock.json)
+---------------------------------
+Format: Lockfile | Software | Version | Declared license | Use
+The package-lock license field is reported verbatim; 'NOT DECLARED' means
+the lockfile does not carry a license declaration.
+build-tools/package-lock.json | @babel/code-frame | 7.27.1 | MIT | development
+build-tools/package-lock.json | @babel/helper-validator-identifier | 7.27.1 | MIT | development
+build-tools/package-lock.json | @babel/runtime | 7.27.6 | MIT | development
+build-tools/package-lock.json | @emotion/is-prop-valid | 1.2.2 | MIT | development
+build-tools/package-lock.json | @emotion/memoize | 0.8.1 | MIT | development
+build-tools/package-lock.json | @emotion/unitless | 0.8.1 | MIT | development
+build-tools/package-lock.json | @exodus/schemasafe | 1.3.0 | MIT | development
+build-tools/package-lock.json | @faker-js/faker | 7.6.0 | MIT | development
+build-tools/package-lock.json | @humanwhocodes/momoa | 2.0.4 | Apache-2.0 | development
+build-tools/package-lock.json | @jest/schemas | 29.6.3 | MIT | development
+build-tools/package-lock.json | @jsep-plugin/assignment | 1.3.0 | MIT | development
+build-tools/package-lock.json | @jsep-plugin/regex | 1.0.4 | MIT | development
+build-tools/package-lock.json | @opentelemetry/api | 1.9.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/api-logs | 0.53.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/context-async-hooks | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/core | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/exporter-trace-otlp-http | 0.53.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/otlp-exporter-base | 0.53.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/otlp-transformer | 0.53.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/propagator-b3 | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/propagator-jaeger | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/resources | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/sdk-logs | 0.53.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/sdk-metrics | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/sdk-trace-base | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/sdk-trace-node | 1.26.0 | Apache-2.0 | development
+build-tools/package-lock.json | @opentelemetry/semantic-conventions | 1.27.0 | Apache-2.0 | development
+build-tools/package-lock.json | @protobufjs/aspromise | 1.1.2 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/base64 | 1.1.2 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/codegen | 2.0.4 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/eventemitter | 1.1.0 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/fetch | 1.1.0 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/float | 1.0.2 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/inquire | 1.1.0 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/path | 1.1.2 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/pool | 1.1.0 | BSD-3-Clause | development
+build-tools/package-lock.json | @protobufjs/utf8 | 1.1.0 | BSD-3-Clause | development
+build-tools/package-lock.json | @redocly/ajv | 8.11.2 | MIT | development
+build-tools/package-lock.json | @redocly/cli | 1.34.5 | MIT | development
+build-tools/package-lock.json | @redocly/config | 0.22.2 | MIT | development
+build-tools/package-lock.json | @redocly/openapi-core | 1.34.5 | MIT | development
+build-tools/package-lock.json | @redocly/respect-core | 1.34.5 | MIT | development
+build-tools/package-lock.json | colorette | 2.0.20 | MIT | development
+build-tools/package-lock.json | @sinclair/typebox | 0.27.8 | MIT | development
+build-tools/package-lock.json | @sourcemeta/jsonschema | 10.0.0 | AGPL-3.0 | development
+build-tools/package-lock.json | @types/json-schema | 7.0.15 | MIT | development
+build-tools/package-lock.json | @types/node | 24.0.13 | MIT | development
+build-tools/package-lock.json | @types/stylis | 4.2.5 | MIT | development
+build-tools/package-lock.json | @types/trusted-types | 2.0.7 | MIT | development
+build-tools/package-lock.json | abort-controller | 3.0.0 | MIT | development
+build-tools/package-lock.json | agent-base | 7.1.4 | MIT | development
+build-tools/package-lock.json | ajv | 8.17.1 | MIT | development
+build-tools/package-lock.json | ansi-regex | 5.0.1 | MIT | development
+build-tools/package-lock.json | ansi-styles | 4.3.0 | MIT | development
+build-tools/package-lock.json | anymatch | 3.1.3 | ISC | development
+build-tools/package-lock.json | argparse | 2.0.1 | Python-2.0 | development
+build-tools/package-lock.json | asynckit | 0.4.0 | MIT | development
+build-tools/package-lock.json | balanced-match | 1.0.2 | MIT | development
+build-tools/package-lock.json | better-ajv-errors | 1.2.0 | Apache-2.0 | development
+build-tools/package-lock.json | binary-extensions | 2.3.0 | MIT | development
+build-tools/package-lock.json | brace-expansion | 2.0.2 | MIT | development
+build-tools/package-lock.json | braces | 3.0.3 | MIT | development
+build-tools/package-lock.json | buffer-from | 1.1.2 | MIT | development
+build-tools/package-lock.json | bundle-name | 4.1.0 | MIT | development
+build-tools/package-lock.json | call-bind-apply-helpers | 1.0.2 | MIT | development
+build-tools/package-lock.json | call-me-maybe | 1.0.2 | MIT | development
+build-tools/package-lock.json | camelize | 1.0.1 | MIT | development
+build-tools/package-lock.json | chalk | 4.1.2 | MIT | development
+build-tools/package-lock.json | chokidar | 3.6.0 | MIT | development
+build-tools/package-lock.json | classnames | 2.5.1 | MIT | development
+build-tools/package-lock.json | cliui | 7.0.4 | ISC | development
+build-tools/package-lock.json | clsx | 2.1.1 | MIT | development
+build-tools/package-lock.json | color-convert | 2.0.1 | MIT | development
+build-tools/package-lock.json | color-name | 1.1.4 | MIT | development
+build-tools/package-lock.json | colorette | 1.4.0 | MIT | development
+build-tools/package-lock.json | combined-stream | 1.0.8 | MIT | development
+build-tools/package-lock.json | concat-map | 0.0.1 | MIT | development
+build-tools/package-lock.json | concat-stream | 2.0.0 | MIT | development
+build-tools/package-lock.json | cookie | 0.7.2 | MIT | development
+build-tools/package-lock.json | core-js | 3.44.0 | MIT | development
+build-tools/package-lock.json | css-color-keywords | 1.0.0 | ISC | development
+build-tools/package-lock.json | css-to-react-native | 3.2.0 | MIT | development
+build-tools/package-lock.json | csstype | 3.1.3 | MIT | development
+build-tools/package-lock.json | debug | 4.4.1 | MIT | development
+build-tools/package-lock.json | decko | 1.2.0 | MIT (npm tarball LICENSE) | development
+build-tools/package-lock.json | default-browser | 5.2.1 | MIT | development
+build-tools/package-lock.json | default-browser-id | 5.0.0 | MIT | development
+build-tools/package-lock.json | define-lazy-prop | 3.0.0 | MIT | development
+build-tools/package-lock.json | delayed-stream | 1.0.0 | MIT | development
+build-tools/package-lock.json | diff-sequences | 29.6.3 | MIT | development
+build-tools/package-lock.json | dompurify | 3.2.6 | (MPL-2.0 OR Apache-2.0) | development
+build-tools/package-lock.json | dotenv | 16.4.7 | BSD-2-Clause | development
+build-tools/package-lock.json | dunder-proto | 1.0.1 | MIT | development
+build-tools/package-lock.json | emoji-regex | 8.0.0 | MIT | development
+build-tools/package-lock.json | es-define-property | 1.0.1 | MIT | development
+build-tools/package-lock.json | es-errors | 1.3.0 | MIT | development
+build-tools/package-lock.json | es-object-atoms | 1.1.1 | MIT | development
+build-tools/package-lock.json | es-set-tostringtag | 2.1.0 | MIT | development
+build-tools/package-lock.json | es6-promise | 3.3.1 | MIT | development
+build-tools/package-lock.json | escalade | 3.2.0 | MIT | development
+build-tools/package-lock.json | event-target-shim | 5.0.1 | MIT | development
+build-tools/package-lock.json | eventemitter3 | 5.0.1 | MIT | development
+build-tools/package-lock.json | fast-deep-equal | 3.1.3 | MIT | development
+build-tools/package-lock.json | fast-safe-stringify | 2.1.1 | MIT | development
+build-tools/package-lock.json | fast-uri | 3.0.6 | BSD-3-Clause | development
+build-tools/package-lock.json | fast-xml-parser | 4.5.3 | MIT | development
+build-tools/package-lock.json | fill-range | 7.1.1 | MIT | development
+build-tools/package-lock.json | foreach | 2.0.6 | MIT | development
+build-tools/package-lock.json | form-data | 4.0.4 | MIT | development
+build-tools/package-lock.json | fs.realpath | 1.0.0 | ISC | development
+build-tools/package-lock.json | fsevents | 2.3.3 | MIT | development
+build-tools/package-lock.json | function-bind | 1.1.2 | MIT | development
+build-tools/package-lock.json | get-caller-file | 2.0.5 | ISC | development
+build-tools/package-lock.json | get-intrinsic | 1.3.0 | MIT | development
+build-tools/package-lock.json | get-port-please | 3.2.0 | MIT | development
+build-tools/package-lock.json | get-proto | 1.0.1 | MIT | development
+build-tools/package-lock.json | glob | 7.2.3 | ISC | development
+build-tools/package-lock.json | glob-parent | 5.1.2 | ISC | development
+build-tools/package-lock.json | brace-expansion | 1.1.12 | MIT | development
+build-tools/package-lock.json | minimatch | 3.1.2 | ISC | development
+build-tools/package-lock.json | gopd | 1.2.0 | MIT | development
+build-tools/package-lock.json | handlebars | 4.7.8 | MIT | development
+build-tools/package-lock.json | has-flag | 4.0.0 | MIT | development
+build-tools/package-lock.json | has-symbols | 1.1.0 | MIT | development
+build-tools/package-lock.json | has-tostringtag | 1.0.2 | MIT | development
+build-tools/package-lock.json | hasown | 2.0.2 | MIT | development
+build-tools/package-lock.json | http2-client | 1.3.5 | MIT | development
+build-tools/package-lock.json | https-proxy-agent | 7.0.6 | MIT | development
+build-tools/package-lock.json | inflight | 1.0.6 | ISC | development
+build-tools/package-lock.json | inherits | 2.0.4 | ISC | development
+build-tools/package-lock.json | is-binary-path | 2.1.0 | MIT | development
+build-tools/package-lock.json | is-docker | 3.0.0 | MIT | development
+build-tools/package-lock.json | is-extglob | 2.1.1 | MIT | development
+build-tools/package-lock.json | is-fullwidth-code-point | 3.0.0 | MIT | development
+build-tools/package-lock.json | is-glob | 4.0.3 | MIT | development
+build-tools/package-lock.json | is-inside-container | 1.0.0 | MIT | development
+build-tools/package-lock.json | is-number | 7.0.0 | MIT | development
+build-tools/package-lock.json | is-wsl | 3.1.0 | MIT | development
+build-tools/package-lock.json | jest-diff | 29.7.0 | MIT | development
+build-tools/package-lock.json | jest-get-type | 29.6.3 | MIT | development
+build-tools/package-lock.json | jest-matcher-utils | 29.7.0 | MIT | development
+build-tools/package-lock.json | js-levenshtein | 1.1.6 | MIT | development
+build-tools/package-lock.json | js-tokens | 4.0.0 | MIT | development
+build-tools/package-lock.json | js-yaml | 4.1.0 | MIT | development
+build-tools/package-lock.json | jsep | 1.4.0 | MIT | development
+build-tools/package-lock.json | json-pointer | 0.6.2 | MIT | development
+build-tools/package-lock.json | json-schema-traverse | 1.0.0 | MIT | development
+build-tools/package-lock.json | jsonpath-plus | 10.3.0 | MIT | development
+build-tools/package-lock.json | jsonpointer | 5.0.1 | MIT | development
+build-tools/package-lock.json | leven | 3.1.0 | MIT | development
+build-tools/package-lock.json | long | 5.3.2 | Apache-2.0 | development
+build-tools/package-lock.json | loose-envify | 1.4.0 | MIT | development
+build-tools/package-lock.json | lunr | 2.3.9 | MIT | development
+build-tools/package-lock.json | mark.js | 8.11.1 | MIT | development
+build-tools/package-lock.json | marked | 4.3.0 | MIT | development
+build-tools/package-lock.json | math-intrinsics | 1.1.0 | MIT | development
+build-tools/package-lock.json | mime-db | 1.52.0 | MIT | development
+build-tools/package-lock.json | mime-types | 2.1.35 | MIT | development
+build-tools/package-lock.json | minimatch | 5.1.6 | ISC | development
+build-tools/package-lock.json | minimist | 1.2.8 | MIT | development
+build-tools/package-lock.json | mobx | 6.13.7 | MIT | development
+build-tools/package-lock.json | mobx-react | 9.2.0 | MIT | development
+build-tools/package-lock.json | mobx-react-lite | 4.1.0 | MIT | development
+build-tools/package-lock.json | ms | 2.1.3 | MIT | development
+build-tools/package-lock.json | nanoid | 3.3.11 | MIT | development
+build-tools/package-lock.json | neo-async | 2.6.2 | MIT | development
+build-tools/package-lock.json | node-fetch | 2.7.0 | MIT | development
+build-tools/package-lock.json | node-fetch-h2 | 2.3.0 | MIT | development
+build-tools/package-lock.json | node-readfiles | 0.2.0 | MIT | development
+build-tools/package-lock.json | normalize-path | 3.0.0 | MIT | development
+build-tools/package-lock.json | oas-kit-common | 1.0.8 | BSD-3-Clause | development
+build-tools/package-lock.json | oas-linter | 3.2.2 | BSD-3-Clause | development
+build-tools/package-lock.json | oas-resolver | 2.5.6 | BSD-3-Clause | development
+build-tools/package-lock.json | oas-schema-walker | 1.1.5 | BSD-3-Clause | development
+build-tools/package-lock.json | oas-validator | 5.0.8 | BSD-3-Clause | development
+build-tools/package-lock.json | object-assign | 4.1.1 | MIT | development
+build-tools/package-lock.json | once | 1.4.0 | ISC | development
+build-tools/package-lock.json | open | 10.2.0 | MIT | development
+build-tools/package-lock.json | openapi-sampler | 1.6.1 | MIT | development
+build-tools/package-lock.json | outdent | 0.8.0 | MIT | development
+build-tools/package-lock.json | path-browserify | 1.0.1 | MIT | development
+build-tools/package-lock.json | path-is-absolute | 1.0.1 | MIT | development
+build-tools/package-lock.json | perfect-scrollbar | 1.5.6 | MIT | development
+build-tools/package-lock.json | picocolors | 1.1.1 | ISC | development
+build-tools/package-lock.json | picomatch | 2.3.1 | MIT | development
+build-tools/package-lock.json | pluralize | 8.0.0 | MIT | development
+build-tools/package-lock.json | polished | 4.3.1 | MIT | development
+build-tools/package-lock.json | postcss | 8.4.49 | MIT | development
+build-tools/package-lock.json | postcss-value-parser | 4.2.0 | MIT | development
+build-tools/package-lock.json | pretty-format | 29.7.0 | MIT | development
+build-tools/package-lock.json | ansi-styles | 5.2.0 | MIT | development
+build-tools/package-lock.json | prismjs | 1.30.0 | MIT | development
+build-tools/package-lock.json | prop-types | 15.8.1 | MIT | development
+build-tools/package-lock.json | react-is | 16.13.1 | MIT | development
+build-tools/package-lock.json | protobufjs | 7.5.3 | BSD-3-Clause | development
+build-tools/package-lock.json | queue-microtask | 1.2.3 | MIT | development
+build-tools/package-lock.json | randombytes | 2.1.0 | MIT | development
+build-tools/package-lock.json | react | 19.1.0 | MIT | development
+build-tools/package-lock.json | react-dom | 19.1.0 | MIT | development
+build-tools/package-lock.json | react-is | 18.3.1 | MIT | development
+build-tools/package-lock.json | react-tabs | 6.1.0 | MIT | development
+build-tools/package-lock.json | readable-stream | 3.6.2 | MIT | development
+build-tools/package-lock.json | readdirp | 3.6.0 | MIT | development
+build-tools/package-lock.json | redoc | 2.5.0 | MIT | development
+build-tools/package-lock.json | reftools | 1.1.9 | BSD-3-Clause | development
+build-tools/package-lock.json | require-directory | 2.1.1 | MIT | development
+build-tools/package-lock.json | require-from-string | 2.0.2 | MIT | development
+build-tools/package-lock.json | run-applescript | 7.0.0 | MIT | development
+build-tools/package-lock.json | safe-buffer | 5.2.1 | MIT | development
+build-tools/package-lock.json | scheduler | 0.26.0 | MIT | development
+build-tools/package-lock.json | semver | 7.7.2 | ISC | development
+build-tools/package-lock.json | set-cookie-parser | 2.7.1 | MIT | development
+build-tools/package-lock.json | shallowequal | 1.1.0 | MIT | development
+build-tools/package-lock.json | should | 13.2.3 | MIT | development
+build-tools/package-lock.json | should-equal | 2.0.0 | MIT | development
+build-tools/package-lock.json | should-format | 3.0.3 | MIT | development
+build-tools/package-lock.json | should-type | 1.4.0 | MIT | development
+build-tools/package-lock.json | should-type-adaptors | 1.1.0 | MIT | development
+build-tools/package-lock.json | should-util | 1.0.1 | MIT | development
+build-tools/package-lock.json | simple-websocket | 9.1.0 | MIT | development
+build-tools/package-lock.json | slugify | 1.4.7 | MIT | development
+build-tools/package-lock.json | source-map | 0.6.1 | BSD-3-Clause | development
+build-tools/package-lock.json | source-map-js | 1.2.1 | BSD-3-Clause | development
+build-tools/package-lock.json | stickyfill | 1.1.1 | MIT (npm tarball LICENSE) | development
+build-tools/package-lock.json | string-width | 4.2.3 | MIT | development
+build-tools/package-lock.json | string_decoder | 1.3.0 | MIT | development
+build-tools/package-lock.json | strip-ansi | 6.0.1 | MIT | development
+build-tools/package-lock.json | strnum | 1.1.2 | MIT | development
+build-tools/package-lock.json | styled-components | 6.1.19 | MIT | development
+build-tools/package-lock.json | stylis | 4.3.2 | MIT | development
+build-tools/package-lock.json | supports-color | 7.2.0 | MIT | development
+build-tools/package-lock.json | swagger2openapi | 7.0.8 | BSD-3-Clause | development
+build-tools/package-lock.json | to-regex-range | 5.0.1 | MIT | development
+build-tools/package-lock.json | tr46 | 0.0.3 | MIT | development
+build-tools/package-lock.json | tslib | 2.6.2 | 0BSD | development
+build-tools/package-lock.json | typedarray | 0.0.6 | MIT | development
+build-tools/package-lock.json | uglify-js | 3.19.3 | BSD-2-Clause | development
+build-tools/package-lock.json | undici | 6.21.3 | MIT | development
+build-tools/package-lock.json | undici-types | 7.8.0 | MIT | development
+build-tools/package-lock.json | uri-js-replace | 1.0.1 | MIT | development
+build-tools/package-lock.json | url-template | 2.0.8 | BSD | development
+build-tools/package-lock.json | use-sync-external-store | 1.5.0 | MIT | development
+build-tools/package-lock.json | util-deprecate | 1.0.2 | MIT | development
+build-tools/package-lock.json | webidl-conversions | 3.0.1 | BSD-2-Clause | development
+build-tools/package-lock.json | whatwg-url | 5.0.0 | MIT | development
+build-tools/package-lock.json | wordwrap | 1.0.0 | MIT | development
+build-tools/package-lock.json | wrap-ansi | 7.0.0 | MIT | development
+build-tools/package-lock.json | wrappy | 1.0.2 | ISC | development
+build-tools/package-lock.json | ws | 7.5.10 | MIT | development
+build-tools/package-lock.json | wsl-utils | 0.1.0 | MIT | development
+build-tools/package-lock.json | y18n | 5.0.8 | ISC | development
+build-tools/package-lock.json | yaml | 1.10.2 | ISC | development
+build-tools/package-lock.json | yaml-ast-parser | 0.0.43 | Apache-2.0 | development
+build-tools/package-lock.json | yargs | 17.0.1 | MIT | development
+build-tools/package-lock.json | yargs-parser | 20.2.9 | ISC | development
+compute/package-lock.json | @sourcemeta/jsonschema | 9.3.4 | AGPL-3.0 | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | @neondatabase/serverless | 0.9.4 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | @types/node | 20.14.9 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | @types/pg | 8.11.6 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | obuf | 1.1.2 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | pg-int8 | 1.0.1 | ISC | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | pg-numeric | 1.0.2 | ISC | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | pg-protocol | 1.6.1 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | pg-types | 4.0.2 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | postgres-array | 3.0.2 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | postgres-bytea | 3.0.0 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | postgres-date | 2.1.0 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | postgres-interval | 3.0.0 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | postgres-range | 1.1.4 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | undici-types | 5.26.5 | MIT | other/production
+test_runner/pg_clients/typescript/serverless-driver/package-lock.json | ws | 8.17.1 | MIT (npm registry metadata) | other/production
+
+Base image and system packages
+------------------------------
+The openGauss Dockerfiles use openeuler/openeuler:22.03-lts as a final
+base image. Dockerfile.arm installs the following final-stage packages:
+readline-devel, libseccomp-devel, ca-certificates, openssl, unzip, curl,
+procps-ng, vim, libaio-devel, numactl-devel, lapack, openblas, libxml2, shadow.
+compute/compute-node-opengauss.arm.Dockerfile installs:
+ca-certificates, gdb, iproute, libcurl, libevent, lz4, libuuid, readline,
+libxml2, libxslt, libzstd, libaio, libedit, lapack, ncurses-libs,
+numactl-libs, openblas, glibc-common, glibc-locale-source, perl, lsof,
+procps, screen, tcpdump, vim, jq, nmap, libicu, shadow, findutils.
+Dockerfile.arm also downloads AWS CLI v2 without pinning a version.
+Consult the exact built image's package database and the respective
+upstream license files for version-specific system package notices.
+
+License text locations
+----------------------
+Project Apache-2.0: LICENSE
+openGauss copyright, MulanPSL-2.0 and third-party notices:
+  vendor/openGauss/COPYRIGHT
+  vendor/openGauss/License
+  vendor/openGauss/Third_Party_Open_Source_Software_Notice
+openGauss Rust connector: vendor/openGauss-connector-rust/LICENSE
+  and component LICENSE-MIT / LICENSE-APACHE files
+diesel-async: vendor/diesel-async-0.5.2/LICENSE-MIT
+  and vendor/diesel-async-0.5.2/LICENSE-APACHE
+For each registry dependency, the exact-version source URL above is the
+reference for its copyright notices and complete license text.
+NOT DECLARED and NOT VERIFIED entries require source-level review before
+treating this as a distribution compliance record.
+The copyright notices and full license texts for registry packages remain
+in their exact-version upstream source archives unless reproduced below.
+
+Selected source license texts (verbatim)
+---------------------------------------
+These texts come from license files in the checked-out vendor source or exact
+Rust registry source cache. The openGauss MulanPSL-2.0 section reproduces only
+the English part; the complete bilingual source is vendor/openGauss/License.
+Component-specific copyright notices remain in their upstream source archives
+where not reproduced here.
+
+========================================================================
+openGauss server — MulanPSL-2.0
+Source file: vendor/openGauss/License
+========================================================================
+Mulan Permissive Software License，Version 2 (Mulan PSL v2)
+
+January 2020 http://license.coscl.org.cn/MulanPSL2
+
+Your reproduction, use, modification and distribution of the Software shall be subject to Mulan PSL v2 (this License) with the following terms and conditions:
+
+0. Definition
+
+Software means the program and related documents which are licensed under this License and comprise all Contribution(s).
+
+Contribution means the copyrightable work licensed by a particular Contributor under this License.
+
+Contributor means the Individual or Legal Entity who licenses its copyrightable work under this License.
+
+Legal Entity means the entity making a Contribution and all its Affiliates.
+
+Affiliates means entities that control, are controlled by, or are under common control with the acting entity under this License, ‘control’ means direct or indirect ownership of at least fifty percent (50%) of the voting power, capital or other securities of controlled or commonly controlled entity.
+
+1. Grant of Copyright License
+
+Subject to the terms and conditions of this License, each Contributor hereby grants to you a perpetual, worldwide, royalty-free, non-exclusive, irrevocable copyright license to reproduce, use, modify, or distribute its Contribution, with modification or not.
+
+2. Grant of Patent License
+
+Subject to the terms and conditions of this License, each Contributor hereby grants to you a perpetual, worldwide, royalty-free, non-exclusive, irrevocable (except for revocation under this Section) patent license to make, have made, use, offer for sale, sell, import or otherwise transfer its Contribution, where such patent license is only limited to the patent claims owned or controlled by such Contributor now or in future which will be necessarily infringed by its Contribution alone, or by combination of the Contribution with the Software to which the Contribution was contributed. The patent license shall not apply to any modification of the Contribution, and any other combination which includes the Contribution. If you or your Affiliates directly or indirectly institute patent litigation (including a cross claim or counterclaim in a litigation) or other patent enforcement activities against any individual or entity by alleging that the Software or any Contribution in it infringes patents, then any patent license granted to you under this License for the Software shall terminate as of the date such litigation or activity is filed or taken.
+
+3. No Trademark License
+
+No trademark license is granted to use the trade names, trademarks, service marks, or product names of Contributor, except as required to fulfill notice requirements in section 4.
+
+4. Distribution Restriction
+
+You may distribute the Software in any medium with or without modification, whether in source or executable forms, provided that you provide recipients with a copy of this License and retain copyright, patent, trademark and disclaimer statements in the Software.
+
+5. Disclaimer of Warranty and Limitation of Liability
+
+THE SOFTWARE AND CONTRIBUTION IN IT ARE PROVIDED WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED. IN NO EVENT SHALL ANY CONTRIBUTOR OR COPYRIGHT HOLDER BE LIABLE TO YOU FOR ANY DAMAGES, INCLUDING, BUT NOT LIMITED TO ANY DIRECT, OR INDIRECT, SPECIAL OR CONSEQUENTIAL DAMAGES ARISING FROM YOUR USE OR INABILITY TO USE THE SOFTWARE OR THE CONTRIBUTION IN IT, NO MATTER HOW IT’S CAUSED OR BASED ON WHICH LEGAL THEORY, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+6. Language
+
+THIS LICENSE IS WRITTEN IN BOTH CHINESE AND ENGLISH, AND THE CHINESE VERSION AND ENGLISH VERSION SHALL HAVE THE SAME LEGAL EFFECT. IN THE CASE OF DIVERGENCE BETWEEN THE CHINESE AND ENGLISH VERSIONS, THE CHINESE VERSION SHALL PREVAIL.
+
+END OF THE TERMS AND CONDITIONS
+
+How to Apply the Mulan Permissive Software License，Version 2 (Mulan PSL v2) to Your Software
+
+To apply the Mulan PSL v2 to your work, for easy identification by recipients, you are suggested to complete following three steps:
+
+Fill in the blanks in following statement, including insert your software name, the year of the first publication of your software, and your name identified as the copyright owner;
+Create a file named "LICENSE" which contains the whole context of this License in the first directory of your software package;
+Attach the statement to the appropriate annotated syntax at the beginning of each source file.
+Copyright (c) [Year] [name of copyright holder]
+[Software Name] is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+         http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details.
+
+========================================================================
+openGauss Rust connector — MIT
+Source file: vendor/openGauss-connector-rust/opengauss/LICENSE-MIT
+========================================================================
+The MIT License (MIT)
+
+Copyright (c) 2016 Steven Fackler
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+========================================================================
+openGauss Rust connector — Apache-2.0
+Source file: vendor/openGauss-connector-rust/opengauss/LICENSE-APACHE
+========================================================================
+                              Apache License
+                        Version 2.0, January 2004
+                     http://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS
+
+APPENDIX: How to apply the Apache License to your work.
+
+   To apply the Apache License to your work, attach the following
+   boilerplate notice, with the fields enclosed by brackets "[]"
+   replaced with your own identifying information. (Don't include
+   the brackets!)  The text should be enclosed in the appropriate
+   comment syntax for the file format. We also recommend that a
+   file or class name and description of purpose be included on the
+   same "printed page" as the copyright notice for easier
+   identification within third-party archives.
+
+Copyright [yyyy] [name of copyright owner]
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+========================================================================
+diesel-async — MIT
+Source file: vendor/diesel-async-0.5.2/LICENSE-MIT
+========================================================================
+The MIT License (MIT)
+
+2021-2022 Georg Semmler
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+========================================================================
+diesel-async — Apache-2.0
+Source file: vendor/diesel-async-0.5.2/LICENSE-APACHE
+========================================================================
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   Copyright 2015-2021 Sean Griffin, 2018-2021 Diesel Core Team
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+========================================================================
+fuchsia-cprng 0.1.1
+Source: https://crates.io/crates/fuchsia-cprng/0.1.1
+========================================================================
+Copyright 2019 The Fuchsia Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+========================================================================
+ring 0.16.20
+Source: https://crates.io/crates/ring/0.16.20
+========================================================================
+Note that it is easy for this file to get out of sync with the licenses in the
+source code files. It's recommended to compare the licenses in the source code
+with what's mentioned here.
+
+*ring* is derived from BoringSSL, so the licensing situation in *ring* is
+similar to BoringSSL.
+
+*ring* uses an ISC-style license like BoringSSL for code in new files,
+including in particular all the Rust code:
+
+   Copyright 2015-2016 Brian Smith.
+
+   Permission to use, copy, modify, and/or distribute this software for any
+   purpose with or without fee is hereby granted, provided that the above
+   copyright notice and this permission notice appear in all copies.
+
+   THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+   WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+   MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY
+   SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+   OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+   CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+BoringSSL is a fork of OpenSSL. As such, large parts of it fall under OpenSSL
+licensing. Files that are completely new have a Google copyright and an ISC
+license. This license is reproduced at the bottom of this file.
+
+Contributors to BoringSSL are required to follow the CLA rules for Chromium:
+https://cla.developers.google.com/clas
+
+Files in third_party/ have their own licenses, as described therein. The MIT
+license, for third_party/fiat, which, unlike other third_party directories, is
+compiled into non-test libraries, is included below.
+
+The OpenSSL toolkit stays under a dual license, i.e. both the conditions of the
+OpenSSL License and the original SSLeay license apply to the toolkit. See below
+for the actual license texts. Actually both licenses are BSD-style Open Source
+licenses. In case of any license issues related to OpenSSL please contact
+openssl-core@openssl.org.
+
+The following are Google-internal bug numbers where explicit permission from
+some authors is recorded for use of their work:
+  27287199
+  27287880
+  27287883
+
+  OpenSSL License
+  ---------------
+
+/* ====================================================================
+ * Copyright (c) 1998-2011 The OpenSSL Project.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer. 
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *
+ * 3. All advertising materials mentioning features or use of this
+ *    software must display the following acknowledgment:
+ *    "This product includes software developed by the OpenSSL Project
+ *    for use in the OpenSSL Toolkit. (http://www.openssl.org/)"
+ *
+ * 4. The names "OpenSSL Toolkit" and "OpenSSL Project" must not be used to
+ *    endorse or promote products derived from this software without
+ *    prior written permission. For written permission, please contact
+ *    openssl-core@openssl.org.
+ *
+ * 5. Products derived from this software may not be called "OpenSSL"
+ *    nor may "OpenSSL" appear in their names without prior written
+ *    permission of the OpenSSL Project.
+ *
+ * 6. Redistributions of any form whatsoever must retain the following
+ *    acknowledgment:
+ *    "This product includes software developed by the OpenSSL Project
+ *    for use in the OpenSSL Toolkit (http://www.openssl.org/)"
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE OpenSSL PROJECT ``AS IS'' AND ANY
+ * EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE OpenSSL PROJECT OR
+ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+ * OF THE POSSIBILITY OF SUCH DAMAGE.
+ * ====================================================================
+ *
+ * This product includes cryptographic software written by Eric Young
+ * (eay@cryptsoft.com).  This product includes software written by Tim
+ * Hudson (tjh@cryptsoft.com).
+ *
+ */
+
+ Original SSLeay License
+ -----------------------
+
+/* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
+ * All rights reserved.
+ *
+ * This package is an SSL implementation written
+ * by Eric Young (eay@cryptsoft.com).
+ * The implementation was written so as to conform with Netscapes SSL.
+ * 
+ * This library is free for commercial and non-commercial use as long as
+ * the following conditions are aheared to.  The following conditions
+ * apply to all code found in this distribution, be it the RC4, RSA,
+ * lhash, DES, etc., code; not just the SSL code.  The SSL documentation
+ * included with this distribution is covered by the same copyright terms
+ * except that the holder is Tim Hudson (tjh@cryptsoft.com).
+ * 
+ * Copyright remains Eric Young's, and as such any Copyright notices in
+ * the code are not to be removed.
+ * If this package is used in a product, Eric Young should be given attribution
+ * as the author of the parts of the library used.
+ * This can be in the form of a textual message at program startup or
+ * in documentation (online or textual) provided with the package.
+ * 
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *    "This product includes cryptographic software written by
+ *     Eric Young (eay@cryptsoft.com)"
+ *    The word 'cryptographic' can be left out if the rouines from the library
+ *    being used are not cryptographic related :-).
+ * 4. If you include any Windows specific code (or a derivative thereof) from 
+ *    the apps directory (application code) you must include an acknowledgement:
+ *    "This product includes software written by Tim Hudson (tjh@cryptsoft.com)"
+ * 
+ * THIS SOFTWARE IS PROVIDED BY ERIC YOUNG ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ * 
+ * The licence and distribution terms for any publically available version or
+ * derivative of this code cannot be changed.  i.e. this code cannot simply be
+ * copied and put under another distribution licence
+ * [including the GNU Public Licence.]
+ */
+
+
+ISC license used for completely new code in BoringSSL:
+
+/* Copyright (c) 2015, Google Inc.
+ *
+ * Permission to use, copy, modify, and/or distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+ * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+ * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
+
+
+The code in third_party/fiat carries the MIT license:
+
+Copyright (c) 2015-2016 the fiat-crypto authors (see
+https://github.com/mit-plv/fiat-crypto/blob/master/AUTHORS).
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
