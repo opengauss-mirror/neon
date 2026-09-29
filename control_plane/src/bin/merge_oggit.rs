@@ -192,6 +192,36 @@ pub async fn oggit_gc_parent(
     client: &tokio_opengauss::Client,
     request: OggitGcParentRequest,
 ) -> Result<OggitGcParentResult> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .context("failed to begin oggit GC")?;
+    let outcome = async {
+        // Share the merge lock before checking pending merges or touching GC tables.
+        // A pending-merge check outside this transaction cannot serialize with merge.
+        oggit_lock_branch_merge(client).await?;
+        oggit_gc_parent_in_transaction(client, request).await
+    }
+    .await;
+    match outcome {
+        Ok(result) => {
+            client
+                .batch_execute("COMMIT")
+                .await
+                .context("failed to commit oggit GC")?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
+async fn oggit_gc_parent_in_transaction(
+    client: &tokio_opengauss::Client,
+    request: OggitGcParentRequest,
+) -> Result<OggitGcParentResult> {
     let mut result = OggitGcParentResult {
         tenant_id: request.tenant_id.clone(),
         timeline_id: request.timeline_id.clone(),
@@ -240,11 +270,7 @@ pub async fn oggit_gc_parent(
     }
 
     oggit_ensure_gc_state(client).await?;
-    client
-        .batch_execute("BEGIN")
-        .await
-        .context("failed to begin oggit GC")?;
-    let gc_result = async {
+    let (deleted_change_log, deleted_object_change) = async {
         let deleted_change_log =
             oggit_delete_rows_before_lsn(client, "change_log", &state_floor).await?;
         let deleted_object_change =
@@ -288,24 +314,11 @@ pub async fn oggit_gc_parent(
         }
         Ok::<_, anyhow::Error>((deleted_change_log, deleted_object_change))
     }
-    .await;
-
-    match gc_result {
-        Ok((deleted_change_log, deleted_object_change)) => {
-            client
-                .batch_execute("COMMIT")
-                .await
-                .context("failed to commit oggit GC")?;
-            result.status = "deleted".to_string();
-            result.deleted_change_log = deleted_change_log;
-            result.deleted_object_change = deleted_object_change;
-            Ok(result)
-        }
-        Err(err) => {
-            let _ = client.batch_execute("ROLLBACK").await;
-            Err(err)
-        }
-    }
+    .await?;
+    result.status = "deleted".to_string();
+    result.deleted_change_log = deleted_change_log;
+    result.deleted_object_change = deleted_object_change;
+    Ok(result)
 }
 
 pub(crate) fn oggit_json_text(value: &Option<JsonValue>) -> String {

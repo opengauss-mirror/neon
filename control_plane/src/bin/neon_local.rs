@@ -2456,8 +2456,9 @@ async fn handle_oggit_gc(args: &OggitGcCmdArgs, env: &local_env::LocalEnv) -> Re
         }
 
         let (endpoint_id, endpoint) = running_endpoints[0];
+        let database = endpoint.oggit_database.as_deref().unwrap_or("postgres");
         let mut result = run_oggit_gc_on_endpoint(
-            &endpoint.connstr("cloud_admin", "postgres"),
+            &endpoint.connstr("cloud_admin", database),
             tenant_id,
             timeline.timeline_id,
             floor_lsn,

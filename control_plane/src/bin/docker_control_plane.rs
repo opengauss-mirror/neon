@@ -1,3 +1,5 @@
+mod oggit_gc_scheduler;
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -88,6 +90,7 @@ struct AppState {
     compute_image: String,
     client: Client,
     oggit_worker_lock: Arc<tokio::sync::Mutex<()>>,
+    oggit_gc_scheduler: Arc<oggit_gc_scheduler::OggitGcScheduler>,
 }
 
 #[derive(Clone)]
@@ -694,6 +697,7 @@ async fn main() -> Result<()> {
             .build()
             .context("building HTTP client")?,
         oggit_worker_lock: Arc::new(tokio::sync::Mutex::new(())),
+        oggit_gc_scheduler: Arc::new(oggit_gc_scheduler::OggitGcScheduler::default()),
     });
 
     let auth = ControlPlaneAuth::from_environment()?;
@@ -2350,15 +2354,6 @@ async fn oggit_gc(State(state): State<Arc<AppState>>, body: String) -> Response 
     }
 }
 
-fn min_child_ancestor_lsn(parent_id: TimelineId, timelines: &[TimelineInfo]) -> Option<String> {
-    timelines
-        .iter()
-        .filter(|timeline| timeline.ancestor_timeline_id == Some(parent_id))
-        .filter_map(|timeline| timeline.ancestor_lsn)
-        .min()
-        .map(|lsn| lsn.to_string())
-}
-
 async fn run_oggit_gc_on_connstr(
     connstr: &str,
     tenant_id: TenantId,
@@ -2368,7 +2363,7 @@ async fn run_oggit_gc_on_connstr(
 ) -> Result<OggitGcParentResult> {
     let (client, connection) = tokio_opengauss::connect(connstr, NoTls)
         .await
-        .with_context(|| format!("failed to connect to oggit parent endpoint at {connstr}"))?;
+        .with_context(|| format!("failed to connect to oggit parent endpoint {tenant_id}/{timeline_id}"))?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("connection error: {e}");
@@ -2386,6 +2381,169 @@ async fn run_oggit_gc_on_connstr(
     .await
 }
 
+// Missing/zero child boundaries must never be interpreted as "no children".
+fn oggit_gc_floor(children: impl Iterator<Item = Option<Lsn>>) -> Result<String> {
+    let mut floor: Option<Lsn> = None;
+    for lsn in children {
+        let lsn = lsn.context("child ancestor LSN is missing; refusing oggit GC")?;
+        anyhow::ensure!(
+            lsn != Lsn(0),
+            "child ancestor LSN is zero; refusing oggit GC"
+        );
+        floor = Some(floor.map_or(lsn, |current| current.min(lsn)));
+    }
+    Ok(floor.map_or_else(|| "0/0".to_string(), |lsn| lsn.to_string()))
+}
+
+fn skipped_oggit_gc(tenant: TenantId, parent: TimelineId, reason: &str) -> OggitGcParentResult {
+    OggitGcParentResult {
+        tenant_id: tenant.to_string(),
+        timeline_id: parent.to_string(),
+        status: "skipped".to_string(),
+        floor_lsn: "0/0".to_string(),
+        deleted_change_log: 0,
+        deleted_object_change: 0,
+        skipped_reason: Some(reason.to_string()),
+    }
+}
+
+fn ensure_deleted_children_absent(
+    deleted: &HashSet<TimelineId>,
+    present: impl Iterator<Item = TimelineId>,
+) -> Result<()> {
+    for id in present {
+        anyhow::ensure!(
+            !deleted.contains(&id),
+            "deleted timeline {id} is still visible on a shard; waiting before oggit GC"
+        );
+    }
+    Ok(())
+}
+
+/// Refresh every shard before computing the floor. Used by manual and automatic GC.
+async fn run_oggit_gc_for_parent(
+    state: &AppState,
+    tenant_id: TenantId,
+    parent_id: TimelineId,
+    deleted: &HashSet<TimelineId>,
+    retention_lsn_distance: u64,
+) -> Result<OggitGcParentResult> {
+    let controller = docker_storage_controller_api(state)?;
+    let tenant = controller.tenant_describe(tenant_id).await?;
+    anyhow::ensure!(!tenant.shards.is_empty(), "tenant has no shards");
+    let nodes = load_pageserver_nodes(state).await?;
+    let mut timelines = Vec::new();
+    for shard in tenant.shards {
+        let node_id = shard
+            .node_attached
+            .context("GC requires every shard to be attached")?;
+        let node = nodes
+            .get(&node_id.0)
+            .context("GC shard pageserver is unavailable")?;
+        let shard_timelines = list_pageserver_timelines(state, node, shard.tenant_shard_id).await?;
+        ensure_deleted_children_absent(
+            deleted,
+            shard_timelines.iter().map(|timeline| timeline.timeline_id),
+        )?;
+        let parent = shard_timelines
+            .iter()
+            .find(|timeline| timeline.timeline_id == parent_id)
+            .context("GC parent is absent from a shard")?;
+        if parent.ancestor_timeline_id.is_some() {
+            return Ok(skipped_oggit_gc(
+                tenant_id,
+                parent_id,
+                "timeline is not root parent",
+            ));
+        }
+        anyhow::ensure!(
+            matches!(parent.state, pageserver_api::models::TimelineState::Active),
+            "GC parent is not active"
+        );
+        timelines.extend(shard_timelines);
+    }
+    let floor_lsn = oggit_gc_floor(
+        timelines
+            .iter()
+            .filter(|timeline| timeline.ancestor_timeline_id == Some(parent_id))
+            .map(|timeline| timeline.ancestor_lsn),
+    )?;
+    let endpoints = load_endpoints(&state.state_dir)?;
+    let running = endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.tenant_id == tenant_id.to_string()
+                && endpoint.timeline_id == parent_id.to_string()
+                && endpoint.status == "Running"
+        })
+        .collect::<Vec<_>>();
+    let endpoint = match running.as_slice() {
+        [] => {
+            return Ok(skipped_oggit_gc(
+                tenant_id,
+                parent_id,
+                "no running endpoint for root parent timeline",
+            ));
+        }
+        [endpoint] => *endpoint,
+        _ => {
+            return Ok(skipped_oggit_gc(
+                tenant_id,
+                parent_id,
+                "multiple running endpoints for root parent timeline",
+            ));
+        }
+    };
+    if !endpoint.enable_oggit {
+        return Ok(skipped_oggit_gc(
+            tenant_id,
+            parent_id,
+            "oggit is disabled on parent endpoint",
+        ));
+    }
+    let connstr = branch_endpoint_connstr(endpoint, "branch_merge", &endpoint.oggit_database)?;
+    let mut result = run_oggit_gc_on_connstr(
+        &connstr,
+        tenant_id,
+        parent_id,
+        floor_lsn,
+        u128::from(retention_lsn_distance),
+    )
+    .await?;
+    if result.status == "deleted"
+        && result.deleted_change_log == 0
+        && result.deleted_object_change == 0
+    {
+        result.status = "ok".to_string();
+    }
+    eprintln!("oggit_gc {}", json!({
+        "database": endpoint.oggit_database,
+        "result": result,
+    }));
+    Ok(result)
+}
+
+fn enqueue_parent_oggit_gc(
+    state: &AppState,
+    tenant: TenantId,
+    parent: TimelineId,
+    deleted: TimelineId,
+) {
+    let task_state = state.clone();
+    state.oggit_gc_scheduler.enqueue(tenant, parent, deleted, move |children| {
+        let state = task_state.clone();
+        async move {
+            let result = run_oggit_gc_for_parent(
+                &state, tenant, parent, &children, default_oggit_gc_retention_lsn_distance()
+            ).await?;
+            if result.status == "skipped" {
+                eprintln!("oggit_gc {}", json!({"background": true, "result": result}));
+            }
+            Ok(())
+        }
+    });
+}
+
 async fn handle_oggit_gc(
     state: &AppState,
     req: OggitGcRequest,
@@ -2393,9 +2551,7 @@ async fn handle_oggit_gc(
     let storage_controller = docker_storage_controller_api(state)?;
     let nodes = load_pageserver_nodes(state).await?;
     let tenants = storage_controller.tenant_list(Some(10000)).await?;
-    let endpoints = load_endpoints(&state.state_dir)?;
-    let mut results = Vec::new();
-
+    let mut parents = HashSet::new();
     for tenant in tenants {
         for shard in tenant.shards {
             let Some(node_id) = shard.node_attached else {
@@ -2404,74 +2560,26 @@ async fn handle_oggit_gc(
             let Some(node) = nodes.get(&node_id.0) else {
                 continue;
             };
-            let timelines = list_pageserver_timelines(state, node, shard.tenant_shard_id).await?;
-            for timeline in timelines
-                .iter()
-                .filter(|timeline| timeline.ancestor_timeline_id.is_none())
-            {
-                let tenant_id = timeline.tenant_id.tenant_id;
-                let floor_lsn = min_child_ancestor_lsn(timeline.timeline_id, &timelines)
-                    .unwrap_or_else(|| "0/0".to_string());
-                let running = endpoints
-                    .iter()
-                    .filter(|endpoint| {
-                        endpoint.tenant_id == tenant_id.to_string()
-                            && endpoint.timeline_id == timeline.timeline_id.to_string()
-                            && endpoint.status == "Running"
-                    })
-                    .collect::<Vec<_>>();
-
-                if running.is_empty() {
-                    results.push(OggitGcParentResult {
-                        tenant_id: tenant_id.to_string(),
-                        timeline_id: timeline.timeline_id.to_string(),
-                        status: "skipped".to_string(),
-                        floor_lsn,
-                        deleted_change_log: 0,
-                        deleted_object_change: 0,
-                        skipped_reason: Some(
-                            "no running endpoint for root parent timeline".to_string(),
-                        ),
-                    });
-                    continue;
+            for timeline in list_pageserver_timelines(state, node, shard.tenant_shard_id).await? {
+                if timeline.ancestor_timeline_id.is_none() {
+                    parents.insert((timeline.tenant_id.tenant_id, timeline.timeline_id));
                 }
-                if running.len() > 1 {
-                    results.push(OggitGcParentResult {
-                        tenant_id: tenant_id.to_string(),
-                        timeline_id: timeline.timeline_id.to_string(),
-                        status: "skipped".to_string(),
-                        floor_lsn,
-                        deleted_change_log: 0,
-                        deleted_object_change: 0,
-                        skipped_reason: Some(
-                            "multiple running endpoints for root parent timeline".to_string(),
-                        ),
-                    });
-                    continue;
-                }
-
-                let endpoint = running[0];
-                let connstr = branch_endpoint_connstr(endpoint, "branch_merge", "postgres")?;
-                let mut result = run_oggit_gc_on_connstr(
-                    &connstr,
-                    tenant_id,
-                    timeline.timeline_id,
-                    floor_lsn,
-                    u128::from(req.retention_lsn_distance),
-                )
-                .await
-                .with_context(|| format!("failed to GC endpoint {}", endpoint.endpoint_id))?;
-                if result.status == "deleted"
-                    && result.deleted_change_log == 0
-                    && result.deleted_object_change == 0
-                {
-                    result.status = "ok".to_string();
-                }
-                results.push(result);
             }
         }
     }
-
+    let mut results = Vec::new();
+    for (tenant, parent) in parents {
+        results.push(
+            run_oggit_gc_for_parent(
+                state,
+                tenant,
+                parent,
+                &HashSet::new(),
+                req.retention_lsn_distance,
+            )
+            .await?,
+        );
+    }
     Ok(results)
 }
 
@@ -3210,6 +3318,7 @@ async fn handle_timeline_delete(
     let nodes = load_pageserver_nodes(state).await?;
     let tenant = storage_controller.tenant_describe(tenant_id).await?;
     let mut deleted_shards = Vec::new();
+    let mut parents = HashSet::new();
 
     for shard in tenant.shards {
         let Some(node_id) = shard.node_attached else {
@@ -3219,10 +3328,13 @@ async fn handle_timeline_delete(
             continue;
         };
         let timelines = list_pageserver_timelines(state, node, shard.tenant_shard_id).await?;
-        if timelines
+        if let Some(timeline) = timelines
             .iter()
-            .any(|timeline| timeline.timeline_id == timeline_id)
+            .find(|timeline| timeline.timeline_id == timeline_id)
         {
+            if let Some(parent) = timeline.ancestor_timeline_id {
+                parents.insert(parent);
+            }
             delete_pageserver_timeline(state, node, shard.tenant_shard_id, timeline_id).await?;
             deleted_shards.push(json!({
                 "tenant_shard_id": shard.tenant_shard_id.to_string(),
@@ -3236,6 +3348,9 @@ async fn handle_timeline_delete(
     }
 
     let cleanup = cleanup_deleted_timeline_state(&state.state_dir, tenant_id, timeline_id)?;
+    for parent in parents {
+        enqueue_parent_oggit_gc(state, tenant_id, parent, timeline_id);
+    }
     Ok(json!({
         "tenant_id": tenant_id,
         "timeline_id": timeline_id,
@@ -3735,6 +3850,40 @@ fn setting_value_enabled(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oggit_gc_floor_keeps_the_oldest_child_across_shards() {
+        let floor = oggit_gc_floor(
+            [
+                Some(Lsn(0x3000000)),
+                Some(Lsn(0x2000000)),
+                Some(Lsn(0x4000000)),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(floor.parse::<Lsn>().unwrap(), Lsn(0x2000000));
+        let after_delete =
+            oggit_gc_floor([Some(Lsn(0x3000000)), Some(Lsn(0x4000000))].into_iter()).unwrap();
+        assert_eq!(after_delete.parse::<Lsn>().unwrap(), Lsn(0x3000000));
+        assert_eq!(oggit_gc_floor(std::iter::empty()).unwrap(), "0/0");
+    }
+
+    #[test]
+    fn oggit_gc_refuses_unknown_child_boundaries() {
+        assert!(oggit_gc_floor([None].into_iter()).is_err());
+        assert!(oggit_gc_floor([Some(Lsn(0))].into_iter()).is_err());
+        assert!(oggit_gc_floor([Some(Lsn(123)), None].into_iter()).is_err());
+    }
+
+    #[test]
+    fn oggit_gc_waits_for_deleted_child_to_disappear() {
+        let child = TimelineId::from_array([3; 16]);
+        let other = TimelineId::from_array([4; 16]);
+        let deleted = HashSet::from([child]);
+        assert!(ensure_deleted_children_absent(&deleted, [child, other].into_iter()).is_err());
+        assert!(ensure_deleted_children_absent(&deleted, [other].into_iter()).is_ok());
+    }
 
     fn control_plane_jwt_auth() -> JwtAuth {
         JwtAuth::from_key(DOCKER_DEV_PUBLIC_KEY.to_string()).unwrap()
