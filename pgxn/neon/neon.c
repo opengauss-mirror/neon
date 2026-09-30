@@ -53,6 +53,10 @@ void		_PG_init(void);
 
 bool lakebase_mode = false;
 
+/* Settings written by compute_ctl during startup and reconfiguration. */
+static char *privileged_role_name = NULL;
+static bool disable_logical_replication_subscribers = false;
+
 static int  running_xacts_overflow_policy;
 static bool monitor_query_exec_time = false;
 
@@ -472,6 +476,17 @@ _PG_init(void)
 	pg_init_extension_server();
 	pg_init_oggit_merge_barrier();
 	pg_init_oggit();
+
+	/* These GUCs must be registered before the global loadedNeonPlugin guard:
+	 * openGauss also loads this extension in backend sessions. */
+	DefineCustomStringVariable("neon.privileged_role_name",
+					   "Name of the privileged role", NULL,
+					   &privileged_role_name, "neon_superuser",
+					   PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("neon.disable_logical_replication_subscribers",
+					 "Compatibility setting for compute_ctl on openGauss", NULL,
+					 &disable_logical_replication_subscribers, false,
+					 PGC_SIGHUP, 0, NULL, NULL, NULL);
 	if (ExecutorStart_hook != neon_ExecutorStart)
 	{
 		prev_ExecutorStart = ExecutorStart_hook;
@@ -558,15 +573,6 @@ _PG_init(void)
 	// todo: 先忽略，备机replic hook，内核改动
 	// restore_running_xacts_callback = RestoreRunningXactsFromClog;
 
-	// DefineCustomBoolVariable(
-	// 						"neon.disable_logical_replication_subscribers",
-	// 						"Disables incomming logical replication",
-	// 						NULL,
-	// 						&disable_logical_replication_subscribers,
-	// 						false,
-	// 						PGC_SIGHUP,
-	// 						0,
-	// 						NULL, NULL, NULL);
 	DefineCustomBoolVariable(
 							"neon.disable_wal_prevlink_checks",
 							"Disable validation of prev link in WAL records",
@@ -628,14 +634,6 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	// todo: 可能需要
-	// DefineCustomStringVariable(
-	// 						"neon.privileged_role_name",
-	// 						"Name of the 'weak' superuser role, which we give to the users",
-	// 						NULL,
-	// 						&privileged_role_name,
-	// 						"neon_superuser",
-	// 						PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 							"neon.lakebase_mode",
