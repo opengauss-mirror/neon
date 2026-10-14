@@ -734,7 +734,7 @@ impl MetadataRecord {
         let xl_xid = decoded.xl_xid;
 
         if info == pg_constants::XLOG_XACT_COMMIT {
-            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info);
+            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info)?;
             return Ok(Some(MetadataRecord::Xact(XactRecord::Commit(XactCommon {
                 parsed,
                 origin_id,
@@ -742,7 +742,7 @@ impl MetadataRecord {
                 lsn,
             }))));
         } else if info == pg_constants::XLOG_XACT_ABORT {
-            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info);
+            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info)?;
             return Ok(Some(MetadataRecord::Xact(XactRecord::Abort(XactCommon {
                 parsed,
                 origin_id,
@@ -750,7 +750,7 @@ impl MetadataRecord {
                 lsn,
             }))));
         } else if info == pg_constants::XLOG_XACT_COMMIT_PREPARED {
-            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info);
+            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info)?;
             return Ok(Some(MetadataRecord::Xact(XactRecord::CommitPrepared(
                 XactCommon {
                     parsed,
@@ -760,7 +760,7 @@ impl MetadataRecord {
                 },
             ))));
         } else if info == pg_constants::XLOG_XACT_ABORT_PREPARED {
-            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info);
+            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info)?;
             return Ok(Some(MetadataRecord::Xact(XactRecord::AbortPrepared(
                 XactCommon {
                     parsed,
@@ -770,7 +770,7 @@ impl MetadataRecord {
                 },
             ))));
         } else if info == pg_constants::XLOG_XACT_COMMIT_COMPACT {
-            let parsed = XlXactParsedRecord::decode_compact(buf, decoded.xl_xid);
+            let parsed = XlXactParsedRecord::decode_compact(buf, decoded.xl_xid)?;
             return Ok(Some(MetadataRecord::Xact(XactRecord::Commit(XactCommon {
                 parsed,
                 origin_id,
@@ -778,7 +778,7 @@ impl MetadataRecord {
                 lsn,
             }))));
         } else if info == pg_constants::XLOG_XACT_ABORT_WITH_XID {
-            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info);
+            let parsed = XlXactParsedRecord::decode(buf, decoded.xl_xid, decoded.xl_info)?;
             return Ok(Some(MetadataRecord::Xact(XactRecord::Abort(XactCommon {
                 parsed,
                 origin_id,
