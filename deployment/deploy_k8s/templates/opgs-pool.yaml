@@ -1,0 +1,172 @@
+apiVersion: serverlessdb.openfuyao.cn/v1
+kind: DBResourcePool
+metadata:
+  name: opgs-pool
+  namespace: __NAMESPACE__
+spec:
+  replicas: 5
+  minAvailable: 5
+  pgVersion: 17
+  podTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opgs-pool
+        app.kubernetes.io/part-of: opengauss-branching
+        app.kubernetes.io/component: pooled-compute
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3080"
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      dnsPolicy: ClusterFirst
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: prepare-compute
+          image:  __COMPUTE_IMAGE__
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              mkdir -p /work/gaussdb/compute /work/gaussdb/configs
+              cp /var/db/gaussdb/configs/config.json /work/gaussdb/configs/config.json
+              touch /work/gaussdb/postgresql_extend.conf
+              chmod -R 0777 /work/gaussdb/compute /work/gaussdb/configs /work/gaussdb/postgresql_extend.conf || true
+          volumeMounts:
+            - name: data
+              mountPath: /work/gaussdb
+      containers:
+        - name: compute
+          image: __COMPUTE_IMAGE__
+          imagePullPolicy: Never
+          command: ["/bin/bash"]
+          args:
+            - -c
+            - |
+              set +e
+              set -uo pipefail
+
+              child_pid=""
+              stop_child() {
+                /usr/local/${OG_VERSION}/bin/gs_ctl stop -D /var/db/gaussdb/compute -m fast || true
+                if [[ -n "${child_pid}" ]] && kill -0 "${child_pid}" 2>/dev/null; then
+                  kill -TERM "${child_pid}" 2>/dev/null || true
+                  wait "${child_pid}" 2>/dev/null || true
+                fi
+              }
+              trap 'stop_child; exit 0' TERM INT
+
+              while true; do
+                unset TENANT_ID TIMELINE_ID ANCESTOR_TIMELINE_ID ANCESTOR_START_LSN BRANCH_NAME
+                unset OGGIT_ENABLED OGGIT_DATABASE SAFEKEEPER_CONNSTRINGS OGGIT_SAFEKEEPER_HTTP_URLS
+                export OGGIT_ENABLED=false
+                export SAFEKEEPER_CONNSTRINGS=safekeeper:5454
+                export OGGIT_SAFEKEEPER_HTTP_URLS=http://safekeeper:7676
+
+                if ! python3 /opt/branching/repair_pool_binding.py /var/db/gaussdb; then
+                  echo "Committed pool binding could not be recovered; retrying without starting compute" >&2
+                  sleep 1
+                  continue
+                fi
+                if [[ -f /var/db/gaussdb/pool-rebind.env ]]; then
+                  set -a
+                  . /var/db/gaussdb/pool-rebind.env
+                  set +a
+                fi
+
+                bash /opt/branching/compute.sh &
+                child_pid=$!
+                wait "${child_pid}"
+                status=$?
+                child_pid=""
+                echo "compute.sh exited with status ${status}; supervisor will start a fresh pool compute round" >&2
+                sleep 0.05
+              done
+          env:
+            - name: COMPUTE_CTL_POOL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: branching-pool-api
+                  key: token
+            - name: COMPUTE_CTL_POOL_RECOVERY_DIR
+              value: /var/db/gaussdb
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OG_VERSION
+              value: __OG_VERSION__
+            - name: STORAGE_CONTROLLER_HTTP
+              value: http://storage-controller:1234
+            - name: ENDPOINT_ID
+              value: $(POD_NAME)
+            - name: ENDPOINT_SERVICE_NAME
+              value: $(POD_NAME)
+            - name: OGGIT_ENABLED
+              value: "false"
+            - name: SAFEKEEPER_CONNSTRINGS
+              value: safekeeper:5454
+            - name: OGGIT_SAFEKEEPER_HTTP_URLS
+              value: http://safekeeper:7676
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            - name: RUN_PARALLEL
+              value: "true"
+            - name: COMPUTE_REMOTE_HBA_CIDR
+              value: 10.244.0.0/16
+            - name: BRANCH_MERGE_USER_ENABLED
+              value: "true"
+            - name: BRANCH_MERGE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: branching-secret
+                  key: branch-merge-user
+            - name: BRANCH_MERGE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: branching-secret
+                  key: branch-merge-password
+            - name: OGGIT_FDW_USERMAPPING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: branching-secret
+                  key: oggit-usermapping-key
+          ports:
+            - name: pg
+              containerPort: 55433
+              protocol: TCP
+            - name: http
+              containerPort: 3080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: RestartContainer
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/bash
+                  - -ec
+                  - /usr/local/__OG_VERSION__/bin/gs_ctl stop -D /var/db/gaussdb/compute -m fast || true
+          volumeMounts:
+            - name: data
+              mountPath: /var/db/gaussdb
+            - name: assets
+              mountPath: /opt/branching
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: assets
+          configMap:
+            name: branching-compute-assets

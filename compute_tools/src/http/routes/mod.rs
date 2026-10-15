@@ -38,3 +38,5 @@ impl From<&ComputeState> for ComputeStatusResponse {
         }
     }
 }
+
+pub(in crate::http) mod pool_rebind;

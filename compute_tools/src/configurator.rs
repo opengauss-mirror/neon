@@ -22,7 +22,6 @@ fn configurator_main_loop(compute: &Arc<ComputeNode>) {
         if compute.params.lakebase_mode {
             while state.status != ComputeStatus::ConfigurationPending
                 && state.status != ComputeStatus::RefreshConfigurationPending
-                && state.status != ComputeStatus::Failed
             {
                 info!("configurator: compute status: {:?}, sleeping", state.status);
                 state = compute.state_changed.wait(state).unwrap();
@@ -182,9 +181,6 @@ fn configurator_main_loop(compute: &Arc<ComputeNode>) {
                 }
             }
             compute.set_status(new_status);
-        } else if state.status == ComputeStatus::Failed {
-            info!("compute node is now in Failed state, exiting");
-            break;
         } else {
             info!("woken up for compute status: {:?}, sleeping", state.status);
         }

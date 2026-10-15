@@ -355,6 +355,7 @@ pub async fn get_existing_dbs_async(
 /// 'ready'.
 #[instrument(skip_all, fields(pgdata = %pgdata.display()))]
 pub fn wait_for_postgres(pg: &mut Child, pgdata: &Path) -> Result<()> {
+    let timing_started = Instant::now();
     let pid_path = pgdata.join("postmaster.pid");
 
     // PostgreSQL writes line "ready" to the postmaster.pid file, when it has
@@ -404,6 +405,14 @@ pub fn wait_for_postgres(pg: &mut Child, pgdata: &Path) -> Result<()> {
     watcher.watch(pgdata, RecursiveMode::NonRecursive)?;
 
     let started_at = Instant::now();
+    let watcher_setup_ms = timing_started.elapsed().as_secs_f64() * 1000.0;
+    let mut first_pid_seen_ms = None;
+    let mut wake_count = 0_u64;
+    let mut timeout_wakes = 0_u64;
+    let mut drained_events = 0_u64;
+    let mut wait_ms = 0.0;
+    let mut check_ms = 0.0;
+    let mut ready_on_timeout = false;
     let mut postmaster_pid_seen = false;
     loop {
         if let Ok(Some(status)) = pg.try_wait() {
@@ -419,18 +428,28 @@ pub fn wait_for_postgres(pg: &mut Child, pgdata: &Path) -> Result<()> {
             bail!("Postgres exited unexpectedly with code {}", code);
         }
 
+        let wait_started = Instant::now();
         let res = rx.recv_timeout(Duration::from_millis(100));
+        wait_ms += wait_started.elapsed().as_secs_f64() * 1000.0;
+        wake_count += 1;
+        let woke_on_timeout = matches!(&res, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        if woke_on_timeout {
+            timeout_wakes += 1;
+        }
+        let check_started = Instant::now();
         debug!("woken up by notify: {res:?}");
         // If there are multiple events in the channel already, we only need to be
         // check once. Swallow the extra events before we go ahead to check the
         // pid file.
         while let Ok(res) = rx.try_recv() {
+            drained_events += 1;
             debug!("swallowing extra event: {res:?}");
         }
 
         // Check that we can open pid file first.
         if let Ok(file) = File::open(&pid_path) {
             if !postmaster_pid_seen {
+                first_pid_seen_ms = Some(timing_started.elapsed().as_secs_f64() * 1000.0);
                 debug!("postmaster.pid appeared");
                 watcher
                     .unwatch(pgdata)
@@ -451,11 +470,14 @@ pub fn wait_for_postgres(pg: &mut Child, pgdata: &Path) -> Result<()> {
 
                 // Now Postgres is ready to accept connections
                 if status == "ready" {
+                    ready_on_timeout = woke_on_timeout;
+                    check_ms += check_started.elapsed().as_secs_f64() * 1000.0;
                     break;
                 }
             }
         }
 
+        check_ms += check_started.elapsed().as_secs_f64() * 1000.0;
         // Give up after POSTGRES_WAIT_TIMEOUT.
         let duration = started_at.elapsed();
         if duration >= POSTGRES_WAIT_TIMEOUT {
@@ -463,6 +485,12 @@ pub fn wait_for_postgres(pg: &mut Child, pgdata: &Path) -> Result<()> {
         }
     }
 
+    tracing::info!(
+        watcher_setup_ms, first_pid_seen_ms = ?first_pid_seen_ms,
+        ready_seen_ms = timing_started.elapsed().as_secs_f64() * 1000.0,
+        wait_ms, check_ms, wake_count, timeout_wakes, drained_events, ready_on_timeout,
+        "postgres readiness timing"
+    );
     tracing::info!("PostgreSQL is now running, continuing to configure it");
 
     Ok(())

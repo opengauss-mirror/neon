@@ -53,7 +53,7 @@ FROM openeuler/openeuler:22.03-lts AS build-deps
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
 RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
     && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 
@@ -79,7 +79,7 @@ ARG OPENGAUSS_BUILD_JOBS
 
 USER root
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
 RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
     && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 RUN yum makecache \
@@ -181,7 +181,7 @@ ARG OG_VERSION
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 RUN rm -f /etc/yum.repos.d/*.repo
-COPY vendor/openGauss/docker/dockerfiles/7.0.0-RC2/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
+COPY vendor/openGauss/docker/dockerfiles/7.0.0/openEuler_aarch64.repo /etc/yum.repos.d/openEuler_aarch64.repo
 RUN sed -i 's|openEuler-22.03-LTS/EPOL/$basearch/|openEuler-22.03-LTS/EPOL/main/$basearch/|' /etc/yum.repos.d/openEuler_aarch64.repo \
     && sed -i '/^\[update\]/,/^\[/{s/^enabled=0$/enabled=1/}' /etc/yum.repos.d/openEuler_aarch64.repo
 

@@ -160,11 +160,16 @@ pub enum ComputeStatus {
     Init,
     // Compute is configured and running.
     Running,
+    // A full compute rebind was requested. The current Postgres process is
+    // being stopped before PGDATA is rebuilt from a new basebackup.
+    RebindPending,
+    // PGDATA is being rebuilt and Postgres is being started with the new spec.
+    Rebinding,
     // New spec is being applied.
     Configuration,
     // Either startup or configuration failed,
-    // compute will exit soon or is waiting for
-    // control-plane to terminate it.
+    // compute_ctl stays alive so control-plane can rebind
+    // or terminate it.
     Failed,
     // Termination requested
     TerminationPendingFast,
@@ -195,6 +200,8 @@ impl Display for ComputeStatus {
             }
             ComputeStatus::Init => f.write_str("init"),
             ComputeStatus::Running => f.write_str("running"),
+            ComputeStatus::RebindPending => f.write_str("rebind-pending"),
+            ComputeStatus::Rebinding => f.write_str("rebinding"),
             ComputeStatus::Configuration => f.write_str("configuration"),
             ComputeStatus::Failed => f.write_str("failed"),
             ComputeStatus::TerminationPendingFast => f.write_str("termination-pending-fast"),

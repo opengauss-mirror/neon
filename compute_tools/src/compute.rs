@@ -22,11 +22,11 @@ use postgres::error::SqlState;
 use remote_storage::{DownloadError, RemotePath};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use std::{env, fs};
@@ -74,7 +74,17 @@ pub static BUILD_TAG: Lazy<String> = Lazy::new(|| {
 });
 const DEFAULT_INSTALLED_EXTENSIONS_COLLECTION_INTERVAL: u64 = 3600;
 
-fn compute_spec_setting(spec: &ComputeSpec, name: &str) -> Option<String> {
+fn oggit_readiness_poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_millis(250) {
+        Duration::from_millis(10)
+    } else if elapsed < Duration::from_secs(1) {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
+pub(crate) fn compute_spec_setting(spec: &ComputeSpec, name: &str) -> Option<String> {
     spec.cluster.settings.find(name).or_else(|| {
         spec.cluster.postgresql_conf.as_deref().and_then(|config| {
             config.lines().find_map(|line| {
@@ -174,6 +184,9 @@ pub struct ComputeNode {
     /// Handle to the extension stats collection task
     extension_stats_task: TaskHandle,
     lfc_offload_task: TaskHandle,
+    service_threads_started: AtomicBool,
+    cert_watcher_started: AtomicBool,
+    pgaudit_gc_started: AtomicBool,
 }
 
 // store some metrics about download size that might impact startup time
@@ -197,6 +210,12 @@ pub struct ComputeState {
     /// Compute spec. This can be received from the CLI or - more likely -
     /// passed by the control plane with a /configure HTTP request.
     pub pspec: Option<ParsedSpec>,
+
+    /// Spec requested by /rebind. It becomes active only after the old
+    /// Postgres process has exited and a fresh PGDATA has been prepared.
+    pub pending_pspec: Option<ParsedSpec>,
+    /// Start of the current rebind, used for end-to-end timing.
+    pub rebind_started_at: Option<Instant>,
 
     /// If the spec is passed by a /configure request, 'startup_span' is the
     /// /configure request's tracing span. The main thread enters it when it
@@ -230,6 +249,8 @@ impl ComputeState {
             last_active: None,
             error: None,
             pspec: None,
+            pending_pspec: None,
+            rebind_started_at: None,
             startup_span: None,
             metrics: ComputeMetrics::default(),
             lfc_prewarm_state: LfcPrewarmState::default(),
@@ -539,6 +560,12 @@ impl PostgresHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputeStartMode {
+    Initial,
+    Rebind,
+}
+
 struct StartVmMonitorResult {
     #[cfg(target_os = "linux")]
     token: tokio_util::sync::CancellationToken,
@@ -557,7 +584,42 @@ impl ComputeNode {
             .unwrap_or(false)
     }
 
-    pub fn new(params: ComputeNodeParams, config: ComputeConfig) -> Result<Self> {
+    fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn rebind_journal_path(params: &ComputeNodeParams) -> Option<PathBuf> {
+        // A pool container may restart between preparation and commit. Keep its
+        // pending spec on the same persistent volume as the supervisor state.
+        if let Some(root) = std::env::var_os("COMPUTE_CTL_POOL_RECOVERY_DIR") {
+            return Some(PathBuf::from(root).join("pool-config.rebind-pending"));
+        }
+        params
+            .config_path_test_only
+            .as_ref()
+            .map(PathBuf::from)
+            .map(|path| Self::path_with_suffix(&path, ".rebind-pending"))
+    }
+
+    pub fn new(params: ComputeNodeParams, mut config: ComputeConfig) -> Result<Self> {
+        if let Some(journal_path) = Self::rebind_journal_path(&params) {
+            if journal_path.exists() {
+                info!(
+                    path = %journal_path.display(),
+                    "recovering compute spec from an unfinished rebind"
+                );
+                let file = std::fs::File::open(&journal_path).with_context(|| {
+                    format!("cannot open rebind journal {}", journal_path.display())
+                })?;
+                let pending: ComputeConfig = serde_json::from_reader(file).with_context(|| {
+                    format!("cannot parse rebind journal {}", journal_path.display())
+                })?;
+                config.spec = pending.spec;
+            }
+        }
+
         let connstr = params.connstr.as_str();
         let mut conn_conf = postgres::config::Config::from_str(connstr)
             .context("cannot build postgres config from connstr")?;
@@ -605,34 +667,135 @@ impl ComputeNode {
             compute_ctl_config: config.compute_ctl_config,
             extension_stats_task: Mutex::new(None),
             lfc_offload_task: Mutex::new(None),
+            service_threads_started: AtomicBool::new(false),
+            cert_watcher_started: AtomicBool::new(false),
+            pgaudit_gc_started: AtomicBool::new(false),
         })
+    }
+
+    fn persist_rebind_journal(&self, pspec: &ParsedSpec) -> Result<()> {
+        let Some(journal_path) = Self::rebind_journal_path(&self.params) else {
+            info!("no writable --config path; rebind spec will be kept in memory only");
+            return Ok(());
+        };
+        let config = ComputeConfig {
+            spec: Some(pspec.spec.clone()),
+            compute_ctl_config: self.compute_ctl_config.clone(),
+        };
+        crate::pool_rebind::atomic_write(&journal_path, &serde_json::to_vec_pretty(&config)?)?;
+        Ok(())
+    }
+
+    fn commit_rebind_journal(&self) -> Result<()> {
+        let Some(config_path) = self
+            .params
+            .config_path_test_only
+            .as_ref()
+            .map(PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let Some(journal_path) = Self::rebind_journal_path(&self.params) else {
+            return Ok(());
+        };
+        if !journal_path.exists() {
+            return Ok(());
+        }
+        let config: ComputeConfig = serde_json::from_slice(&std::fs::read(&journal_path)?)?;
+        crate::pool_rebind::persist_supervisor_config(&config)?;
+        // The active --config can live in /tmp while the pending file is on a
+        // volume. Copy atomically across filesystems, then retire pending only
+        // after both the supervisor bundle and active config are durable.
+        crate::pool_rebind::atomic_write(&config_path, &serde_json::to_vec_pretty(&config)?)?;
+        std::fs::remove_file(&journal_path)?;
+        if let Some(parent) = journal_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        info!(path = %config_path.display(), "persisted active rebind config");
+        Ok(())
+    }
+
+    pub fn begin_rebind_checked(
+        &self,
+        pspec: ParsedSpec,
+        expected_generation: Option<&str>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(expected) = expected_generation {
+            anyhow::ensure!(
+                crate::pool_rebind::generation(&state) == expected,
+                "stale binding generation"
+            );
+        }
+        if !matches!(state.status, ComputeStatus::Running | ComputeStatus::Failed) {
+            anyhow::bail!("cannot rebind compute in state {}", state.status);
+        }
+
+        self.persist_rebind_journal(&pspec)?;
+        state.pending_pspec = Some(pspec);
+        state.rebind_started_at = Some(Instant::now());
+        state.error = None;
+        state.set_status(ComputeStatus::RebindPending, &self.state_changed);
+        drop(state);
+
+        let pg_pid = PG_PID.load(Ordering::SeqCst);
+        if pg_pid != 0 {
+            info!(
+                pg_pid,
+                "sending SIGKILL directly to Postgres for rebind shutdown"
+            );
+            // The openGauss compute uses one database process with worker threads.
+            // wait_postgres still reaps it and drains its logs before PGDATA rebuild.
+            kill(Pid::from_raw(pg_pid as i32), Signal::SIGKILL)
+                .context("failed to signal Postgres for rebind")?;
+        }
+        Ok(())
+    }
+
+    fn activate_pending_rebind(&self) -> Result<ParsedSpec> {
+        let mut state = self.state.lock().unwrap();
+        let pspec = state
+            .pending_pspec
+            .take()
+            .context("rebind requested without a pending spec")?;
+        state.pspec = Some(pspec.clone());
+        state.start_time = Utc::now();
+        state.pg_start_time = None;
+        state.error = None;
+        state.metrics = ComputeMetrics::default();
+        state.set_status(ComputeStatus::Rebinding, &self.state_changed);
+        Ok(pspec)
+    }
+
+    fn rebind_elapsed(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .rebind_started_at
+            .map(|started| started.elapsed())
     }
 
     /// Top-level control flow of compute_ctl. Returns a process exit code we should
     /// exit with.
     pub fn run(self) -> Result<Option<i32>> {
+        enum NextAction {
+            Rebind,
+            Terminate,
+            Wait,
+        }
+
         let this = Arc::new(self);
 
         let cli_spec = this.state.lock().unwrap().pspec.clone();
 
-        // If this is a pooled VM, prewarm before starting HTTP server and becoming
-        // available for binding. Prewarming helps Postgres start quicker later,
-        // because QEMU will already have its memory allocated from the host, and
-        // the necessary binaries will already be cached.
         if cli_spec.is_none() {
             this.prewarm_postgres_vm_memory()?;
         }
 
-        // Set the up metric with Empty status before starting the HTTP server.
-        // That way on the first metric scrape, an external observer will see us
-        // as 'up' and 'empty' (unless the compute was started with a spec or
-        // already configured by control plane).
         COMPUTE_CTL_UP
             .with_label_values(&[&BUILD_TAG, ComputeStatus::Empty.to_string().as_str()])
             .set(1);
 
-        // Launch the external HTTP server first, so that we can serve control plane
-        // requests while configuration is still in progress.
         crate::http::server::Server::External {
             port: this.params.external_http_port,
             config: this.compute_ctl_config.clone(),
@@ -641,16 +804,12 @@ impl ComputeNode {
         }
         .launch(&this);
 
-        // The internal HTTP server could be launched later, but there isn't much
-        // sense in waiting.
         crate::http::server::Server::Internal {
             port: this.params.internal_http_port,
         }
         .launch(&this);
 
-        // If we got a spec from the CLI already, use that. Otherwise wait for the
-        // control plane to pass it to us with a /configure HTTP request
-        let pspec = if let Some(cli_spec) = cli_spec {
+        let initial_spec = if let Some(cli_spec) = cli_spec {
             cli_spec
         } else {
             this.wait_spec()?
@@ -658,83 +817,173 @@ impl ComputeNode {
 
         launch_lsn_lease_bg_task_for_static(&this);
 
-        // We have a spec, start the compute
-        let mut delay_exit = false;
         let mut vm_monitor = None;
         let mut pg_process: Option<PostgresHandle> = None;
+        let mut exit_code = None;
+        let mut delay_exit = false;
 
-        match this.start_compute(&mut pg_process) {
+        match this.start_compute(&mut pg_process, ComputeStartMode::Initial) {
             Ok(()) => {
-                // Success! Launch remaining services (just vm-monitor currently)
-                vm_monitor =
-                    Some(this.start_vm_monitor(pspec.spec.disable_lfc_resizing.unwrap_or(false)));
+                if let Err(error) = this.commit_rebind_journal() {
+                    error!(%error, "could not persist recovered rebind config");
+                    this.set_failed_status(error);
+                    if let Some(ref pg_process) = pg_process {
+                        kill(pg_process.pid(), Signal::SIGQUIT).ok();
+                    }
+                } else {
+                    this.set_status(ComputeStatus::Running);
+                    vm_monitor =
+                        Some(this.start_vm_monitor(
+                            initial_spec.spec.disable_lfc_resizing.unwrap_or(false),
+                        ));
+                }
             }
-            Err(err) => {
-                // Something went wrong with the startup. Log it and expose the error to
-                // HTTP status requests.
-                error!("could not start the compute node: {:#}", err);
-                this.set_failed_status(err);
-                delay_exit = true;
-
-                // If the error happened after starting PostgreSQL, kill it
+            Err(error) => {
+                error!("could not start the compute node: {error:#}");
+                this.set_failed_status(error);
                 if let Some(ref pg_process) = pg_process {
                     kill(pg_process.pid(), Signal::SIGQUIT).ok();
                 }
             }
         }
 
-        // If startup was successful, or it failed in the late stages,
-        // PostgreSQL is now running. Wait until it exits.
-        let exit_code = if let Some(pg_handle) = pg_process {
-            let exit_status = this.wait_postgres(pg_handle);
-            info!("Postgres exited with code {}, shutting down", exit_status);
-            exit_status.code()
-        } else {
-            None
-        };
+        loop {
+            let action = if let Some(pg_handle) = pg_process.take() {
+                let exit_status = this.wait_postgres(pg_handle);
+                exit_code = exit_status.code();
+                info!(%exit_status, "Postgres process exited");
 
-        this.terminate_extension_stats_task();
-        this.terminate_lfc_offload_task();
+                this.terminate_extension_stats_task();
+                this.terminate_lfc_offload_task();
 
-        // Terminate the vm_monitor so it releases the file watcher on
-        // /sys/fs/cgroup/neon-postgres.
-        // Note: the vm-monitor only runs on linux because it requires cgroups.
-        if let Some(vm_monitor) = vm_monitor {
-            cfg_if::cfg_if! {
-                if #[cfg(target_os = "linux")] {
-                    // Kills all threads spawned by the monitor
-                    vm_monitor.token.cancel();
-                    if let Some(handle) = vm_monitor.vm_monitor {
-                        // Kills the actual task running the monitor
-                        handle.abort();
+                match this.get_status() {
+                    ComputeStatus::RebindPending => {
+                        if let Some(elapsed) = this.rebind_elapsed() {
+                            info!(
+                                phase = "stop_postgres",
+                                elapsed_ms = elapsed.as_millis(),
+                                "rebind phase finished"
+                            );
+                        }
+                        NextAction::Rebind
                     }
-                } else {
-                    _ = vm_monitor; // appease unused lint on macOS
+                    ComputeStatus::TerminationPendingFast
+                    | ComputeStatus::TerminationPendingImmediate => {
+                        delay_exit = this.cleanup_after_postgres_exit()?;
+                        NextAction::Terminate
+                    }
+                    ComputeStatus::Failed => NextAction::Wait,
+                    status => {
+                        this.set_failed_status(anyhow::anyhow!(
+                            "Postgres exited unexpectedly with status {exit_status} while compute was {status}"
+                        ));
+                        NextAction::Wait
+                    }
+                }
+            } else {
+                let mut state = this.state.lock().unwrap();
+                while !matches!(
+                    state.status,
+                    ComputeStatus::RebindPending
+                        | ComputeStatus::TerminationPendingFast
+                        | ComputeStatus::TerminationPendingImmediate
+                ) {
+                    state = this.state_changed.wait(state).unwrap();
+                }
+
+                match state.status {
+                    ComputeStatus::RebindPending => NextAction::Rebind,
+                    ComputeStatus::TerminationPendingFast
+                    | ComputeStatus::TerminationPendingImmediate => {
+                        delay_exit = state.status == ComputeStatus::TerminationPendingFast;
+                        state.terminate_flush_lsn = None;
+                        state.set_status(ComputeStatus::Terminated, &this.state_changed);
+                        NextAction::Terminate
+                    }
+                    _ => unreachable!(),
+                }
+            };
+
+            match action {
+                NextAction::Wait => continue,
+                NextAction::Terminate => break,
+                NextAction::Rebind => {}
+            }
+
+            let target_spec = match this.activate_pending_rebind() {
+                Ok(spec) => spec,
+                Err(error) => {
+                    this.set_failed_status(error);
+                    continue;
+                }
+            };
+
+            let rebuild_started = Instant::now();
+            match this.start_compute(&mut pg_process, ComputeStartMode::Rebind) {
+                Ok(()) => {
+                    if let Err(error) = this.commit_rebind_journal() {
+                        error!(%error, "rebind succeeded but active config could not be persisted");
+                        this.set_failed_status(error);
+                        if let Some(ref pg_process) = pg_process {
+                            kill(pg_process.pid(), Signal::SIGQUIT).ok();
+                        }
+                        continue;
+                    }
+                    this.set_status(ComputeStatus::Running);
+                    if vm_monitor.is_none() {
+                        vm_monitor = Some(this.start_vm_monitor(
+                            target_spec.spec.disable_lfc_resizing.unwrap_or(false),
+                        ));
+                    }
+
+                    let total_ms = this
+                        .rebind_elapsed()
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or_default();
+                    info!(
+                        phase = "rebuild_and_start",
+                        elapsed_ms = rebuild_started.elapsed().as_millis(),
+                        total_ms,
+                        tenant_id = %target_spec.tenant_id,
+                        timeline_id = %target_spec.timeline_id,
+                        "rebind completed"
+                    );
+                    this.state.lock().unwrap().rebind_started_at = None;
+                }
+                Err(error) => {
+                    error!("could not start compute after rebind: {error:#}");
+                    this.set_failed_status(error);
+                    if let Some(ref pg_process) = pg_process {
+                        kill(pg_process.pid(), Signal::SIGQUIT).ok();
+                    }
                 }
             }
         }
 
-        // Reap the postgres process
-        delay_exit |= this.cleanup_after_postgres_exit()?;
+        if let Some(vm_monitor) = vm_monitor {
+            cfg_if::cfg_if! {
+                if #[cfg(target_os = "linux")] {
+                    vm_monitor.token.cancel();
+                    if let Some(handle) = vm_monitor.vm_monitor {
+                        handle.abort();
+                    }
+                } else {
+                    _ = vm_monitor;
+                }
+            }
+        }
 
-        // /terminate returns LSN. If we don't sleep at all, connection will break and we
-        // won't get result. If we sleep too much, tests will take significantly longer
-        // and Github Action run will error out
         let sleep_duration = if delay_exit {
             Duration::from_secs(30)
         } else {
             Duration::from_millis(300)
         };
-
-        // If launch failed, keep serving HTTP requests for a while, so the cloud
-        // control plane can get the actual error.
         if delay_exit {
-            info!("giving control plane 30s to collect the error before shutdown");
+            info!("giving control plane 30s to collect the termination response");
         }
         std::thread::sleep(sleep_duration);
         Ok(exit_code)
     }
-
     pub fn wait_spec(&self) -> Result<ParsedSpec> {
         info!("no compute spec provided, waiting");
         let mut state = self.state.lock().unwrap();
@@ -766,17 +1015,22 @@ impl ComputeNode {
     /// - the compute spec has been placed in self.state.pspec
     ///
     /// On success:
-    /// - status is set to ComputeStatus::Running
     /// - self.running_postgres is set
+    /// - the caller commits any pending configuration and then sets status to
+    ///   ComputeStatus::Running
     ///
     /// On error:
-    /// - status is left in ComputeStatus::Init. The caller is responsible for setting it to Failed
+    /// - status is left in Init or Rebinding. The caller is responsible for setting it to Failed
     /// - if Postgres was started before the fatal error happened, self.running_postgres is
     ///   set. The caller is responsible for killing it.
     ///
     /// Note that this is in the critical path of a compute cold start. Keep this fast.
     /// Try to do things concurrently, to hide the latencies.
-    fn start_compute(self: &Arc<Self>, pg_handle: &mut Option<PostgresHandle>) -> Result<()> {
+    fn start_compute(
+        self: &Arc<Self>,
+        pg_handle: &mut Option<PostgresHandle>,
+        mode: ComputeStartMode,
+    ) -> Result<()> {
         let compute_state: ComputeState;
 
         let start_compute_span;
@@ -810,7 +1064,11 @@ impl ComputeNode {
             // Hadron: Record postgres start time (used to enforce pg_init_timeout).
             state_guard.pg_start_time.replace(Utc::now());
 
-            state_guard.set_status(ComputeStatus::Init, &self.state_changed);
+            let status = match mode {
+                ComputeStartMode::Initial => ComputeStatus::Init,
+                ComputeStartMode::Rebind => ComputeStatus::Rebinding,
+            };
+            state_guard.set_status(status, &self.state_changed);
             compute_state = state_guard.clone()
         }
 
@@ -834,7 +1092,9 @@ impl ComputeNode {
         let mut pre_tasks = tokio::task::JoinSet::new();
 
         // Make sure TLS certificates are properly loaded and in the right place.
-        if self.compute_ctl_config.tls.is_some() {
+        if self.compute_ctl_config.tls.is_some()
+            && !self.cert_watcher_started.swap(true, Ordering::SeqCst)
+        {
             let this = self.clone();
             pre_tasks.spawn(async move {
                 this.watch_cert_for_changes().await;
@@ -968,7 +1228,9 @@ impl ComputeNode {
                 )?;
 
                 // Launch a background task to clean up the audit logs
-                launch_pgaudit_gc(log_directory_path);
+                if !self.pgaudit_gc_started.swap(true, Ordering::SeqCst) {
+                    launch_pgaudit_gc(log_directory_path);
+                }
             }
             _ => {}
         }
@@ -982,8 +1244,10 @@ impl ComputeNode {
         info!("Configure and start rsyslog2 succeed..");
 
         // Launch remaining service threads
-        let _monitor_handle = launch_monitor(self);
-        let _configurator_handle = launch_configurator(self);
+        if !self.service_threads_started.swap(true, Ordering::SeqCst) {
+            let _monitor_handle = launch_monitor(self);
+            let _configurator_handle = launch_configurator(self);
+        }
 
         // Wait for all the pre-tasks to finish before starting postgres
         let rt = tokio::runtime::Handle::current();
@@ -1002,7 +1266,6 @@ impl ComputeNode {
         let config_time = Utc::now();
         if pspec.spec.mode == ComputeMode::Primary {
             self.configure_as_primary(&compute_state)?;
-            self.start_oggit_worker(&pspec.spec)?;
 
             let conf = self.get_tokio_conn_conf(None);
             tokio::task::spawn(async {
@@ -1010,6 +1273,15 @@ impl ComputeNode {
             });
         }
 
+        if mode == ComputeStartMode::Rebind {
+            let validation_started = Instant::now();
+            self.validate_rebind_identity(pspec)?;
+            info!(
+                phase = "validate_runtime_identity",
+                elapsed_ms = validation_started.elapsed().as_millis(),
+                "rebind phase finished"
+            );
+        }
         // All done!
         let startup_end_time = Utc::now();
         let metrics = {
@@ -1031,8 +1303,6 @@ impl ComputeNode {
                 .as_millis() as u64;
             state.metrics.clone()
         };
-        self.set_status(ComputeStatus::Running);
-
         // Log metrics so that we can search for slow operations in logs
         info!(?metrics, postmaster_pid = %postmaster_pid, "compute start finished");
 
@@ -1630,6 +1900,7 @@ impl ComputeNode {
     /// safekeepers sync, basebackup, etc.
     #[instrument(skip_all)]
     pub fn prepare_pgdata(&self, compute_state: &ComputeState) -> Result<()> {
+        let prepare_started = Instant::now();
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         let spec = &pspec.spec;
         let pgdata_path = Path::new(&self.params.pgdata);
@@ -1637,7 +1908,15 @@ impl ComputeNode {
         let tls_config = self.tls_config(&pspec.spec);
 
         // Remove/create an empty pgdata directory and put configuration there.
+        let delete_started = Instant::now();
         self.create_pgdata()?;
+        info!(
+            phase = "delete_and_create_pgdata",
+            elapsed_ms = delete_started.elapsed().as_millis(),
+            "prepare_pgdata phase finished"
+        );
+
+        let config_started = Instant::now();
         config::write_postgres_conf(
             pgdata_path,
             &self.params,
@@ -1645,10 +1924,16 @@ impl ComputeNode {
             self.params.internal_http_port,
             tls_config,
         )?;
+        info!(
+            phase = "write_postgres_conf",
+            elapsed_ms = config_started.elapsed().as_millis(),
+            "prepare_pgdata phase finished"
+        );
 
         // Syncing safekeepers is only safe with primary nodes: if a primary
         // is already connected it will be kicked out, so a secondary (standby)
         // cannot sync safekeepers.
+        let safekeeper_started = Instant::now();
         let lsn = match spec.mode {
             ComputeMode::Primary => {
                 info!("checking if safekeepers are synced");
@@ -1676,17 +1961,28 @@ impl ComputeNode {
                 Lsn(0)
             }
         };
+        info!(
+            phase = "sync_safekeepers",
+            elapsed_ms = safekeeper_started.elapsed().as_millis(),
+            "prepare_pgdata phase finished"
+        );
 
         info!(
             "getting basebackup@{} from pageserver {}",
             lsn, &pspec.pageserver_connstr
         );
+        let basebackup_started = Instant::now();
         self.get_basebackup(compute_state, lsn).with_context(|| {
             format!(
                 "failed to get basebackup@{} from pageserver {}",
                 lsn, &pspec.pageserver_connstr
             )
         })?;
+        info!(
+            phase = "download_basebackup",
+            elapsed_ms = basebackup_started.elapsed().as_millis(),
+            "prepare_pgdata phase finished"
+        );
 
         // Update pg_hba.conf received with basebackup.
         update_pg_hba(pgdata_path, None)?;
@@ -1784,7 +2080,11 @@ impl ComputeNode {
                 )?;
             }
         }
-        info!("prepare_pgdata succeed..");
+        info!(
+            phase = "prepare_pgdata_total",
+            elapsed_ms = prepare_started.elapsed().as_millis(),
+            "prepare_pgdata finished"
+        );
         Ok(())
     }
 
@@ -1845,6 +2145,7 @@ impl ComputeNode {
     /// Returns a handle to the child process and a handle to the logs thread.
     #[instrument(skip_all)]
     pub fn start_postgres(&self, storage_auth_token: Option<String>) -> Result<PostgresHandle> {
+        let startup_started = Instant::now();
         let pgdata_path = Path::new(&self.params.pgdata);
         info!("testneon start_postgres...");
         let is_opengauss =
@@ -1883,21 +2184,25 @@ impl ComputeNode {
             info!("Environment variables: {}", env_str);
         }
 
+        let prepare_done = Instant::now();
         if is_opengauss {
             if let Some(pg_port) = self.params.connstr.port() {
                 cleanup_stale_opengauss_ipc(pg_port);
             }
         }
 
+        let ipc_done = Instant::now();
         let mut cmd = maybe_cgexec(&self.params.pgbin);
         cmd.args(["-D", &self.params.pgdata]);
         cmd.envs(env_vars.iter().map(|(k, v)| (*k, *v)));
         cmd.stderr(Stdio::piped());
 
         info!("About to spawn postgres process");
+        let spawn_started = Instant::now();
         let mut pg = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn postgres process. Command: {}", cmd_str))?;
+        let spawn_done = Instant::now();
         info!(pid = %pg.id(), "Successfully spawned postgres process");
         PG_PID.store(pg.id(), Ordering::SeqCst);
 
@@ -1907,7 +2212,18 @@ impl ComputeNode {
         let log_file_path = pgdata_path.parent().map(|p| p.join("postgres_startup.log"));
         let logs_handle = handle_postgres_logs_with_file(stderr, log_file_path);
 
+        let wait_started = Instant::now();
         wait_for_postgres(&mut pg, pgdata_path)?;
+        info!(
+            prepare_ms = prepare_done.duration_since(startup_started).as_secs_f64() * 1000.0,
+            ipc_cleanup_ms = ipc_done.duration_since(prepare_done).as_secs_f64() * 1000.0,
+            command_setup_ms = spawn_started.duration_since(ipc_done).as_secs_f64() * 1000.0,
+            spawn_ms = spawn_done.duration_since(spawn_started).as_secs_f64() * 1000.0,
+            log_collector_setup_ms = wait_started.duration_since(spawn_done).as_secs_f64() * 1000.0,
+            wait_ready_ms = wait_started.elapsed().as_secs_f64() * 1000.0,
+            total_ms = startup_started.elapsed().as_secs_f64() * 1000.0,
+            "postgres startup timing"
+        );
 
         Ok(PostgresHandle {
             postgres: pg,
@@ -1932,6 +2248,60 @@ impl ComputeNode {
             .map_err(|e| tracing::error!("log task panicked: {:?}", e));
 
         ecode
+    }
+
+    fn validate_rebind_identity(&self, pspec: &ParsedSpec) -> Result<()> {
+        let expected = [
+            ("neon.tenant_id", pspec.tenant_id.to_string()),
+            ("neon.timeline_id", pspec.timeline_id.to_string()),
+            (
+                "neon.pageserver_connstring",
+                pspec.pageserver_connstr.clone(),
+            ),
+        ];
+
+        let expected_oggit = compute_spec_setting(&pspec.spec, "neon.oggit_enabled");
+        let mut conf = self.get_conn_conf(Some("compute_ctl:verify_rebind"));
+        conf.connect_timeout(Duration::from_secs(5));
+        let mut client = conf
+            .connect(NoTls)
+            .context("failed to connect while verifying rebind identity")?;
+        // Read all settings in one query over one connection. Do not request
+        // the optional OGGIT setting when it is absent from the spec.
+        let query = if expected_oggit.is_some() {
+            "SELECT current_setting('neon.tenant_id'), current_setting('neon.timeline_id'), \
+             current_setting('neon.pageserver_connstring'), current_setting('neon.oggit_enabled')"
+        } else {
+            "SELECT current_setting('neon.tenant_id'), current_setting('neon.timeline_id'), \
+             current_setting('neon.pageserver_connstring')"
+        };
+        let row = client
+            .query_one(query, &[])
+            .context("failed to read runtime settings while verifying rebind identity")?;
+
+        for (index, (setting, expected_value)) in expected.into_iter().enumerate() {
+            let actual: String = row.get(index);
+            anyhow::ensure!(
+                actual == expected_value,
+                "rebind validation failed for {setting}: expected {expected_value:?}, got {actual:?}"
+            );
+        }
+
+        if let Some(expected_oggit) = expected_oggit {
+            let actual: String = row.get(3);
+            anyhow::ensure!(
+                actual.eq_ignore_ascii_case(&expected_oggit),
+                "rebind validation failed for neon.oggit_enabled: expected {expected_oggit:?}, got {actual:?}"
+            );
+        }
+
+        info!(
+            tenant_id = %pspec.tenant_id,
+            timeline_id = %pspec.timeline_id,
+            pageserver_connstring = %pspec.pageserver_connstr,
+            "rebind runtime identity validated"
+        );
+        Ok(())
     }
 
     /// Do post configuration of the already started Postgres. This function spawns a background task to
@@ -1978,7 +2348,10 @@ impl ComputeNode {
         conf
     }
 
-    fn install_oggit_target_extension(&self, spec: &ComputeSpec) -> Result<()> {
+    /// Install the target extension and start its worker over one connection.
+    /// This connection is always scoped to neon.oggit_database; it must not be
+    /// reused from a different database's catalog configuration.
+    fn configure_oggit(&self, spec: &ComputeSpec) -> Result<()> {
         let oggit_enabled = compute_spec_setting(spec, "neon.oggit_enabled").is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
@@ -1991,67 +2364,55 @@ impl ComputeNode {
 
         let database = compute_spec_setting(spec, "neon.oggit_database")
             .unwrap_or_else(|| "postgres".to_string());
-        let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:install_oggit_extension"));
+        let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:configure_oggit"));
         conf.dbname(&database);
+        conf.connect_timeout(Duration::from_secs(5));
+        let is_opengauss = is_opengauss_pgbin(&self.params.pgbin);
 
         tokio::runtime::Handle::current().block_on(async move {
+            let connect_started = Instant::now();
             let (mut client, connection) = conf
                 .connect(NoTls)
                 .await
                 .with_context(|| format!("failed to connect to oggit database {database}"))?;
             tokio::spawn(async move {
                 if let Err(error) = connection.await {
-                    error!(%error, "oggit extension database connection failed");
+                    error!(%error, "oggit control connection failed");
                 }
             });
+            let connect_ms = connect_started.elapsed().as_secs_f64() * 1000.0;
+            let extension_started = Instant::now();
 
-            client
-                .simple_query("CREATE SCHEMA IF NOT EXISTS neon")
-                .await
-                .with_context(|| format!("failed to create neon schema in database {database}"))?;
-            client
-                .simple_query("CREATE EXTENSION IF NOT EXISTS neon WITH SCHEMA neon")
-                .await
-                .with_context(|| {
-                    format!("failed to install neon extension in database {database}")
-                })?;
-            handle_neon_extension_upgrade(&mut client)
-                .await
-                .with_context(|| {
-                    format!("failed to refresh neon extension in database {database}")
-                })?;
-            Ok::<(), anyhow::Error>(())
-        })
-    }
+            // The normal config path may already have installed this extension
+            // in the same database. Verify actual catalog state before omitting
+            // the duplicate CREATE/upgrade commands.
+            let extension_current =
+                is_opengauss && crate::spec_apply::neon_extension_is_current(&client).await?;
+            if !extension_current {
+                client
+                    .simple_query("CREATE SCHEMA IF NOT EXISTS neon")
+                    .await
+                    .with_context(|| {
+                        format!("failed to create neon schema in database {database}")
+                    })?;
+                client
+                    .simple_query("CREATE EXTENSION IF NOT EXISTS neon WITH SCHEMA neon")
+                    .await
+                    .with_context(|| {
+                        format!("failed to install neon extension in database {database}")
+                    })?;
+                handle_neon_extension_upgrade(&mut client)
+                    .await
+                    .with_context(|| {
+                        format!("failed to refresh neon extension in database {database}")
+                    })?;
+            }
+            let extension_ms = extension_started.elapsed().as_secs_f64() * 1000.0;
+            if !is_opengauss {
+                return Ok(());
+            }
 
-    fn start_oggit_worker(&self, spec: &ComputeSpec) -> Result<()> {
-        let oggit_enabled = compute_spec_setting(spec, "neon.oggit_enabled").is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "on" | "true" | "1" | "yes"
-            )
-        });
-        if !oggit_enabled || !is_opengauss_pgbin(&self.params.pgbin) {
-            return Ok(());
-        }
-
-        let database = compute_spec_setting(spec, "neon.oggit_database")
-            .unwrap_or_else(|| "postgres".to_string());
-        let mut conf = self.get_tokio_conn_conf(Some("compute_ctl:start_oggit_worker"));
-        conf.dbname(&database);
-        conf.connect_timeout(Duration::from_secs(5));
-
-        tokio::runtime::Handle::current().block_on(async move {
-            let (client, connection) = conf
-                .connect(NoTls)
-                .await
-                .with_context(|| format!("failed to connect to oggit database {database}"))?;
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
-                    error!(%error, "oggit worker control connection failed");
-                }
-            });
-
+            let worker_started = Instant::now();
             let requested: bool = client
                 .query_one("SELECT neon.neon_start_oggit_worker()", &[])
                 .await
@@ -2059,21 +2420,35 @@ impl ComputeNode {
                 .get(0);
             anyhow::ensure!(requested, "oggit worker startup request was rejected");
 
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = worker_started + Duration::from_secs(30);
+            let mut readiness_checks = 0_u64;
             loop {
                 let ready: bool = client
                     .query_one("SELECT neon.neon_oggit_worker_is_ready()", &[])
                     .await
                     .context("failed to query oggit worker readiness")?
                     .get(0);
+                readiness_checks += 1;
                 if ready {
-                    info!(database, "oggit worker is ready");
+                    info!(
+                        database,
+                        connect_ms,
+                        extension_ms,
+                        extension_current,
+                        worker_ready_ms = worker_started.elapsed().as_secs_f64() * 1000.0,
+                        readiness_checks,
+                        "oggit worker is ready"
+                    );
                     return Ok::<(), anyhow::Error>(());
                 }
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     anyhow::bail!("timed out waiting 30s for oggit worker in database {database}");
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Normal warm starts should not pay a 100 ms polling quantum.
+                // Back off on slow/error paths to retain bounded query load.
+                let delay = oggit_readiness_poll_interval(now.duration_since(worker_started));
+                tokio::time::sleep(delay.min(deadline.duration_since(now))).await;
             }
         })
     }
@@ -2484,7 +2859,7 @@ impl ComputeNode {
                 self.pg_reload_conf()?;
             }
         }
-        self.install_oggit_target_extension(&pspec.spec)?;
+        self.configure_oggit(&pspec.spec)?;
         self.post_apply_config()?;
 
         Ok(())
@@ -2517,14 +2892,16 @@ impl ComputeNode {
                             }
 
                             // exit loop
-                            ComputeStatus::Failed
-                            | ComputeStatus::TerminationPendingFast
+                            ComputeStatus::TerminationPendingFast
                             | ComputeStatus::TerminationPendingImmediate
                             | ComputeStatus::Terminated => break 'cert_update,
 
                             // wait
                             ComputeStatus::Init
                             | ComputeStatus::Configuration
+                            | ComputeStatus::Failed
+                            | ComputeStatus::RebindPending
+                            | ComputeStatus::Rebinding
                             | ComputeStatus::RefreshConfiguration
                             | ComputeStatus::RefreshConfigurationPending
                             | ComputeStatus::Empty => {

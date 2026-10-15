@@ -321,3 +321,7 @@ To get more familiar with this aspect, refer to:
 - Read [CONTRIBUTING.md](/CONTRIBUTING.md) to learn about project code style and practices.
 - To get familiar with a source tree layout, use [sourcetree.md](/docs/sourcetree.md).
 - To learn more about PostgreSQL internals, check http://www.interdb.jp/pg/index.html
+
+## 按指定时间恢复
+
+使用 `pitr` 一条命令查询历史 LSN 并创建恢复分支。参见 [PITR CLI 使用说明](docs/pitr-cli.md)。

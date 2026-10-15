@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: branching-pool-client
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: branching-pool-client
+  template:
+    metadata:
+      annotations:
+        branching.openfuyao.cn/coordinator-code-sha: "__COORDINATOR_CODE_SHA__"
+      labels:
+        app.kubernetes.io/name: branching-pool-client
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      serviceAccountName: branching-pool-client
+      containers:
+        - name: client
+          image: __COMPUTE_IMAGE__
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-ec"]
+          args: ["exec python3 /opt/branching-coordinator/branching_coordinator.py"]
+          ports:
+            - name: coordinator
+              containerPort: 8787
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: coordinator
+            periodSeconds: 2
+          volumeMounts:
+            - name: coordinator-code
+              mountPath: /opt/branching-coordinator
+              readOnly: true
+            - name: main-creation-records
+              mountPath: /var/lib/branching/main-timeline-creation
+              readOnly: true
+          env:
+            - name: MAIN_TIMELINE_CREATION_DIR
+              value: /var/lib/branching/main-timeline-creation
+            - name: K8S_LOCAL_NAMESPACE
+              value: __NAMESPACE__
+            - name: COMPUTE_CTL_POOL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: branching-pool-api
+                  key: token
+            - name: BRANCHING_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: branching-pool-api
+                  key: coordinator-token
+            - name: POOL_NAMESPACE
+              value: __NAMESPACE__
+            - name: OPERATOR_URL
+              value: http://serverlessdb-operator.serverlessdb.svc.cluster.local:8080
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: branching-secret
+                  key: branch-merge-user
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: branching-secret
+                  key: branch-merge-password
+            - name: PGDATABASE
+              value: postgres
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+
+      volumes:
+        - name: main-creation-records
+          hostPath:
+            path: __DATA_ROOT__/control-plane/endpoints/main/timeline-creation
+            type: DirectoryOrCreate
+        - name: coordinator-code
+          configMap:
+            name: branching-coordinator-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: branching-coordinator
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: branching-pool-client
+  ports:
+    - name: http
+      port: 8787
+      targetPort: coordinator

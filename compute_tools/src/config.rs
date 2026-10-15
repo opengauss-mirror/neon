@@ -215,11 +215,14 @@ pub fn write_postgres_conf(
         }
     }
 
-    writeln!(
-        file,
-        "neon.privileged_role_name={}",
-        escape_conf_value(params.privileged_role_name.as_str())
-    )?;
+    // The openGauss Neon extension does not register this PostgreSQL-only GUC.
+    if !is_opengauss {
+        writeln!(
+            file,
+            "neon.privileged_role_name={}",
+            escape_conf_value(params.privileged_role_name.as_str())
+        )?;
+    }
 
     // If there are any extra options in the 'settings' field, append those.
     // Prefer top-level fields when both old and new spec formats carry the same GUC.
@@ -330,11 +333,14 @@ pub fn write_postgres_conf(
 
     writeln!(file, "neon.extension_server_port={extension_server_port}")?;
 
-    if spec.drop_subscriptions_before_start {
-        writeln!(file, "neon.disable_logical_replication_subscribers=true")?;
-    } else {
-        // be explicit about the default value
-        writeln!(file, "neon.disable_logical_replication_subscribers=false")?;
+    // Logical replication monitor GUCs are not registered by the openGauss extension.
+    if !is_opengauss {
+        if spec.drop_subscriptions_before_start {
+            writeln!(file, "neon.disable_logical_replication_subscribers=true")?;
+        } else {
+            // be explicit about the default value
+            writeln!(file, "neon.disable_logical_replication_subscribers=false")?;
+        }
     }
 
     // We need Postgres to send logs to rsyslog so that we can forward them

@@ -36,6 +36,35 @@ set_config_include() {
     mv "${tmp}" "${CONFIG_FILE}"
 }
 
+record_root_timeline_creation() {
+    # Only a root timeline created by this startup can receive a creation record.
+    # Existing timelines must never be assigned the current startup time.
+    if [[ "${ENDPOINT_ID:-}" != "main" || -z "${ENDPOINT_STATUS_DIR:-}" || -n "${ANCESTOR_TIMELINE_ID:-}" ]]; then
+      return
+    fi
+    local record_dir="${ENDPOINT_STATUS_DIR}/timeline-creation"
+    local record_file="${record_dir}/${tenant_id}-${timeline_id}.json"
+    local tmp_record
+    mkdir -p "${record_dir}"
+    tmp_record=$(mktemp "${record_dir}/.creation.XXXXXX")
+    jq -n \
+      --arg tenant_id "${tenant_id}" \
+      --arg timeline_id "${timeline_id}" \
+      --arg created_at "$(date -u +'%Y-%m-%dT%H:%M:%S.%6NZ')" \
+      '{version: 1, tenant_id: $tenant_id, timeline_id: $timeline_id,
+        created_at: $created_at, source: "compute.sh root timeline creation"}' > "${tmp_record}"
+    chmod 0644 "${tmp_record}"
+    # An atomic, create-only link prevents partial reads and preserves the first record.
+    if ! ln "${tmp_record}" "${record_file}" 2>/dev/null; then
+      rm -f "${tmp_record}"
+      jq -e --arg tenant_id "${tenant_id}" --arg timeline_id "${timeline_id}" \
+        '.version == 1 and .tenant_id == $tenant_id and .timeline_id == $timeline_id
+          and (.created_at | type == "string" and length > 0)' "${record_file}" >/dev/null
+      return
+    fi
+    rm -f "${tmp_record}"
+}
+
 write_endpoint_record() {
     local status=${1}
     if [[ -z "${ENDPOINT_STATUS_DIR:-}" ]]; then
@@ -191,12 +220,29 @@ ensure_branch_merge_user() {
 
     if "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -tAc \
       "SELECT 1 FROM pg_roles WHERE rolname = '${merge_user}'" | grep -q 1; then
-      "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 \
-        -c "ALTER USER ${merge_user} WITH SYSADMIN PASSWORD ${password_literal};"
+      local combined_matches
+      combined_matches=$("${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -tA -v ON_ERROR_STOP=1 <<SQL
+SELECT length(rolpassword) = 244 AND left(rolpassword, 6) = 'sha256'
+  AND substring(rolpassword from 199 for 35) = 'md5' || md5(${password_literal} || '${merge_user}')
+FROM pg_authid WHERE rolname = '${merge_user}';
+SQL
+)
+      if [[ "${combined_matches}" == "t" ]]; then
+        "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -v ON_ERROR_STOP=1 -c "ALTER USER ${merge_user} WITH SYSADMIN;"
+      else
+        "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -v ON_ERROR_STOP=1 <<SQL
+ALTER USER ${merge_user} WITH SYSADMIN PASSWORD ${password_literal};
+SQL
+      fi
     else
-      "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 \
-        -c "CREATE USER ${merge_user} WITH SYSADMIN PASSWORD ${password_literal};"
+      "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -v ON_ERROR_STOP=1 <<SQL
+CREATE USER ${merge_user} WITH SYSADMIN PASSWORD ${password_literal};
+SQL
     fi
+
+    # Studio creates unqualified tables in public on every initialized timeline.
+    "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -v ON_ERROR_STOP=1 \
+      -c "ALTER ROLE ${merge_user} IN DATABASE postgres SET search_path TO public;"
 
     if [[ -n "${OGGIT_FDW_USERMAPPING_KEY:-}" ]]; then
       "${GAUSSHOME}/bin/gs_guc" generate \
@@ -211,8 +257,12 @@ wait_for_compute_running() {
     local status
 
     for _ in $(seq 1 120); do
-      status_json=$(LD_LIBRARY_PATH="${SYSTEM_LD_LIBRARY_PATH}" curl -sf http://127.0.0.1:3080/status || true)
+      status_json=$(LD_LIBRARY_PATH="${SYSTEM_LD_LIBRARY_PATH}" curl -sS http://127.0.0.1:3080/status 2>/dev/null || true)
       status=$(printf '%s' "${status_json}" | jq -r '.status // empty' 2>/dev/null || true)
+      if [[ "${DOCKER_CONTROL_PLANE_MODE:-false}" != "true" ]] \
+        && printf '%s' "${status_json}" | jq -e '.error == "invalid authorization token"' >/dev/null 2>&1; then
+        return 0
+      fi
       case "${status}" in
         running)
           return 0
@@ -269,6 +319,16 @@ echo "A pageserver is active."
 cp "${CONFIG_FILE_ORG}" "${CONFIG_FILE}"
 touch "${POSTGRESQL_EXTEND_CONF}"
 chmod 0644 "${POSTGRESQL_EXTEND_CONF}"
+
+# This is a SIGHUP setting, not a session SET parameter. Apply it before startup
+# so branch_merge password creation stores both SHA256 and PostgreSQL MD5 formats.
+if [[ "${BRANCH_MERGE_USER_ENABLED:-true}" != "false" ]]; then
+  encryption_tmp=$(mktemp)
+  awk '!/^[[:space:]]*password_encryption_type[[:space:]]*=/' "${POSTGRESQL_EXTEND_CONF}" > "${encryption_tmp}"
+  printf '\npassword_encryption_type = 1\n' >> "${encryption_tmp}"
+  cat "${encryption_tmp}" > "${POSTGRESQL_EXTEND_CONF}"
+  rm -f "${encryption_tmp}"
+fi
 
 if [[ "${DOCKER_CONTROL_PLANE_MODE:-false}" == "true" ]]; then
   tenant_id=$(
@@ -343,6 +403,7 @@ else
       echo "Create timeline failed: ${result}" >&2
       exit 1
     fi
+    record_root_timeline_creation
   fi
 fi
 
@@ -360,6 +421,9 @@ sed -i "s|TIMELINE_ID|${timeline_id}|" ${CONFIG_FILE}
 set_pageserver_from_controller "${tenant_id}"
 if [[ "${DOCKER_CONTROL_PLANE_MODE:-false}" != "true" ]]; then
   set_config_setting "neon.pageserver_connstring" "${pageserver_connstring}" "string"
+  if [[ -n "${SAFEKEEPER_CONNSTRINGS:-}" ]]; then
+    set_config_setting "neon.safekeepers" "${SAFEKEEPER_CONNSTRINGS}" "string"
+  fi
 
   if [[ "${OGGIT_ENABLED:-false}" == "true" ]]; then
     set_config_setting "enable_subscription" "on" "bool"
@@ -392,22 +456,33 @@ set -e
 PG_HBA=/var/db/gaussdb/compute/pg_hba.conf
 for _ in $(seq 1 120); do
   if [[ -f "${PG_HBA}" ]] && "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -c 'SELECT 1' >/dev/null 2>&1; then
-    if [[ -n "${COMPUTE_REMOTE_HBA_CIDR:-}" ]] && ! awk -v cidr="${COMPUTE_REMOTE_HBA_CIDR}" '$1 == "host" && $2 == "all" && $3 == "all" && $4 == cidr && $5 == "sha256" { found = 1 } END { exit !found }' "${PG_HBA}"; then
+    if [[ -n "${COMPUTE_REMOTE_HBA_CIDR:-}" ]]; then
+      remote_hba_user=${BRANCH_MERGE_USER:-branch_merge}
+      if ! [[ "${remote_hba_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "BRANCH_MERGE_USER must be a simple SQL identifier" >&2
+        exit 1
+      fi
       hba_tmp=$(mktemp)
-      awk -v cidr="${COMPUTE_REMOTE_HBA_CIDR}" '
-        !inserted && $1 == "host" && $2 == "all" && $3 == "all" && $4 == "all" && $5 == "md5" {
-          print "host all all " cidr " sha256"
+      awk -v cidr="${COMPUTE_REMOTE_HBA_CIDR}" -v user="${remote_hba_user}" '
+        # Replace the old network-wide SHA256 rule and avoid duplicate MD5 entries.
+        $1 == "host" && $2 == "all" && $3 == "all" && $4 == cidr && $5 == "sha256" { next }
+        $1 == "host" && $2 == "postgres" && $3 == user && $4 == cidr && $5 == "md5" { next }
+        !inserted && $1 ~ /^host/ {
+          print "host postgres " user " " cidr " md5"
           inserted = 1
         }
         { print }
         END {
           if (!inserted) {
-            print "host all all " cidr " sha256"
+            print "host postgres " user " " cidr " md5"
           }
         }
       ' "${PG_HBA}" > "${hba_tmp}"
-      mv "${hba_tmp}" "${PG_HBA}"
-      "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -c 'SELECT pg_reload_conf()'
+      if ! cmp -s "${hba_tmp}" "${PG_HBA}"; then
+        cat "${hba_tmp}" > "${PG_HBA}"
+        "${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -c 'SELECT pg_reload_conf()'
+      fi
+      rm -f "${hba_tmp}"
     fi
 
     if ! wait_for_compute_running; then
