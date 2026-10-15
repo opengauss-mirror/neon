@@ -1571,6 +1571,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "camino",
+ "chrono",
  "clap 4.5.22",
  "comfy-table",
  "compute_api",

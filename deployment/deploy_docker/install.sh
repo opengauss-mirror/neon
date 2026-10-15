@@ -84,6 +84,7 @@ download_runtime_files() {
     download_file "docker-compose/docker-compose.yml" "${COMPOSE_DIR}/docker-compose.yml"
     download_file "docker-compose/bin/docker_local" "${COMPOSE_DIR}/bin/docker_local"
     download_file "docker-compose/bin/docker_local.py" "${COMPOSE_DIR}/bin/docker_local.py"
+    download_file "deployment/common/pitr_common.py" "${DEPLOY_DIR}/deployment/common/pitr_common.py"
     download_file "docker-compose/pageserver_config/identity.toml" "${COMPOSE_DIR}/pageserver_config/identity.toml"
     download_file "docker-compose/pageserver_config/pageserver.toml" "${COMPOSE_DIR}/pageserver_config/pageserver.toml"
     download_file "docker-compose/pageserver_config/metadata.json" "${COMPOSE_DIR}/pageserver_config/metadata.json"

@@ -249,3 +249,7 @@ bin/docker_local start
 docker run --rm -u 0:0 -v "$PWD:/work" og_storage:latest \
   /bin/sh -ec 'rm -rf /work/.neon'
 ```
+
+## 按指定时间恢复
+
+使用 `pitr` 一条命令查询历史 LSN 并创建恢复分支。参见 [PITR CLI 使用说明](../docs/pitr-cli.md)。
