@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,7 +91,7 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                 instance_id,
                 ..
             } => {
-                let unauthenticated_router = Router::<Arc<ComputeNode>>::new()
+                let mut unauthenticated_router = Router::<Arc<ComputeNode>>::new()
                     .route("/metrics", get(metrics::get_metrics))
                     .route(
                         "/autoscaling_metrics",
@@ -113,12 +113,26 @@ impl From<&Server> for Router<Arc<ComputeNode>> {
                     .route(
                         "/hadron_liveness_probe",
                         get(hadron_liveness_probe::hadron_liveness_probe),
+                    );
+
+                // These narrow pool endpoints enforce their own scoped bearer token.
+                unauthenticated_router = unauthenticated_router
+                    .route(
+                        "/binding_context",
+                        get(super::routes::pool_rebind::binding_context),
                     )
-                    .layer(AsyncRequireAuthorizationLayer::new(Authorize::new(
+                    .route(
+                        "/pool_rebind",
+                        post(super::routes::pool_rebind::pool_rebind),
+                    );
+
+                let authenticated_router = authenticated_router.layer(
+                    AsyncRequireAuthorizationLayer::new(Authorize::new(
                         compute_id.clone(),
                         instance_id.clone(),
                         config.jwks.clone(),
-                    )));
+                    )),
+                );
 
                 router
                     .merge(unauthenticated_router)
@@ -186,10 +200,8 @@ impl Server {
 
     fn ip(&self) -> IpAddr {
         match self {
-            // TODO: Change this to Ipv6Addr::LOCALHOST when the GitHub runners
-            // allow binding to localhost
-            Server::Internal { .. } => IpAddr::from(Ipv6Addr::UNSPECIFIED),
-            Server::External { .. } => IpAddr::from(Ipv6Addr::UNSPECIFIED),
+            Server::Internal { .. } => IpAddr::from(Ipv4Addr::UNSPECIFIED),
+            Server::External { .. } => IpAddr::from(Ipv4Addr::UNSPECIFIED),
         }
     }
 

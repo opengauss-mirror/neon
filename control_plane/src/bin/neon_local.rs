@@ -93,6 +93,8 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum NeonLocalCmd {
     Init(InitCmdArgs),
+    /// Create a new branch at a historical transaction timestamp.
+    Pitr(PitrCmdArgs),
 
     #[command(subcommand)]
     Tenant(TenantCmd),
@@ -121,6 +123,21 @@ enum NeonLocalCmd {
 
     Start(StartCmdArgs),
     Stop(StopCmdArgs),
+}
+
+#[derive(clap::Args)]
+struct PitrCmdArgs {
+    /// Name of the new recovery branch.
+    branch_name: String,
+    #[clap(long, default_value = "main")]
+    parent: String,
+    /// RFC3339 timestamp with an explicit timezone.
+    #[clap(long = "time")]
+    target_time: String,
+    #[clap(long)]
+    tenant_id: Option<TenantId>,
+    #[clap(long)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -1255,6 +1272,7 @@ fn main() -> Result<()> {
             NeonLocalCmd::Stop(args) => rt.block_on(handle_stop_all(&args, env)),
             NeonLocalCmd::Tenant(subcmd) => rt.block_on(handle_tenant(&subcmd, env)),
             NeonLocalCmd::Timeline(subcmd) => rt.block_on(handle_timeline(&subcmd, env)),
+            NeonLocalCmd::Pitr(args) => rt.block_on(handle_pitr(&args, env)),
             NeonLocalCmd::Pageserver(subcmd) => rt.block_on(handle_pageserver(&subcmd, env)),
             NeonLocalCmd::StorageController(subcmd) => {
                 rt.block_on(handle_storage_controller(&subcmd, env))
@@ -1874,6 +1892,91 @@ async fn handle_timeline(cmd: &TimelineCmd, env: &mut local_env::LocalEnv) -> Re
         }
     }
 
+    Ok(())
+}
+
+async fn handle_pitr(args: &PitrCmdArgs, env: &mut LocalEnv) -> Result<()> {
+    use control_plane::ops::pitr::{normalize_timestamp, select_lsn};
+    use pageserver_client::mgmt_api::ResponseErrorMessageExt;
+
+    let timestamp = normalize_timestamp(&args.target_time)?;
+    if args.branch_name.trim().is_empty() {
+        bail!("recovery branch name must not be empty");
+    }
+    let tenant_id = get_tenant_id(args.tenant_id, env)?;
+    if env
+        .get_branch_timeline_id(&args.branch_name, tenant_id)
+        .is_some()
+    {
+        bail!("recovery branch '{}' already exists", args.branch_name);
+    }
+    let ancestor = env
+        .get_branch_timeline_id(&args.parent, tenant_id)
+        .with_context(|| format!("parent branch '{}' does not exist", args.parent))?;
+    let controller = StorageController::from_env(env);
+    let located = controller.tenant_locate(tenant_id).await?;
+    let shard = located
+        .shards
+        .iter()
+        .find(|s| s.shard_id.is_shard_zero())
+        .context("tenant has no attached shard zero")?;
+    let node = PageServerNode::from_env(env, env.get_pageserver_conf(shard.node_id)?);
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("timestamp", &timestamp)
+        .append_pair("with_lease", "false")
+        .finish();
+    let response: serde_json::Value = node
+        .http_client
+        .op_raw(
+            reqwest::Method::GET,
+            format!(
+                "/v1/tenant/{}/timeline/{ancestor}/get_lsn_by_timestamp?{query}",
+                shard.shard_id
+            ),
+        )
+        .await?
+        .error_from_body()
+        .await?
+        .json()
+        .await?;
+    let lsn = select_lsn(&response)?;
+    let mut plan = serde_json::json!({
+        "branch": args.branch_name, "parent": args.parent,
+        "requested_time": args.target_time, "timestamp": timestamp,
+        "tenant_id": tenant_id, "ancestor_timeline_id": ancestor,
+        "ancestor_start_lsn": lsn, "dry_run": args.dry_run,
+    });
+    if args.dry_run {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    // Protect the branch point on every shard, not just the timestamp lookup shard.
+    for shard in &located.shards {
+        let node = PageServerNode::from_env(env, env.get_pageserver_conf(shard.node_id)?);
+        let lease = node
+            .http_client
+            .timeline_init_lsn_lease(shard.shard_id, ancestor, lsn)
+            .await?;
+        if lease.valid_until <= std::time::SystemTime::now() + Duration::from_secs(10) {
+            bail!("pageserver returned an expired or nearly expired LSN lease");
+        }
+    }
+    eprintln!("PITR: {} -> {} at {}", args.target_time, timestamp, lsn);
+    let output = branch_timeline(
+        &controller,
+        env,
+        TimelineBranchOptions {
+            tenant_id,
+            timeline_id: None,
+            branch_name: args.branch_name.clone(),
+            ancestor_timeline_id: ancestor,
+            ancestor_start_lsn: Some(lsn),
+        },
+    )
+    .await?;
+    plan["timeline_id"] = serde_json::to_value(output.timeline_id)?;
+    plan["status"] = serde_json::json!("created");
+    println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
 }
 

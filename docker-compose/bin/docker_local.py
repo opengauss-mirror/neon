@@ -21,6 +21,8 @@ except ModuleNotFoundError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 COMPOSE_DIR = os.path.dirname(SCRIPT_DIR)
 REPO_DIR = os.path.dirname(COMPOSE_DIR)
+sys.path.insert(0, os.path.join(REPO_DIR, "deployment", "common"))
+from pitr_common import pitr_timestamp, pitr_select_lsn, pitr_shard_zero, pitr_check_lease
 CP_URL = os.environ.get("DOCKER_CONTROL_PLANE_URL", "http://127.0.0.1:8080")
 DEFAULT_STORAGE_CONTROLLER_URL = "http://127.0.0.1:1234"
 DEFAULT_STORAGE_IMAGE = os.environ.get("NEON_IMAGE", "og_storage:latest")
@@ -2166,9 +2168,74 @@ def add_service_parser(sub, command_name, service_name, aliases=None):
     p.set_defaults(func=cmd_service, service_name=service_name)
 
 
+def pitr_pageserver_request(method, shard, timeline_id, query=None, body=None):
+    url = pageserver_host_http_url(shard["node_id"]).rstrip("/") + (
+        "/v1/tenant/%s/timeline/%s" % (shard["shard_id"], timeline_id))
+    url += "/get_lsn_by_timestamp" if method == "GET" else "/lsn_lease"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("PAGESERVER_JWT_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=headers, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=120) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError("pageserver HTTP %s: %s" % (exc.code, exc.read().decode("utf-8", "replace"))) from exc
+
+
+def cmd_pitr(args):
+    timestamp = pitr_timestamp(args.time)
+    mappings = api("GET", "/v1/mappings")
+    if args.branch_name in mappings:
+        raise RuntimeError("recovery branch '%s' already exists" % args.branch_name)
+    parent = mappings.get(args.parent)
+    if not parent:
+        raise RuntimeError("parent branch '%s' does not exist" % args.parent)
+    tenant_id = args.tenant_id or parent.get("tenant_id") or resolve_tenant_id()
+    if parent.get("tenant_id") and parent["tenant_id"] != tenant_id:
+        raise RuntimeError("parent branch belongs to a different tenant")
+    ancestor = parent["timeline_id"]
+    located = api("GET", "/v1/tenant/%s/locate" % tenant_id)
+    shards = located.get("shards") or []
+    zero = pitr_shard_zero(shards, tenant_id)
+    response = pitr_pageserver_request("GET", zero, ancestor,
+                                      query={"timestamp": timestamp, "with_lease": "false"})
+    lsn = pitr_select_lsn(response)
+    plan = {"branch": args.branch_name, "parent": args.parent, "requested_time": args.time,
+            "timestamp": timestamp, "tenant_id": tenant_id,
+            "ancestor_timeline_id": ancestor, "ancestor_start_lsn": lsn,
+            "dry_run": args.dry_run}
+    if args.dry_run:
+        print_json(plan)
+        return
+    for shard in shards:
+        pitr_check_lease(pitr_pageserver_request("POST", shard, ancestor, body={"lsn": lsn}))
+    print("PITR: %s -> %s at %s" % (args.time, timestamp, lsn), file=sys.stderr)
+    result = api("POST", "/v1/timeline/branch", {
+        "tenant_id": tenant_id, "branch_name": args.branch_name,
+        "ancestor_timeline_id": ancestor, "ancestor_start_lsn": lsn, "timeline_id": None})
+    plan["result"] = result
+    plan["status"] = "created"
+    print_json(plan)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="docker_local")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("pitr", help="create a recovery branch at a timestamp")
+    p.add_argument("branch_name")
+    p.add_argument("--parent", default="main")
+    p.add_argument("--time", required=True)
+    p.add_argument("--tenant-id")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_pitr)
+
 
     p = sub.add_parser("init")
     p.add_argument("--compose-project", default=DEFAULT_COMPOSE_PROJECT)

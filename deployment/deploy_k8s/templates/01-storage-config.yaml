@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: branching-storage-config
+  namespace: __NAMESPACE__
+data:
+  identity.toml: |
+    id=1001
+  pageserver.toml: |
+    broker_endpoint='http://storage-broker:50051'
+    pg_distrib_dir='/usr/local/__OG_VERSION__'
+    listen_pg_addr='0.0.0.0:6400'
+    listen_http_addr='0.0.0.0:9898'
+    remote_storage={local_path='/data/.neon/shared_remote_storage'}
+    control_plane_api='http://storage-controller:1234/upcall/v1/'
+    control_plane_emergency_mode=false
+    availability_zone='local'
+    virtual_file_io_mode="buffered"
+  metadata.json: |
+    {
+      "host": "pageserver",
+      "port": 6400,
+      "http_host": "pageserver",
+      "http_port": 9898,
+      "https_port": null,
+      "grpc_host": null,
+      "grpc_port": null,
+      "availability_zone_id": "local"
+    }
+  public-key.pem: |
+    -----BEGIN PUBLIC KEY-----
+    MCowBQYDK2VwAyEARYwaNBayR+eGI0iXB4s3QxE3Nl2g1iWbr6KtLWeVD/w=
+    -----END PUBLIC KEY-----
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: branching-secret
+  namespace: __NAMESPACE__
+type: Opaque
+stringData:
+  branch-merge-user: branch_merge
+  branch-merge-password: Branch_merge@123
+  oggit-usermapping-key: MapKey@123

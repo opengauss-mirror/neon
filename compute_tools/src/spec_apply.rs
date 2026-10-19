@@ -52,9 +52,12 @@ impl ComputeNode {
             let params = Arc::new(self.params.clone());
             configure_apply_client(&client, &params).await?;
 
-            let databases = get_existing_dbs_async(&client).await?;
-            let roles = get_existing_roles_async(&client)
-                .await?
+            // Pipeline independent catalog reads on the same connection.
+            let (databases, roles) = tokio::try_join!(
+                get_existing_dbs_async(&client),
+                get_existing_roles_async(&client),
+            )?;
+            let roles = roles
                 .into_iter()
                 .map(|role| (role.name.clone(), role))
                 .collect::<HashMap<String, Role>>();
@@ -436,6 +439,26 @@ impl ComputeNode {
     }
 }
 
+/// Check both the installed state and this image's default extension version.
+/// The default-version comparison preserves ALTER EXTENSION UPDATE semantics
+/// when a future image ships a different default version.
+pub(crate) async fn neon_extension_is_current(client: &Client) -> Result<bool> {
+    let row = client
+        .query_opt(
+            "SELECT COALESCE(e.extversion = a.default_version \
+                    AND e.extversion = $1 \
+                    AND n.nspname = 'neon' AND e.extrelocatable, false) \
+             FROM pg_catalog.pg_extension e \
+             JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+             JOIN pg_catalog.pg_available_extensions a ON a.name = e.extname \
+             WHERE e.extname = 'neon'",
+            &[&crate::spec::NEON_EXTENSION_TARGET_VERSION],
+        )
+        .await
+        .context("failed to inspect installed neon extension")?;
+    Ok(row.is_some_and(|row| row.get::<_, bool>(0)))
+}
+
 async fn configure_apply_client(client: &Client, params: &ComputeNodeParams) -> Result<()> {
     if crate::spec::is_opengauss_pgbin(&params.pgbin) {
         client.simple_query("SET synchronous_commit=off").await?;
@@ -558,6 +581,18 @@ where
         }
 
         let client = client().await?;
+
+        // A branch inherits its parent's extension catalog. Avoid repeating
+        // compatibility DDL when the installed openGauss extension is already
+        // exactly what this image would install. Missing or outdated state
+        // still goes through the existing repair/upgrade operations below.
+        if matches!(apply_spec_phase, HandleNeonExtension)
+            && crate::spec::is_opengauss_pgbin(&params.pgbin)
+            && neon_extension_is_current(client).await?
+        {
+            debug!("neon extension is already current; skipping compatibility DDL");
+            return Ok(());
+        }
 
         debug!("Applying phase {:?}", &apply_spec_phase);
 

@@ -1136,116 +1136,117 @@ pub struct XlXactParsedRecord {
 }
 
 impl XlXactParsedRecord {
-    /// Decode a XLOG_XACT_COMMIT/ABORT/COMMIT_PREPARED/ABORT_PREPARED
-    /// record. This should agree with the ParseCommitRecord and ParseAbortRecord
-    /// functions in PostgreSQL (in src/backend/access/rmgr/xactdesc.c)
-    /// 
-    /// Note: openGauss has different structure than PostgreSQL:
-    /// - TransactionId is uint64 (not uint32)
-    /// - xl_xact_commit has an extra csn (uint64) field
-    /// - xinfo is uint64 (not uint32)
-    pub fn decode(buf: &mut Bytes, mut xid: TransactionId, xl_info: u8) -> XlXactParsedRecord {
+    /// Decode the fixed-layout openGauss xl_xact_commit/xl_xact_abort records.
+    /// Unlike PostgreSQL, counts are unconditional header fields, not optional
+    /// sections selected by XACT_XINFO_HAS_* flags. See access/xact.h.
+    pub fn decode(buf: &mut Bytes, mut xid: TransactionId, xl_info: u8) -> anyhow::Result<Self> {
+        use anyhow::ensure;
         let info = xl_info & pg_constants::XLOG_XACT_OPMASK;
-        // The record starts with time of commit/abort
-        let xact_time = buf.get_i64_le();
-        
-        // openGauss: skip csn (commit sequence number) - uint64
-        let _csn = buf.get_u64_le();
-        
-        // openGauss: xinfo is uint64 (PostgreSQL uses uint32)
-        let xinfo = if xl_info & pg_constants::XLOG_XACT_HAS_INFO != 0 {
-            buf.get_u64_le() as u32  // We only use lower 32 bits for flags
-        } else {
-            0
-        };
-        let db_id;
-        let ts_id;
-        if xinfo & pg_constants::XACT_XINFO_HAS_DBINFO != 0 {
-            db_id = buf.get_u32_le();
-            ts_id = buf.get_u32_le();
-        } else {
-            db_id = 0;
-            ts_id = 0;
-        }
-        let mut subxacts = Vec::<TransactionId>::new();
-        if xinfo & pg_constants::XACT_XINFO_HAS_SUBXACTS != 0 {
-            let nsubxacts = buf.get_i32_le();
-            for _i in 0..nsubxacts {
-                // openGauss: TransactionId is uint64
-                let subxact = buf.get_u64_le();
-                subxacts.push(subxact);
-            }
-        }
-        let mut xnodes = Vec::<RelFileNode>::new();
-        if xinfo & pg_constants::XACT_XINFO_HAS_RELFILENODES != 0 {
-            let nrels = buf.get_i32_le();
-            for _i in 0..nrels {
-                let spcnode = buf.get_u32_le();
-                let dbnode = buf.get_u32_le();
-                let relnode = buf.get_u32_le();
-                tracing::trace!(
-                    "XLOG_XACT_COMMIT relfilenode {}/{}/{}",
-                    spcnode,
-                    dbnode,
-                    relnode
-                );
-                xnodes.push(RelFileNode {
-                    spcnode,
-                    dbnode,
-                    relnode,
-                });
-            }
-        }
-
-        if xinfo & pg_constants::XACT_XINFO_HAS_INVALS != 0 {
-            let nmsgs = buf.get_i32_le();
-            let sizeof_shared_invalidation_message = 16;
-            buf.advance(
-                (nmsgs * sizeof_shared_invalidation_message)
-                    .try_into()
-                    .unwrap(),
-            );
-        }
-
-        if xinfo & pg_constants::XACT_XINFO_HAS_TWOPHASE != 0 {
-            // openGauss: TransactionId is uint64
+        let prepared = matches!(
+            info,
+            pg_constants::XLOG_XACT_COMMIT_PREPARED | pg_constants::XLOG_XACT_ABORT_PREPARED
+        );
+        let commit = matches!(
+            info,
+            pg_constants::XLOG_XACT_COMMIT | pg_constants::XLOG_XACT_COMMIT_PREPARED
+        );
+        ensure!(
+            commit
+                || matches!(
+                    info,
+                    pg_constants::XLOG_XACT_ABORT
+                        | pg_constants::XLOG_XACT_ABORT_PREPARED
+                        | pg_constants::XLOG_XACT_ABORT_WITH_XID
+                ),
+            "unexpected openGauss xact opcode {info}"
+        );
+        if prepared {
+            ensure!(buf.remaining() >= 8, "truncated prepared transaction ID");
             xid = buf.get_u64_le();
         }
-
-        let origin_lsn = if xinfo & pg_constants::XACT_XINFO_HAS_ORIGIN != 0 {
-            Lsn(buf.get_u64_le())
+        ensure!(
+            buf.remaining() >= if commit { 48 } else { 20 },
+            "truncated openGauss xact header"
+        );
+        let xact_time = buf.get_i64_le();
+        let (xinfo, nrels, nsubxacts, db_id, ts_id) = if commit {
+            let _csn = buf.get_u64_le();
+            let xinfo = buf.get_u64_le();
+            let nrels = buf.get_i32_le();
+            let nsubxacts = buf.get_i32_le();
+            let _nmsgs = buf.get_i32_le();
+            let db_id = buf.get_u32_le();
+            let ts_id = buf.get_u32_le();
+            let _nlibrary = buf.get_i32_le();
+            (xinfo, nrels, nsubxacts, db_id, ts_id)
+        } else {
+            let nrels = buf.get_i32_le();
+            let nsubxacts = buf.get_i32_le();
+            let _nlibrary = buf.get_i32_le();
+            (0, nrels, nsubxacts, 0, 0)
+        };
+        ensure!(
+            nrels >= 0 && nsubxacts >= 0,
+            "negative openGauss xact counts"
+        );
+        // XLR_REL_COMPRESS selects ColFileNode (24 bytes); older WAL uses
+        // ColFileNodeRel (20 bytes). Both start with the three relation OIDs.
+        let node_size = if xl_info & 0x04 != 0 { 24 } else { 20 };
+        let needed = nrels as u64 * node_size as u64 + nsubxacts as u64 * 8;
+        ensure!(
+            needed <= buf.remaining() as u64,
+            "truncated openGauss xact arrays"
+        );
+        let mut xnodes = Vec::with_capacity(nrels as usize);
+        for _ in 0..nrels {
+            xnodes.push(RelFileNode {
+                spcnode: buf.get_u32_le(),
+                dbnode: buf.get_u32_le(),
+                relnode: buf.get_u32_le(),
+            });
+            buf.advance(node_size - 12);
+        }
+        let subxacts = (0..nsubxacts).map(|_| buf.get_u64_le()).collect();
+        if info == pg_constants::XLOG_XACT_ABORT_WITH_XID {
+            ensure!(buf.remaining() >= 8, "truncated abort transaction ID");
+            xid = buf.get_u64_le();
+        }
+        // XACT_HAS_ORIGIN is 0x08 in openGauss. xl_xact_origin is the final
+        // 16 bytes, after invalidation messages, RecentXmin and library paths.
+        let origin_lsn = if xinfo & 0x08 != 0 {
+            ensure!(buf.remaining() >= 16, "truncated transaction origin");
+            Lsn(u64::from_le_bytes(
+                buf[buf.len() - 16..buf.len() - 8].try_into().unwrap(),
+            ))
         } else {
             Lsn::INVALID
         };
-        XlXactParsedRecord {
+        Ok(Self {
             xid,
             info,
             xact_time,
-            xinfo,
+            xinfo: xinfo as u32,
             db_id,
             ts_id,
             subxacts,
             xnodes,
             origin_lsn,
-        }
+        })
     }
 
-    /// Decode an openGauss XLOG_XACT_COMMIT_COMPACT record.
-    ///
-    /// openGauss xl_xact_commit_compact:
-    ///   TimestampTz xact_time (8 bytes)
-    ///   uint64      csn       (8 bytes)
-    ///   int         nsubxacts (4 bytes)
-    ///   TransactionId subxacts[] (each 8 bytes)
-    pub fn decode_compact(buf: &mut Bytes, xid: TransactionId) -> XlXactParsedRecord {
+    /// xl_xact_commit_compact has four padding bytes before its uint64 array.
+    pub fn decode_compact(buf: &mut Bytes, xid: TransactionId) -> anyhow::Result<Self> {
+        anyhow::ensure!(buf.remaining() >= 24, "truncated compact commit header");
         let xact_time = buf.get_i64_le();
         let _csn = buf.get_u64_le();
         let nsubxacts = buf.get_i32_le();
-        let mut subxacts = Vec::<TransactionId>::with_capacity(nsubxacts as usize);
-        for _ in 0..nsubxacts {
-            subxacts.push(buf.get_u64_le());
-        }
-        XlXactParsedRecord {
+        buf.advance(4);
+        anyhow::ensure!(
+            nsubxacts >= 0 && nsubxacts as u64 * 8 <= buf.remaining() as u64,
+            "invalid compact subtransaction array"
+        );
+        let subxacts = (0..nsubxacts).map(|_| buf.get_u64_le()).collect();
+        Ok(Self {
             xid,
             info: pg_constants::XLOG_XACT_COMMIT,
             xact_time,
@@ -1255,7 +1256,7 @@ impl XlXactParsedRecord {
             subxacts,
             xnodes: Vec::new(),
             origin_lsn: Lsn::INVALID,
-        }
+        })
     }
 }
 
@@ -1401,3 +1402,4 @@ pub fn describe_postgres_wal_record(record: &Bytes) -> Result<String, Deserializ
 
     Ok(String::from(result))
 }
+

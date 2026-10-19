@@ -546,6 +546,8 @@ components:
         - init
         - running
         - configuration
+        - rebind_pending
+        - rebinding
         - failed
         - termination_pending_fast
         - termination_pending_immediate

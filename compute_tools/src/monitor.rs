@@ -87,7 +87,6 @@ impl ComputeMonitor {
             ComputeStatus::Terminated
                 | ComputeStatus::TerminationPendingFast
                 | ComputeStatus::TerminationPendingImmediate
-                | ComputeStatus::Failed
         ) {
             info!(
                 "compute is in {} status, stopping compute monitor",

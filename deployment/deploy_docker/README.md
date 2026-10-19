@@ -261,6 +261,8 @@ cd openGauss-branching-deploy
 ./docker-compose/bin/docker_local endpoint status main
 ```
 
+更多详细命令见 [`docker-compose/README.md`](../../docker-compose/README.md)。
+
 ## 访问服务
 
 部署成功后，常用访问地址：

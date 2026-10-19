@@ -1,0 +1,720 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-broker
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: storage-broker
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-broker
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: storage-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storage-broker
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      containers:
+        - name: storage-broker
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["storage_broker"]
+          args: ["--listen-addr=0.0.0.0:50051"]
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-control-plane
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: docker-control-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-control-plane
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: docker-control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: docker-control-plane
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      securityContext:
+        fsGroup: 1000
+        seLinuxOptions:
+          type: spc_t
+      initContainers:
+        - name: prepare-data
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /data/.neon/control_plane/endpoints
+              chown -R 1000:1000 /data/.neon/control_plane
+          volumeMounts:
+            - name: control-plane
+              mountPath: /data/.neon/control_plane
+      containers:
+        - name: docker-control-plane
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["docker_control_plane"]
+          env:
+            - name: OG_VERSION
+              value: __OG_VERSION__
+            - name: DOCKER_CONTROL_PLANE_LISTEN
+              value: 0.0.0.0:8080
+            - name: DOCKER_CONTROL_PLANE_STATE_DIR
+              value: /data/.neon/control_plane
+            - name: STORAGE_CONTROLLER_HTTP
+              value: http://storage-controller:1234
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: control-plane
+              mountPath: /data/.neon/control_plane
+      volumes:
+        - name: control-plane
+          hostPath:
+            path: __DATA_ROOT__/control-plane
+            type: DirectoryOrCreate
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: docker-control-plane-init
+  namespace: __NAMESPACE__
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: docker-control-plane-init
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      containers:
+        - name: init
+          image: __COMPUTE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              marker=/data/.neon/control_plane/k8s-init.done
+              if [[ -f "${marker}" ]]; then
+                echo "docker control plane already initialized"
+                exit 0
+              fi
+
+              until curl -fsS http://docker-control-plane:8080/ready >/dev/null; do
+                sleep 1
+              done
+
+              curl -fsS -X POST \
+                -H 'Content-Type: application/json' \
+                -d '{
+                  "compose_project": "__COMPOSE_PROJECT__",
+                  "og_version": "__OG_VERSION__",
+                  "storage_image": "__STORAGE_IMAGE__",
+                  "compute_image": "__COMPUTE_IMAGE__",
+                  "num_pageservers": 1,
+                  "num_safekeepers": __NUM_SAFEKEEPERS__
+                }' \
+                http://docker-control-plane:8080/v1/init
+
+              touch "${marker}"
+          volumeMounts:
+            - name: control-plane
+              mountPath: /data/.neon/control_plane
+      volumes:
+        - name: control-plane
+          hostPath:
+            path: __DATA_ROOT__/control-plane
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-controller-db
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: storage-controller-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-controller-db
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: storage-controller-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storage-controller-db
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      securityContext:
+        fsGroup: 1000
+        seLinuxOptions:
+          type: spc_t
+      initContainers:
+        - name: prepare-data
+          image: __COMPUTE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              mkdir -p /var/db/omm/storage_controller_db
+              chown -R 1000:1000 /var/db/omm
+              chmod 0700 /var/db/omm/storage_controller_db
+          volumeMounts:
+            - name: data
+              mountPath: /var/db/omm
+      containers:
+        - name: storage-controller-db
+          image: __COMPUTE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/branching/storage_controller_db.sh"]
+          env:
+            - name: OG_VERSION
+              value: __OG_VERSION__
+            - name: DB_PASSWORD
+              value: StorageController123!
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            tcpSocket:
+              port: postgres
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/db/omm
+            - name: scripts
+              mountPath: /opt/branching/storage_controller_db.sh
+              subPath: storage_controller_db.sh
+              readOnly: true
+      volumes:
+        - name: data
+          hostPath:
+            path: __DATA_ROOT__/storage-controller-db
+            type: DirectoryOrCreate
+        - name: scripts
+          hostPath:
+            path: __COMPUTE_SHELL_DIR__
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage-controller
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: storage-controller
+  ports:
+    - name: http
+      port: 1234
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage-controller
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: storage-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storage-controller
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      containers:
+        - name: storage-controller
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              storage_controller \
+                --listen=0.0.0.0:1234 \
+                --database-url=postgresql://omm@storage-controller-db:5432/storage_controller \
+                --db-connect-timeout=60s \
+                --dev \
+                --timelines-onto-safekeepers \
+                --timeline-safekeeper-count=1 \
+                --control-plane-url=http://docker-control-plane:8080 &
+              controller_pid=$!
+
+              stop_controller() {
+                kill -TERM "${controller_pid}" 2>/dev/null || true
+                wait "${controller_pid}" || true
+              }
+              trap stop_controller TERM INT
+
+              until curl -fsS http://127.0.0.1:1234/ready >/dev/null; do
+                if ! kill -0 "${controller_pid}" 2>/dev/null; then
+                  wait "${controller_pid}"
+                  exit $?
+                fi
+                sleep 1
+              done
+
+              if ! curl -fsS http://127.0.0.1:1234/control/v1/safekeeper/1 >/dev/null; then
+                curl -fsS -X POST \
+                  -H 'Content-Type: application/json' \
+                  -d '{"id":1,"region_id":"local","version":1,"host":"safekeeper","port":5454,"http_port":7676,"https_port":null,"availability_zone_id":"local-1"}' \
+                  http://127.0.0.1:1234/control/v1/safekeeper/1
+              fi
+
+              curl -fsS -X POST \
+                -H 'Content-Type: application/json' \
+                -d '{"scheduling_policy":"Active"}' \
+                http://127.0.0.1:1234/control/v1/safekeeper/1/scheduling_policy
+
+              wait "${controller_pid}"
+          ports:
+            - name: http
+              containerPort: 1234
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: endpoint-storage
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: endpoint-storage
+  ports:
+    - name: http
+      port: 9993
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-storage
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: endpoint-storage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: endpoint-storage
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      securityContext:
+        fsGroup: 1000
+        seLinuxOptions:
+          type: spc_t
+      initContainers:
+        - name: prepare-data
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /data/.neon/endpoint_storage/etc /data/.neon/endpoint_storage/local_fs_remote_storage /data/.neon/control_plane
+              cp /config/public-key.pem /data/.neon/endpoint_storage/etc/public-key.pem
+              if [ ! -s /data/.neon/control_plane/auth_public_key.pem ]; then
+                cp /config/public-key.pem /data/.neon/control_plane/auth_public_key.pem
+              fi
+              chmod 0644 /data/.neon/endpoint_storage/etc/public-key.pem /data/.neon/control_plane/auth_public_key.pem
+              chown -R 1000:1000 /data/.neon/endpoint_storage /data/.neon/control_plane
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon/endpoint_storage
+            - name: control-plane
+              mountPath: /data/.neon/control_plane
+            - name: config
+              mountPath: /config
+              readOnly: true
+      containers:
+        - name: endpoint-storage
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["endpoint_storage"]
+          args:
+            - --config
+            - '{"listen":"0.0.0.0:9993","pemfile":"/data/.neon/control_plane/auth_public_key.pem","type":"LocalFs","local_path":"/data/.neon/endpoint_storage/local_fs_remote_storage"}'
+          ports:
+            - name: http
+              containerPort: 9993
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon/endpoint_storage
+            - name: control-plane
+              mountPath: /data/.neon/control_plane
+      volumes:
+        - name: data
+          hostPath:
+            path: __DATA_ROOT__/endpoint-storage
+            type: DirectoryOrCreate
+        - name: control-plane
+          hostPath:
+            path: __DATA_ROOT__/control-plane
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: branching-storage-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pageserver
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: pageserver
+  ports:
+    - name: pg
+      port: 6400
+      targetPort: pg
+    - name: http
+      port: 9898
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pageserver
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pageserver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pageserver
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      securityContext:
+        fsGroup: 1000
+        seLinuxOptions:
+          type: spc_t
+      initContainers:
+        - name: prepare-data
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /data/.neon/pageserver /data/.neon/shared_remote_storage
+              chown -R 1000:1000 /data/.neon/pageserver /data/.neon/shared_remote_storage
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon/pageserver
+            - name: remote-storage
+              mountPath: /data/.neon/shared_remote_storage
+      containers:
+        - name: pageserver
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["pageserver"]
+          args: ["-D", "/data/.neon/pageserver"]
+          ports:
+            - name: pg
+              containerPort: 6400
+            - name: http
+              containerPort: 9898
+          readinessProbe:
+            tcpSocket:
+              port: pg
+            periodSeconds: 2
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon/pageserver
+            - name: remote-storage
+              mountPath: /data/.neon/shared_remote_storage
+            - name: config
+              mountPath: /data/.neon/pageserver/identity.toml
+              subPath: identity.toml
+              readOnly: true
+            - name: config
+              mountPath: /data/.neon/pageserver/pageserver.toml
+              subPath: pageserver.toml
+              readOnly: true
+            - name: config
+              mountPath: /data/.neon/pageserver/metadata.json
+              subPath: metadata.json
+              readOnly: true
+      volumes:
+        - name: data
+          hostPath:
+            path: __DATA_ROOT__/pageserver
+            type: DirectoryOrCreate
+        - name: remote-storage
+          hostPath:
+            path: __DATA_ROOT__/shared-remote-storage
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: branching-storage-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: safekeeper
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: safekeeper1
+  ports:
+    - name: pg
+      port: 5454
+      targetPort: pg
+    - name: http
+      port: 7676
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: safekeeper1
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: safekeeper1
+  ports:
+    - name: pg
+      port: 5454
+      targetPort: pg
+    - name: http
+      port: 7676
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safekeeper1
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: safekeeper1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: safekeeper1
+        app.kubernetes.io/part-of: opengauss-branching
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: __NODE_NAME__
+      securityContext:
+        fsGroup: 1000
+        seLinuxOptions:
+          type: spc_t
+      initContainers:
+        - name: prepare-data
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command: ["/bin/sh", "-ec"]
+          args: ["mkdir -p /data/.neon/safekeeper && chown -R 1000:1000 /data/.neon/safekeeper"]
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon/safekeeper
+      containers:
+        - name: safekeeper
+          image: __STORAGE_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["safekeeper"]
+          args:
+            - --listen-pg=0.0.0.0:5454
+            - --advertise-pg=safekeeper1:5454
+            - --listen-http=0.0.0.0:7676
+            - --id=1
+            - --broker-endpoint=http://storage-broker:50051
+            - -D
+            - /data/.neon/safekeeper
+          ports:
+            - name: pg
+              containerPort: 5454
+            - name: http
+              containerPort: 7676
+          readinessProbe:
+            tcpSocket:
+              port: pg
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data/.neon/safekeeper
+      volumes:
+        - name: data
+          hostPath:
+            path: __DATA_ROOT__/safekeeper1
+            type: DirectoryOrCreate

@@ -1267,12 +1267,15 @@ impl Endpoint {
             match self.get_status().await {
                 Ok(state) => {
                     match state.status {
-                        ComputeStatus::Init => {
+                        ComputeStatus::Init
+                        | ComputeStatus::RebindPending
+                        | ComputeStatus::Rebinding => {
                             let timeout = args.start_timeout;
                             if Instant::now().duration_since(start_at) > timeout {
                                 bail!(
-                                    "compute startup timed out {:?}; still in Init state",
-                                    timeout
+                                    "compute startup timed out {:?}; still in {:?} state",
+                                    timeout,
+                                    state.status
                                 );
                             }
                             // keep retrying

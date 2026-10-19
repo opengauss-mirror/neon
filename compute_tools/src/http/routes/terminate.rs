@@ -30,7 +30,10 @@ pub(in crate::http) async fn terminate(
             return JsonResponse::success(StatusCode::CREATED, response);
         }
 
-        if !matches!(state.status, ComputeStatus::Empty | ComputeStatus::Running) {
+        if !matches!(
+            state.status,
+            ComputeStatus::Empty | ComputeStatus::Running | ComputeStatus::Failed
+        ) {
             return JsonResponse::invalid_status(state.status);
         }
 
