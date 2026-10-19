@@ -31,6 +31,7 @@ services:
       - DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH=${DOCKER_CONTROL_PLANE_HTTP_AUTH_PUBLIC_KEY_PATH:-}
       - DOCKER_CONTROL_PLANE_STATE_DIR=/data/.neon/control_plane
       - STORAGE_CONTROLLER_HTTP=${STORAGE_CONTROLLER_HTTP:-http://storage_controller:1234}
+      - PAGESERVER_REMOTE_STORAGE=${PAGESERVER_REMOTE_STORAGE:-}
     ports:
       - 127.0.0.1:${DOCKER_CONTROL_PLANE_HOST_PORT:-8080}:8080
     volumes:
@@ -132,13 +133,16 @@ services:
     environment:
       - OG_VERSION=${OG_VERSION:-V702}
       - PATH=/usr/local/${OG_VERSION:-V702}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
     ports:
       - ${PAGESERVER_HOST_HTTP_PORT:-9898}:9898
     volumes:
       - ./.neon/pageserver:/data/.neon/pageserver
       - ./.neon/shared_remote_storage:/data/.neon/shared_remote_storage
       - ./pageserver_config/identity.toml:/data/.neon/pageserver/identity.toml:ro
-      - ./pageserver_config/pageserver.toml:/data/.neon/pageserver/pageserver.toml:ro
+      - ./pageserver_config/${PAGESERVER_CONFIG_FILE:-pageserver.toml}:/data/.neon/pageserver/pageserver.toml:ro
       - ./pageserver_config/metadata.json:/data/.neon/pageserver/metadata.json:ro
     entrypoint: ["/bin/sh", "-ec"]
     command:
@@ -163,6 +167,9 @@ services:
       - SAFEKEEPER_ID=1
       - BROKER_ENDPOINT=http://storage_broker:50051
       - SAFEKEEPER_EXTRA_OPT=${SAFEKEEPER_EXTRA_OPT:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
     ports:
       - ${SAFEKEEPER_HOST_HTTP_PORT:-7676}:7676
     volumes:

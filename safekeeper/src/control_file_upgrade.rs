@@ -340,6 +340,31 @@ pub struct TimelinePersistentStateV10 {
     pub creation_ts: std::time::SystemTime,
 }
 
+/// Version 11 state, kept here so version 11 control files can be upgraded
+/// after adding the remote WAL GC watermark in version 12.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelinePersistentStateV11 {
+    #[serde(with = "hex")]
+    pub tenant_id: TenantId,
+    #[serde(with = "hex")]
+    pub timeline_id: TimelineId,
+    pub mconf: Configuration,
+    pub acceptor_state: AcceptorState,
+    pub server: ServerInfo,
+    #[serde(with = "hex")]
+    pub proposer_uuid: PgUuid,
+    pub timeline_start_lsn: Lsn,
+    pub local_start_lsn: Lsn,
+    pub commit_lsn: Lsn,
+    pub backup_lsn: Lsn,
+    pub peer_horizon_lsn: Lsn,
+    pub remote_consistent_lsn: Lsn,
+    pub oggit_required_lsn: Lsn,
+    pub partial_backup: wal_backup_partial::State,
+    pub eviction_state: EvictionState,
+    pub creation_ts: std::time::SystemTime,
+}
+
 pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersistentState> {
     // migrate to storing full term history
     if version == 1 {
@@ -369,6 +394,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: Lsn(0),
             peer_horizon_lsn: oldstate.truncate_lsn,
             remote_consistent_lsn: Lsn(0),
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
@@ -396,6 +422,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: Lsn(0),
             peer_horizon_lsn: oldstate.truncate_lsn,
             remote_consistent_lsn: Lsn(0),
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
@@ -423,6 +450,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: Lsn(0),
             peer_horizon_lsn: oldstate.truncate_lsn,
             remote_consistent_lsn: Lsn(0),
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
@@ -450,6 +478,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: Lsn::INVALID,
             peer_horizon_lsn: oldstate.peer_horizon_lsn,
             remote_consistent_lsn: Lsn(0),
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
@@ -497,6 +526,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: oldstate.backup_lsn,
             peer_horizon_lsn: oldstate.peer_horizon_lsn,
             remote_consistent_lsn: oldstate.remote_consistent_lsn,
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: wal_backup_partial::State::default(),
             eviction_state: EvictionState::Present,
@@ -518,6 +548,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: oldstate.backup_lsn,
             peer_horizon_lsn: oldstate.peer_horizon_lsn,
             remote_consistent_lsn: oldstate.remote_consistent_lsn,
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: oldstate.partial_backup,
             eviction_state: EvictionState::Present,
@@ -538,6 +569,7 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: oldstate.backup_lsn,
             peer_horizon_lsn: oldstate.peer_horizon_lsn,
             remote_consistent_lsn: oldstate.remote_consistent_lsn,
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
             partial_backup: oldstate.partial_backup,
             eviction_state: oldstate.eviction_state,
@@ -558,7 +590,29 @@ pub fn upgrade_control_file(buf: &[u8], version: u32) -> Result<TimelinePersiste
             backup_lsn: oldstate.backup_lsn,
             peer_horizon_lsn: oldstate.peer_horizon_lsn,
             remote_consistent_lsn: oldstate.remote_consistent_lsn,
+            remote_wal_gc_lsn: Lsn::INVALID,
             oggit_required_lsn: Lsn::MAX,
+            partial_backup: oldstate.partial_backup,
+            eviction_state: oldstate.eviction_state,
+            creation_ts: oldstate.creation_ts,
+        });
+    } else if version == 11 {
+        let oldstate = TimelinePersistentStateV11::des(&buf[..buf.len()])?;
+        return Ok(TimelinePersistentState {
+            tenant_id: oldstate.tenant_id,
+            timeline_id: oldstate.timeline_id,
+            mconf: oldstate.mconf,
+            acceptor_state: oldstate.acceptor_state,
+            server: oldstate.server,
+            proposer_uuid: oldstate.proposer_uuid,
+            timeline_start_lsn: oldstate.timeline_start_lsn,
+            local_start_lsn: oldstate.local_start_lsn,
+            commit_lsn: oldstate.commit_lsn,
+            backup_lsn: oldstate.backup_lsn,
+            peer_horizon_lsn: oldstate.peer_horizon_lsn,
+            remote_consistent_lsn: oldstate.remote_consistent_lsn,
+            remote_wal_gc_lsn: Lsn::INVALID,
+            oggit_required_lsn: oldstate.oggit_required_lsn,
             partial_backup: oldstate.partial_backup,
             eviction_state: oldstate.eviction_state,
             creation_ts: oldstate.creation_ts,

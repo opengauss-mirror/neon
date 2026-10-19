@@ -128,6 +128,10 @@ pub struct SafeKeeperConf {
     /* END_HADRON */
     pub backup_parallel_jobs: usize,
     pub wal_backup_enabled: bool,
+    /// Enable deletion of complete WAL objects from remote storage.
+    pub remote_wal_gc_enabled: bool,
+    /// Interval between remote complete WAL garbage collection attempts.
+    pub remote_wal_gc_interval: Duration,
     pub pg_auth: Option<Arc<JwtAuth>>,
     pub pg_tenant_only_auth: Option<Arc<JwtAuth>>,
     pub http_auth: Option<Arc<SwappableJwtAuth>>,
@@ -172,6 +176,8 @@ impl SafeKeeperConf {
             broker_keepalive_interval: Duration::from_secs(5),
             peer_recovery_enabled: true,
             wal_backup_enabled: true,
+            remote_wal_gc_enabled: false,
+            remote_wal_gc_interval: Duration::from_secs(60),
             backup_parallel_jobs: 1,
             pg_auth: None,
             pg_tenant_only_auth: None,

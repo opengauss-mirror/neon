@@ -62,6 +62,30 @@ pub struct PeerInfo {
     /// LSN of the last record.
     pub flush_lsn: Lsn,
     pub commit_lsn: Lsn,
+    #[serde(default)]
+    pub backup_lsn: Lsn,
+    #[serde(default)]
+    pub remote_consistent_lsn: Lsn,
+    /// Minimal LSN that this safekeeper reports as no longer needed by peers.
+    #[serde(default)]
+    pub peer_horizon_lsn: Lsn,
+    /// Remote WAL deletion watermark known by this safekeeper.
+    #[serde(default)]
+    pub remote_wal_gc_lsn: Lsn,
+    #[serde(default)]
+    pub membership_generation: u32,
+    #[serde(default)]
+    pub membership_is_joint: bool,
+    #[serde(default)]
+    pub cfile_commit_lsn: Lsn,
+    #[serde(default)]
+    pub cfile_backup_lsn: Lsn,
+    #[serde(default)]
+    pub cfile_remote_consistent_lsn: Lsn,
+    #[serde(default)]
+    pub cfile_peer_horizon_lsn: Lsn,
+    #[serde(default)]
+    pub cfile_oggit_required_lsn: Lsn,
     /// Since which LSN safekeeper has WAL.
     pub local_start_lsn: Lsn,
     /// When info was received. Serde annotations are not very useful but make
@@ -204,6 +228,8 @@ pub struct TimelineStatus {
     pub backup_lsn: Lsn,
     pub peer_horizon_lsn: Lsn,
     pub remote_consistent_lsn: Lsn,
+    #[serde(default)]
+    pub remote_wal_gc_lsn: Lsn,
     pub oggit_required_lsn: Lsn,
     pub peers: Vec<PeerInfo>,
     pub walsenders: Vec<WalSenderState>,
@@ -268,6 +294,23 @@ pub struct SkTimelineInfo {
     pub remote_consistent_lsn: Lsn,
     #[serde(default = "lsn_invalid")]
     pub peer_horizon_lsn: Lsn,
+    /// LSN below which remote complete WAL has been garbage-collected.
+    #[serde(default = "lsn_invalid")]
+    pub remote_wal_gc_lsn: Lsn,
+    #[serde(default)]
+    pub membership_generation: u32,
+    #[serde(default)]
+    pub membership_is_joint: bool,
+    #[serde(default = "lsn_invalid")]
+    pub cfile_commit_lsn: Lsn,
+    #[serde(default = "lsn_invalid")]
+    pub cfile_backup_lsn: Lsn,
+    #[serde(default = "lsn_invalid")]
+    pub cfile_remote_consistent_lsn: Lsn,
+    #[serde(default = "lsn_invalid")]
+    pub cfile_peer_horizon_lsn: Lsn,
+    #[serde(default = "lsn_invalid")]
+    pub cfile_oggit_required_lsn: Lsn,
     #[serde(default = "lsn_max")]
     pub oggit_required_lsn: Lsn,
     #[serde(default = "lsn_invalid")]

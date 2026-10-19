@@ -17,6 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="${SCRIPT_DIR}"
 ENV_FILE="${DEPLOY_DIR}/deploy.env"
 COMPOSE_DIR="${DEPLOY_DIR}/docker-compose"
+PAGESERVER_CONFIG_TEMPLATE="${COMPOSE_DIR}/pageserver_config/pageserver.toml"
+PAGESERVER_RUNTIME_CONFIG="${COMPOSE_DIR}/pageserver_config/pageserver.runtime.toml"
+DEPLOYMENT_RUNTIME_ENV="${COMPOSE_DIR}/deployment.runtime.env"
 
 CLI_SKIP_PULL="false"
 
@@ -126,6 +129,133 @@ load_runtime_configuration() {
     DOCKER_CONTROL_PLANE_TOKEN="${DOCKER_CONTROL_PLANE_TOKEN:-}"
     CONTROL_PLANE_JWT_TOKEN="${CONTROL_PLANE_JWT_TOKEN:-${DOCKER_CONTROL_PLANE_TOKEN}}"
     STORAGE_CONTROLLER_HOST_PORT="${STORAGE_CONTROLLER_HOST_PORT:-1234}"
+    REMOTE_STORAGE_MODE="${REMOTE_STORAGE_MODE:-localfs}"
+    S3_ENDPOINT="${S3_ENDPOINT:-}"
+    S3_BUCKET="${S3_BUCKET:-}"
+    S3_REGION="${S3_REGION:-us-east-1}"
+    PAGESERVER_S3_PREFIX="${PAGESERVER_S3_PREFIX:-opengauss-neon/pageserver}"
+    SAFEKEEPER_S3_PREFIX="${SAFEKEEPER_S3_PREFIX:-opengauss-neon/safekeeper}"
+    S3_CONCURRENCY_LIMIT="${S3_CONCURRENCY_LIMIT:-20}"
+    OBJECT_STORAGE_CREDENTIALS_FILE="${OBJECT_STORAGE_CREDENTIALS_FILE:-./object_storage.env}"
+}
+
+resolve_deploy_path() {
+    local path="$1"
+    if [[ "${path}" = /* ]]; then
+        printf '%s\n' "${path}"
+    else
+        printf '%s\n' "${DEPLOY_DIR}/${path#./}"
+    fi
+}
+
+require_nonempty() {
+    local name="$1"
+    local value="$2"
+    [[ -n "${value}" ]] || die "S3模式缺少配置: ${name}"
+}
+
+validate_remote_storage_value() {
+    local name="$1"
+    local value="$2"
+    if [[ "${value}" =~ [[:space:]\'] ]]; then
+        die "${name}不能包含空白字符或单引号"
+    fi
+}
+
+write_deployment_runtime_env() {
+    (
+        umask 077
+        {
+            printf 'REMOTE_STORAGE_MODE=%q\n' "${REMOTE_STORAGE_MODE}"
+            printf 'PAGESERVER_REMOTE_STORAGE=%q\n' "${PAGESERVER_REMOTE_STORAGE}"
+            printf 'PAGESERVER_CONFIG_FILE=%q\n' "${PAGESERVER_CONFIG_FILE}"
+            printf 'SAFEKEEPER_EXTRA_OPT=%q\n' "${SAFEKEEPER_EXTRA_OPT:-}"
+            printf 'OBJECT_STORAGE_CREDENTIALS_FILE=%q\n' "${OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED:-}"
+        } > "${DEPLOYMENT_RUNTIME_ENV}"
+    )
+}
+
+generate_pageserver_runtime_config() {
+    python3 - "${PAGESERVER_CONFIG_TEMPLATE}" "${PAGESERVER_RUNTIME_CONFIG}" "${PAGESERVER_REMOTE_STORAGE}" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+remote_storage = sys.argv[3]
+lines = source.read_text(encoding="utf-8").splitlines()
+matches = [i for i, line in enumerate(lines) if line.strip().startswith("remote_storage=")]
+if len(matches) != 1:
+    raise SystemExit(f"expected exactly one remote_storage entry in {source}, found {len(matches)}")
+lines[matches[0]] = f"remote_storage={remote_storage}"
+target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+    chmod 0644 "${PAGESERVER_RUNTIME_CONFIG}"
+}
+
+configure_remote_storage() {
+    log_step "配置远端存储"
+
+    local existing_safekeeper_opts="${SAFEKEEPER_EXTRA_OPT:-}"
+    case "${REMOTE_STORAGE_MODE}" in
+        localfs)
+            PAGESERVER_REMOTE_STORAGE="{local_path='/data/.neon/shared_remote_storage'}"
+            PAGESERVER_CONFIG_FILE="pageserver.toml"
+            SAFEKEEPER_EXTRA_OPT="${existing_safekeeper_opts}"
+            OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED=""
+            rm -f "${PAGESERVER_RUNTIME_CONFIG}"
+            log_info "使用本地LocalFs远端存储目录"
+            ;;
+        s3)
+            require_nonempty "S3_ENDPOINT" "${S3_ENDPOINT}"
+            require_nonempty "S3_BUCKET" "${S3_BUCKET}"
+            require_nonempty "S3_REGION" "${S3_REGION}"
+            require_nonempty "PAGESERVER_S3_PREFIX" "${PAGESERVER_S3_PREFIX}"
+            require_nonempty "SAFEKEEPER_S3_PREFIX" "${SAFEKEEPER_S3_PREFIX}"
+            [[ "${PAGESERVER_S3_PREFIX}" != "${SAFEKEEPER_S3_PREFIX}" ]] \
+                || die "Pageserver和Safekeeper必须使用不同的S3 Prefix"
+            [[ "${S3_CONCURRENCY_LIMIT}" =~ ^[1-9][0-9]*$ ]] \
+                || die "S3_CONCURRENCY_LIMIT必须是正整数"
+
+            local value_name
+            for value_name in S3_ENDPOINT S3_BUCKET S3_REGION PAGESERVER_S3_PREFIX SAFEKEEPER_S3_PREFIX; do
+                validate_remote_storage_value "${value_name}" "${!value_name}"
+            done
+
+            OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED="$(resolve_deploy_path "${OBJECT_STORAGE_CREDENTIALS_FILE}")"
+            [[ -f "${OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED}" ]] \
+                || die "对象存储凭证文件不存在: ${OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED}"
+            set -a
+            # shellcheck source=/dev/null
+            source "${OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED}"
+            set +a
+            require_nonempty "AWS_ACCESS_KEY_ID" "${AWS_ACCESS_KEY_ID:-}"
+            require_nonempty "AWS_SECRET_ACCESS_KEY" "${AWS_SECRET_ACCESS_KEY:-}"
+
+            PAGESERVER_REMOTE_STORAGE="{bucket_name='${S3_BUCKET}',bucket_region='${S3_REGION}',prefix_in_bucket='${PAGESERVER_S3_PREFIX}',endpoint='${S3_ENDPOINT}',concurrency_limit=${S3_CONCURRENCY_LIMIT}}"
+            local safekeeper_remote_storage="{bucket_name='${S3_BUCKET}',bucket_region='${S3_REGION}',prefix_in_bucket='${SAFEKEEPER_S3_PREFIX}',endpoint='${S3_ENDPOINT}',concurrency_limit=${S3_CONCURRENCY_LIMIT}}"
+            SAFEKEEPER_EXTRA_OPT="--remote-storage=${safekeeper_remote_storage}${existing_safekeeper_opts:+ ${existing_safekeeper_opts}}"
+            PAGESERVER_CONFIG_FILE="pageserver.runtime.toml"
+            generate_pageserver_runtime_config
+
+            if ! curl --connect-timeout 5 --max-time 10 -sS -o /dev/null "${S3_ENDPOINT}"; then
+                die "无法从宿主机访问S3 Endpoint: ${S3_ENDPOINT}"
+            fi
+            log_info "使用S3兼容对象存储: bucket=${S3_BUCKET}, region=${S3_REGION}"
+            log_info "Pageserver prefix: ${PAGESERVER_S3_PREFIX}"
+            log_info "Safekeeper prefix: ${SAFEKEEPER_S3_PREFIX}"
+            ;;
+        *)
+            die "REMOTE_STORAGE_MODE仅支持 localfs 或 s3，当前值: ${REMOTE_STORAGE_MODE}"
+            ;;
+    esac
+
+    export REMOTE_STORAGE_MODE
+    export PAGESERVER_REMOTE_STORAGE
+    export PAGESERVER_CONFIG_FILE
+    export SAFEKEEPER_EXTRA_OPT
+    export OBJECT_STORAGE_CREDENTIALS_FILE_RESOLVED
+    write_deployment_runtime_env
 }
 
 check_docker_environment() {
@@ -385,6 +515,7 @@ main() {
     validate_runtime_files
     load_runtime_configuration
     check_docker_environment
+    configure_remote_storage
     pull_and_tag_images
     validate_compute_image_contents
     validate_compose_configuration

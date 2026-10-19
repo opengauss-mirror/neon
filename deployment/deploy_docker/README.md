@@ -77,12 +77,119 @@ bash openGauss-branching-deploy/deploy.sh arm --skip-pull
 bash openGauss-branching-deploy/deploy.sh x86 --skip-pull
 ```
 
+默认使用宿主机本地目录作为Pageserver的远端存储，保持原有部署方式不变。需要使用S3兼容对象存储时，先按照“对象存储部署”章节补充配置，再执行相同的 `deploy.sh`命令。
+
+## 对象存储部署
+
+对象存储模式用于将Pageserver的Layer和远端元数据，以及Safekeeper的完整WAL和Partial WAL写入S3兼容对象存储。MinIO、AWS S3以及提供S3兼容接口的对象存储均使用同一套配置方式。
+
+启用前需要准备以下信息：
+
+- S3 Endpoint；
+- 已创建的Bucket；
+- Bucket所在Region；
+- Access Key和Secret Key；
+- Pageserver与Safekeeper各自使用的Prefix。
+
+部署脚本不会创建Bucket。Pageserver和Safekeeper可以使用同一个Bucket，但必须配置不同Prefix。
+
+### 1. 修改部署配置
+
+安装脚本执行完成后，编辑：
+
+```bash
+vi openGauss-branching-deploy/deploy.env
+```
+
+将远端存储模式改为 `s3`并填写连接参数：
+
+```bash
+REMOTE_STORAGE_MODE="s3"
+
+S3_ENDPOINT="http://<S3_HOST_OR_IP>:<S3_PORT>"
+S3_BUCKET="<S3_BUCKET_NAME>"
+S3_REGION="<S3_REGION>"
+PAGESERVER_S3_PREFIX="<PAGESERVER_S3_PREFIX>"
+SAFEKEEPER_S3_PREFIX="<SAFEKEEPER_S3_PREFIX>"
+S3_CONCURRENCY_LIMIT="20"
+
+OBJECT_STORAGE_CREDENTIALS_FILE="./object_storage.env"
+```
+
+对于未单独配置Region的MinIO，通常使用 `us-east-1`。`S3_ENDPOINT`必须是Pageserver和Safekeeper容器能够访问的地址，不能填写只在宿主机自身有效的 `127.0.0.1`。
+
+### 2. 创建凭证文件
+
+复制凭证模板并填写实际值：
+
+```bash
+cp openGauss-branching-deploy/object_storage.env.example openGauss-branching-deploy/object_storage.env
+vi openGauss-branching-deploy/object_storage.env
+
+chmod 600 openGauss-branching-deploy/object_storage.env
+```
+
+使用临时凭证时，可以继续增加：
+
+```bash
+AWS_SESSION_TOKEN="<session-token>"
+```
+
+凭证不会写入Pageserver和Safekeeper配置文件。部署脚本会在启动和后续执行 `docker_local`管理命令时，将凭证传入相关容器。
+
+### 3. 执行部署
+
+ARM服务器执行：
+
+```bash
+bash openGauss-branching-deploy/deploy.sh arm --skip-pull
+```
+
+x86服务器执行：
+
+```bash
+bash openGauss-branching-deploy/deploy.sh x86 --skip-pull
+```
+
+部署脚本会检查对象存储必填参数、凭证文件、Prefix冲突以及Endpoint连通性，然后为默认和动态Pageserver生成S3配置，并为所有Safekeeper增加远端WAL配置。
+
+### 4. 检查配置
+
+部署完成后可以检查Pageserver实际使用的配置：
+
+```bash
+docker exec neon_poc-pageserver-1 \
+  grep '^remote_storage' /data/.neon/pageserver/pageserver.toml
+```
+
+检查Safekeeper启动参数：
+
+```bash
+docker exec neon_poc-safekeeper-1 \
+  sh -c 'tr "\0" " " < /proc/1/cmdline'
+```
+
+输出中应分别包含S3 Bucket、Endpoint和对应Prefix。随后产生业务数据，通过Pageserver和Safekeeper状态接口以及对象存储中的对象确认上传进度。
+
+### 切回本地模式
+
+保持或恢复以下配置即可使用原有LocalFs方式：
+
+```bash
+REMOTE_STORAGE_MODE="localfs"
+```
+
+本地模式不要求创建 `object_storage.env`，也不会为Safekeeper增加对象存储参数。
+
+远端存储模式应在新集群初始化时确定。将已有LocalFs集群改成S3配置不会自动把原有对象迁移到S3；测试切换模式时应使用新的部署目录，或者设置 `INIT_FORCE="remove-all-contents"`重新初始化。
+
 ## 安装说明
 
 `install.sh` 会下载以下内容：
 
 - `deploy.sh`
 - `deploy.env`
+- `object_storage.env.example`
 - `docker-compose/docker-compose.yml`
 - `docker-compose/bin/docker_local`
 - `docker-compose/bin/docker_local.py`
@@ -127,6 +234,13 @@ RAW_BASE_URL=https://raw.gitcode.com/<owner>/<repo>/raw/<branch> bash install.sh
 | `DOCKER_CONTROL_PLANE_HOST_PORT` | control plane 宿主机端口 |
 | `STORAGE_CONTROLLER_HOST_PORT` | storage controller 宿主机端口 |
 | `SKIP_PULL` | 是否跳过镜像拉取 |
+| `REMOTE_STORAGE_MODE` | 远端存储模式，支持 `localfs`和 `s3`，默认 `localfs` |
+| `S3_ENDPOINT` | S3兼容对象存储访问地址 |
+| `S3_BUCKET` | 已创建的Bucket名称 |
+| `S3_REGION` | Bucket所在Region |
+| `PAGESERVER_S3_PREFIX` | Pageserver对象路径前缀 |
+| `SAFEKEEPER_S3_PREFIX` | Safekeeper对象路径前缀 |
+| `OBJECT_STORAGE_CREDENTIALS_FILE` | S3访问凭证文件路径 |
 
 ## 常用命令
 
@@ -166,6 +280,8 @@ cd openGauss-branching-deploy
 | `deploy.sh` | 执行部署流程 |
 | `deploy.env` | 部署配置 |
 | `docker-compose/` | compose 与运行时配置 |
+| `object_storage.env.example` | 对象存储凭证模板，不包含真实凭证 |
+| `object_storage.env` | 用户创建的对象存储访问凭证，仅S3模式需要 |
 | `compute/shell/compute.sh` | endpoint 启动脚本 |
 | `compute/shell/storage_controller_db.sh` | storage controller DB 初始化脚本 |
 

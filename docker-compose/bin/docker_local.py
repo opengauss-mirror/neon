@@ -1084,6 +1084,9 @@ def write_safekeeper_override(sk_id, host_http_port, image=DEFAULT_STORAGE_IMAGE
       - SAFEKEEPER_ID={sk_id}
       - BROKER_ENDPOINT={broker_endpoint}
       - SAFEKEEPER_EXTRA_OPT=${{SAFEKEEPER_EXTRA_OPT:-}}
+      - AWS_ACCESS_KEY_ID=${{AWS_ACCESS_KEY_ID:-}}
+      - AWS_SECRET_ACCESS_KEY=${{AWS_SECRET_ACCESS_KEY:-}}
+      - AWS_SESSION_TOKEN=${{AWS_SESSION_TOKEN:-}}
     ports:
       - {host_http_port}:7676
     volumes:
@@ -1529,7 +1532,13 @@ def cmd_timeline(args):
         }))
     elif args.timeline_cmd == "delete":
         tenant_id = resolve_tenant_id(args.tenant_id)
-        print_json(api("DELETE", f"/v1/timeline/{tenant_id}/{args.timeline_id}", timeout=args.timeout))
+        result = api("DELETE", f"/v1/timeline/{tenant_id}/{args.timeline_id}", timeout=args.timeout)
+        cleanup = result.get("cleanup", {}) if isinstance(result, dict) else {}
+        for endpoint in cleanup.get("removed_endpoints", []):
+            container_name = endpoint.get("container_name")
+            if container_name:
+                run(["docker", "rm", "-f", container_name], capture=True, check=False)
+        print_json(result)
     elif args.timeline_cmd == "import":
         if not branch_name:
             raise SystemExit("timeline import requires BRANCH_NAME or --branch-name")

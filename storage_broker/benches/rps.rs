@@ -155,6 +155,14 @@ async fn publish(client: Option<BrokerClientChannel>, n_keys: u64) {
                 local_start_lsn: 0,
                 availability_zone: None,
                 standby_horizon: 0,
+                remote_wal_gc_lsn: 0,
+                membership_generation: 0,
+                membership_is_joint: false,
+                cfile_commit_lsn: 0,
+                cfile_backup_lsn: 0,
+                cfile_remote_consistent_lsn: 0,
+                cfile_peer_horizon_lsn: 0,
+                cfile_oggit_required_lsn: 0,
             };
             counter += 1;
             yield info;

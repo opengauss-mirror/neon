@@ -51,6 +51,17 @@ message SafekeeperTimelineInfo {
     optional string https_connstr = 15;
     // Availability zone of a safekeeper.
     optional string availability_zone = 11;
+    // LSN below which remote complete WAL has been garbage-collected.
+    uint64 remote_wal_gc_lsn = 16;
+    // Membership generation used to validate remote WAL GC decisions.
+    uint32 membership_generation = 17;
+    bool membership_is_joint = 18;
+    // Persistent state values used to make remote WAL GC survive restarts safely.
+    uint64 cfile_commit_lsn = 19;
+    uint64 cfile_backup_lsn = 20;
+    uint64 cfile_remote_consistent_lsn = 21;
+    uint64 cfile_peer_horizon_lsn = 22;
+    uint64 cfile_oggit_required_lsn = 23;
 }
 
 message TenantTimelineId {

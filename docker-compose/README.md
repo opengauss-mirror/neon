@@ -49,6 +49,17 @@ Authorization: Bearer <Admin JWT>
 
 ## 一键启停
 
+通过 `deployment/deploy_docker/deploy.sh`部署时，默认使用 `.neon/shared_remote_storage`作为Pageserver的LocalFs远端存储。将 `deploy.env`中的 `REMOTE_STORAGE_MODE`设置为 `s3`后，部署脚本会生成 `pageserver_config/pageserver.runtime.toml`和 `deployment.runtime.env`，`bin/docker_local`会在后续启停及扩容时自动加载这些配置。
+
+S3模式下还需要在部署目录创建 `object_storage.env`：
+
+```bash
+AWS_ACCESS_KEY_ID="<AWS_ACCESS_KEY_ID>"
+AWS_SECRET_ACCESS_KEY="<AWS_SECRET_ACCESS_KEY>"
+```
+
+完整配置方法见 [Docker一键部署指南](../deployment/deploy_docker/README.md#对象存储部署)。不要手工修改动态Pageserver和Safekeeper的override文件，对象存储配置会由 `docker_local`和Docker Control Plane自动应用到新增节点。
+
 ### 首次初始化并启动
 
 ```bash
@@ -218,6 +229,8 @@ bin/docker_local storage-broker logs -f
 | `bin/docker_local` | CLI 入口 |
 | `bin/docker_local.py` | 实现 |
 | `pageserver_config/` | 默认 pageserver（node 1001）配置 |
+| `pageserver_config/pageserver.runtime.toml` | 一键部署在S3模式下生成的Pageserver运行配置 |
+| `deployment.runtime.env` | 一键部署生成的远端存储运行参数，不包含Access Key和Secret Key |
 | `ext-src/` | 构建 `og_compute` 镜像用，不参与运行时启停 |
 | `.neon/control_plane/docker_local.json` | CLI 本地配置（节点数量、镜像等） |
 | `.neon/pageserver` / `.neon/pageserverN` | pageserver 数据 |

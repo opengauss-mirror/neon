@@ -1,5 +1,6 @@
 use std::cmp::min;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use futures::StreamExt;
 use futures::stream::{self, FuturesOrdered};
-use postgres_ffi::V702::xlog_utils::XLogSegNoOffsetToRecPtr;
+use postgres_ffi::V702::xlog_utils::{IsXLogFileName, XLogFromFileName, XLogSegNoOffsetToRecPtr};
 use postgres_ffi::{PG_TLI, XLogFileName, XLogSegNo};
 use remote_storage::{
     DownloadOpts, GenericRemoteStorage, ListingMode, RemotePath, StorageMetadata,
@@ -706,6 +707,117 @@ pub async fn delete_timeline(
     .and_then(|x| x)?;
 
     Ok(())
+}
+
+/// Delete complete WAL segment objects below `horizon_lsn` for one timeline.
+/// Partial WAL and all non-WAL metadata are intentionally left untouched.
+pub async fn delete_wal_segments_up_to(
+    storage: &GenericRemoteStorage,
+    ttid: &TenantTimelineId,
+    wal_seg_size: usize,
+    horizon_lsn: Lsn,
+    cancel: CancellationToken,
+) -> Result<()> {
+    anyhow::ensure!(wal_seg_size > 0, "WAL segment size must be positive");
+    let remote_path = remote_timeline_path(ttid)?;
+    let horizon_segno = horizon_lsn.segment_number(wal_seg_size);
+    let mut listings = Box::pin(storage.list_streaming(
+        Some(&remote_path),
+        ListingMode::NoDelimiter,
+        None,
+        &cancel,
+    ));
+    let mut deleted = 0usize;
+
+    while let Some(listing) = listings.next().await {
+        let listing = listing?;
+        let objects = listing
+            .keys
+            .into_iter()
+            .filter_map(|object| {
+                complete_wal_segment_before(&object.key, &remote_path, wal_seg_size, horizon_segno)
+                    .map(|_| object.key)
+            })
+            .collect::<Vec<_>>();
+
+        if !objects.is_empty() {
+            deleted += objects.len();
+            storage.delete_objects(&objects, &cancel).await?;
+        }
+    }
+
+    if deleted > 0 {
+        info!(%ttid, %horizon_lsn, deleted, "deleted complete WAL objects from remote storage");
+    }
+    Ok(())
+}
+
+fn complete_wal_segment_before(
+    path: &RemotePath,
+    timeline_path: &RemotePath,
+    wal_seg_size: usize,
+    horizon_segno: XLogSegNo,
+) -> Option<XLogSegNo> {
+    if path.get_path().parent()? != timeline_path.get_path() {
+        return None;
+    }
+    let name = path.object_name()?;
+    if !IsXLogFileName(OsStr::new(name)) {
+        return None;
+    }
+    let (segno, tli) = XLogFromFileName(OsStr::new(name), wal_seg_size).ok()?;
+    if tli != PG_TLI {
+        return None;
+    }
+    (segno < horizon_segno).then_some(segno)
+}
+
+#[cfg(test)]
+mod remote_wal_gc_tests {
+    use super::*;
+    use postgres_ffi::{PG_TLI, WAL_SEGMENT_SIZE};
+
+    #[test]
+    fn only_old_complete_wal_segments_are_selected() {
+        let timeline = RemotePath::from_string("tenant/timeline").unwrap();
+        let old = timeline.join(XLogFileName(PG_TLI, 1, WAL_SEGMENT_SIZE as usize));
+        let current = timeline.join(XLogFileName(PG_TLI, 2, WAL_SEGMENT_SIZE as usize));
+        let partial = timeline.join(format!(
+            "{}.partial",
+            XLogFileName(PG_TLI, 1, WAL_SEGMENT_SIZE as usize)
+        ));
+        let metadata = timeline.join("safekeeper.control");
+        let nested =
+            timeline
+                .join("archive")
+                .join(XLogFileName(PG_TLI, 1, WAL_SEGMENT_SIZE as usize));
+        let other_timeline = timeline.join(XLogFileName(PG_TLI + 1, 1, WAL_SEGMENT_SIZE as usize));
+
+        assert_eq!(
+            complete_wal_segment_before(&old, &timeline, WAL_SEGMENT_SIZE as usize, 2,),
+            Some(1)
+        );
+        assert_eq!(
+            complete_wal_segment_before(&current, &timeline, WAL_SEGMENT_SIZE as usize, 2,),
+            None
+        );
+        assert_eq!(
+            complete_wal_segment_before(&partial, &timeline, WAL_SEGMENT_SIZE as usize, 2,),
+            None
+        );
+        assert_eq!(
+            complete_wal_segment_before(&metadata, &timeline, WAL_SEGMENT_SIZE as usize, 2,),
+            None
+        );
+        assert_eq!(
+            complete_wal_segment_before(&nested, &timeline, WAL_SEGMENT_SIZE as usize, 2,),
+            None
+        );
+        assert_eq!(
+            complete_wal_segment_before(&other_timeline, &timeline, WAL_SEGMENT_SIZE as usize, 2,),
+            None
+        );
+    }
 }
 
 /// Used by wal_backup_partial.

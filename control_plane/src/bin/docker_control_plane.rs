@@ -52,7 +52,6 @@ use pageserver_api::models::{
     SafekeepersInfo, TenantConfig, TenantConfigRequest, TenantShardSplitRequest, TimelineInfo,
 };
 use pageserver_api::shard::{ShardStripeSize, TenantShardId};
-use pageserver_client::mgmt_api::ResponseErrorMessageExt;
 use reqwest::Client;
 use safekeeper_api::membership::{Configuration, SafekeeperGeneration, SafekeeperId};
 use safekeeper_api::models::{
@@ -88,6 +87,7 @@ struct AppState {
     og_version: String,
     storage_image: String,
     compute_image: String,
+    pageserver_remote_storage: String,
     client: Client,
     oggit_worker_lock: Arc<tokio::sync::Mutex<()>>,
     oggit_gc_scheduler: Arc<oggit_gc_scheduler::OggitGcScheduler>,
@@ -676,6 +676,10 @@ async fn main() -> Result<()> {
         std::env::var("NEON_IMAGE").unwrap_or_else(|_| "og_storage:latest".to_string());
     let compute_image =
         std::env::var("COMPUTE_IMAGE").unwrap_or_else(|_| "og_compute:latest".to_string());
+    let pageserver_remote_storage = std::env::var("PAGESERVER_REMOTE_STORAGE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "{local_path='/data/.neon/shared_remote_storage'}".to_string());
 
     for dir in [
         state_dir.join("endpoints"),
@@ -692,6 +696,7 @@ async fn main() -> Result<()> {
         og_version,
         storage_image,
         compute_image,
+        pageserver_remote_storage,
         client: Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -1306,6 +1311,25 @@ async fn timeline_delete(
         Ok(timeline_id) => timeline_id,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
     };
+
+    match timeline_endpoints_in_use(&state.state_dir, tenant_id, timeline_id) {
+        Ok(endpoints) if !endpoints.is_empty() => {
+            let endpoint_ids = endpoints
+                .iter()
+                .map(|endpoint| endpoint.endpoint_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return error_response(
+                StatusCode::CONFLICT,
+                anyhow!(
+                    "cannot delete timeline {tenant_id}/{timeline_id}: endpoint(s) {endpoint_ids} are still running; stop them first"
+                ),
+            );
+        }
+        Ok(_) => {}
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+
     match handle_timeline_delete(&state, tenant_id, timeline_id).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -1448,27 +1472,6 @@ async fn list_pageserver_timelines(
         .json::<Vec<TimelineInfo>>()
         .await
         .with_context(|| format!("decoding pageserver timeline list from {url}"))
-}
-
-async fn delete_pageserver_timeline(
-    state: &AppState,
-    node: &NodeDescribeResponse,
-    tenant_shard_id: TenantShardId,
-    timeline_id: TimelineId,
-) -> Result<()> {
-    let url = format!(
-        "http://{}:{}/v1/tenant/{}/timeline/{}",
-        node.listen_http_addr, node.listen_http_port, tenant_shard_id, timeline_id
-    );
-    state
-        .client
-        .delete(&url)
-        .send()
-        .await?
-        .error_from_body()
-        .await
-        .with_context(|| format!("deleting pageserver timeline via {url}"))?;
-    Ok(())
 }
 
 fn mapping_name_for_timeline(
@@ -3317,7 +3320,6 @@ async fn handle_timeline_delete(
     let storage_controller = docker_storage_controller_api(state)?;
     let nodes = load_pageserver_nodes(state).await?;
     let tenant = storage_controller.tenant_describe(tenant_id).await?;
-    let mut deleted_shards = Vec::new();
     let mut parents = HashSet::new();
 
     for shard in tenant.shards {
@@ -3335,17 +3337,12 @@ async fn handle_timeline_delete(
             if let Some(parent) = timeline.ancestor_timeline_id {
                 parents.insert(parent);
             }
-            delete_pageserver_timeline(state, node, shard.tenant_shard_id, timeline_id).await?;
-            deleted_shards.push(json!({
-                "tenant_shard_id": shard.tenant_shard_id.to_string(),
-                "pageserver_id": node_id.to_string(),
-            }));
         }
     }
 
-    if deleted_shards.is_empty() {
-        bail!("timeline {tenant_id}/{timeline_id} was not found on attached pageservers");
-    }
+    storage_controller
+        .tenant_timeline_delete(tenant_id, timeline_id)
+        .await?;
 
     let cleanup = cleanup_deleted_timeline_state(&state.state_dir, tenant_id, timeline_id)?;
     for parent in parents {
@@ -3354,7 +3351,6 @@ async fn handle_timeline_delete(
     Ok(json!({
         "tenant_id": tenant_id,
         "timeline_id": timeline_id,
-        "deleted_shards": deleted_shards,
         "cleanup": cleanup,
     }))
 }
@@ -3502,6 +3498,7 @@ fn handle_pageserver_add(
         og_version: og_version.clone(),
         storage_controller_http,
         broker_endpoint,
+        remote_storage: state.pageserver_remote_storage.clone(),
     })?;
     std::fs::write(config_dir.join("identity.toml"), rendered.identity_toml)
         .with_context(|| format!("writing {}/identity.toml", config_dir.display()))?;
@@ -3520,6 +3517,9 @@ fn handle_pageserver_add(
     environment:
       - OG_VERSION=${{OG_VERSION:-{og_version}}}
       - PATH=/usr/local/${{OG_VERSION:-{og_version}}}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - AWS_ACCESS_KEY_ID=${{AWS_ACCESS_KEY_ID:-}}
+      - AWS_SECRET_ACCESS_KEY=${{AWS_SECRET_ACCESS_KEY:-}}
+      - AWS_SESSION_TOKEN=${{AWS_SESSION_TOKEN:-}}
     ports:
       - {host_http_port}:9898
       - {host_pg_port}:6400
@@ -4136,6 +4136,23 @@ fn load_endpoint(state_dir: &Path, endpoint_id: &str) -> Result<EndpointRecord> 
     serde_json::from_reader(file).with_context(|| format!("decoding {}", path.display()))
 }
 
+fn timeline_endpoints_in_use(
+    state_dir: &Path,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+) -> Result<Vec<EndpointRecord>> {
+    let tenant_id = tenant_id.to_string();
+    let timeline_id = timeline_id.to_string();
+    Ok(load_endpoints(state_dir)?
+        .into_iter()
+        .filter(|endpoint| {
+            endpoint.tenant_id == tenant_id
+                && endpoint.timeline_id == timeline_id
+                && matches!(endpoint.status.as_str(), "Starting" | "Running")
+        })
+        .collect())
+}
+
 fn ensure_auth_keys(state_dir: &Path) -> Result<()> {
     let private_key_path = state_dir.join("auth_private_key.pem");
     let public_key_path = state_dir.join("auth_public_key.pem");
@@ -4442,6 +4459,7 @@ fn delete_endpoint_record(state_dir: &Path, endpoint_id: &str) -> Result<Value> 
     Ok(json!({
         "endpoint_id": endpoint_id,
         "service_name": endpoint.service_name,
+        "container_name": endpoint.container_name,
         "removed": true
     }))
 }

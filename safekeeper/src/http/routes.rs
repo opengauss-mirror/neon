@@ -211,6 +211,7 @@ async fn timeline_status_handler(request: Request<Body>) -> Result<Response<Body
         backup_lsn: inmem.backup_lsn,
         peer_horizon_lsn: inmem.peer_horizon_lsn,
         remote_consistent_lsn: inmem.remote_consistent_lsn,
+        remote_wal_gc_lsn: inmem.remote_wal_gc_lsn,
         oggit_required_lsn: inmem.oggit_required_lsn,
         peers: tli.get_peers(conf).await,
         walsenders: tli.get_walsenders().get_all_public(),
@@ -607,8 +608,16 @@ async fn record_safekeeper_info(mut request: Request<Body>) -> Result<Response<B
         https_connstr: sk_info.https_connstr,
         backup_lsn: sk_info.backup_lsn.0,
         local_start_lsn: sk_info.local_start_lsn.0,
+        remote_wal_gc_lsn: sk_info.remote_wal_gc_lsn.0,
         availability_zone: None,
         standby_horizon: sk_info.standby_horizon.0,
+        membership_generation: sk_info.membership_generation,
+        membership_is_joint: sk_info.membership_is_joint,
+        cfile_commit_lsn: sk_info.cfile_commit_lsn.0,
+        cfile_backup_lsn: sk_info.cfile_backup_lsn.0,
+        cfile_remote_consistent_lsn: sk_info.cfile_remote_consistent_lsn.0,
+        cfile_peer_horizon_lsn: sk_info.cfile_peer_horizon_lsn.0,
+        cfile_oggit_required_lsn: sk_info.cfile_oggit_required_lsn.0,
     };
 
     let global_timelines = get_global_timelines(&request);

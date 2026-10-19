@@ -14,6 +14,7 @@ use std::time::Duration;
 use futures::channel::oneshot;
 use postgres_ffi::XLogSegNo;
 use safekeeper_api::Term;
+use safekeeper_api::membership::Configuration;
 use safekeeper_api::models::PeerInfo;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, JoinHandle};
@@ -48,6 +49,8 @@ pub(crate) struct StateSnapshot {
     pub(crate) cfile_commit_lsn: Lsn,
     pub(crate) cfile_remote_consistent_lsn: Lsn,
     pub(crate) cfile_backup_lsn: Lsn,
+    pub(crate) cfile_peer_horizon_lsn: Lsn,
+    pub(crate) cfile_remote_wal_gc_lsn: Lsn,
     pub(crate) cfile_oggit_required_lsn: Lsn,
 
     // latest state
@@ -59,6 +62,7 @@ pub(crate) struct StateSnapshot {
     pub(crate) inmem_flush_pending: bool,
     pub(crate) wal_removal_on_hold: bool,
     pub(crate) peers: Vec<PeerInfo>,
+    pub(crate) membership: Configuration,
 }
 
 impl StateSnapshot {
@@ -72,6 +76,8 @@ impl StateSnapshot {
             cfile_commit_lsn: state.commit_lsn,
             cfile_remote_consistent_lsn: state.remote_consistent_lsn,
             cfile_backup_lsn: state.backup_lsn,
+            cfile_peer_horizon_lsn: state.peer_horizon_lsn,
+            cfile_remote_wal_gc_lsn: state.remote_wal_gc_lsn,
             cfile_oggit_required_lsn: state.oggit_required_lsn,
             flush_lsn: read_guard.sk.flush_lsn(),
             last_log_term: read_guard.sk.last_log_term(),
@@ -79,6 +85,7 @@ impl StateSnapshot {
             inmem_flush_pending: Self::has_unflushed_inmem_state(state),
             wal_removal_on_hold: read_guard.wal_removal_on_hold,
             peers: read_guard.get_peers(heartbeat_timeout),
+            membership: state.mconf.clone(),
         }
     }
 
@@ -87,6 +94,7 @@ impl StateSnapshot {
             || state.inmem.backup_lsn > state.backup_lsn
             || state.inmem.peer_horizon_lsn > state.peer_horizon_lsn
             || state.inmem.remote_consistent_lsn > state.remote_consistent_lsn
+            || state.inmem.remote_wal_gc_lsn > state.remote_wal_gc_lsn
             || state.inmem.oggit_required_lsn != state.oggit_required_lsn
     }
 }
@@ -216,6 +224,7 @@ pub(crate) struct Manager {
     pub(crate) backup_task: Option<WalBackupTaskHandle>,
     pub(crate) recovery_task: Option<JoinHandle<()>>,
     pub(crate) wal_removal_task: Option<JoinHandle<anyhow::Result<u64>>>,
+    pub(crate) remote_wal_gc_task: Option<JoinHandle<anyhow::Result<Lsn>>>,
 
     // partial backup
     pub(crate) partial_backup_task:
@@ -229,6 +238,7 @@ pub(crate) struct Manager {
     // Anti-flapping state: we evict timelines eagerly if they are inactive, but should not
     // evict them if they go inactive very soon after being restored.
     pub(crate) evict_not_before: Instant,
+    pub(crate) remote_wal_gc_not_before: Instant,
 }
 
 /// This task gets spawned alongside each timeline and is responsible for managing the timeline's
@@ -301,7 +311,15 @@ pub async fn main_task(
 
             mgr.set_status(Status::UpdatePartialBackup);
             mgr.update_partial_backup(&state_snapshot).await;
+        }
 
+        // Remote WAL GC remains useful even when the timeline is already
+        // offloaded and its local WAL files are absent.
+        mgr.set_status(Status::UpdateRemoteWalGc);
+        mgr.update_remote_wal_gc(&state_snapshot, &mut next_event)
+            .await;
+
+        if !mgr.is_offloaded {
             let now = Instant::now();
             if mgr.evict_not_before > now {
                 // we should wait until evict_not_before
@@ -365,6 +383,16 @@ pub async fn main_task(
                 mgr.update_partial_backup_end(res);
             }
 
+            res = await_task_finish(mgr.remote_wal_gc_task.as_mut()) => {
+                // remote WAL GC task finished
+                mgr.remote_wal_gc_task = None;
+                match res {
+                    Ok(Ok(gc_lsn)) => info!(%gc_lsn, "remote WAL GC completed"),
+                    Ok(Err(e)) => warn!("remote WAL GC task failed: {:?}", e),
+                    Err(e) => warn!("remote WAL GC task panicked: {:?}", e),
+                }
+            }
+
             msg = manager_rx.recv() => {
                 mgr.set_status(Status::HandleMessage);
                 mgr.handle_message(msg).await;
@@ -406,6 +434,12 @@ pub async fn main_task(
         mgr.update_wal_removal_end(res);
     }
 
+    if let Some(remote_wal_gc_task) = &mut mgr.remote_wal_gc_task {
+        if let Err(e) = remote_wal_gc_task.await {
+            warn!("remote WAL GC task failed: {:?}", e);
+        }
+    }
+
     // If timeline is deleted while evicted decrement the gauge.
     if mgr.tli.is_cancelled() && mgr.is_offloaded {
         NUM_EVICTED_TIMELINES.dec();
@@ -436,6 +470,7 @@ impl Manager {
             backup_task: None,
             recovery_task: None,
             wal_removal_task: None,
+            remote_wal_gc_task: None,
             partial_backup_task: None,
             partial_backup_uploaded,
             access_service: AccessService::new(manager_tx),
@@ -443,6 +478,7 @@ impl Manager {
             global_rate_limiter,
             // to smooth out evictions spike after restart
             evict_not_before: Instant::now() + rand_duration(&conf.eviction_min_resident),
+            remote_wal_gc_not_before: Instant::now(),
             conf,
         }
     }
@@ -663,6 +699,76 @@ impl Manager {
         self.partial_backup_task = Some((handle, cancel));
     }
 
+    /// Advance the distributed remote WAL GC watermark and delete complete WAL
+    /// objects once every member has durably acknowledged that watermark.
+    async fn update_remote_wal_gc(
+        &mut self,
+        state: &StateSnapshot,
+        next_event: &mut Option<Instant>,
+    ) {
+        if !self.conf.remote_wal_gc_enabled || self.remote_wal_gc_task.is_some() {
+            return;
+        }
+
+        if Instant::now() < self.remote_wal_gc_not_before {
+            update_next_event(next_event, self.remote_wal_gc_not_before);
+            return;
+        }
+
+        let Some(storage) = self.wal_backup.get_storage() else {
+            return;
+        };
+
+        let replication_horizon_lsn = if self.conf.walsenders_keep_horizon {
+            self.walsenders.laggard_lsn()
+        } else {
+            None
+        };
+        let Some(safe_horizon_lsn) = crate::remove_wal::remote_wal_gc_horizon_lsn(
+            state,
+            replication_horizon_lsn,
+            self.conf.my_id,
+        ) else {
+            self.remote_wal_gc_not_before = Instant::now() + self.conf.remote_wal_gc_interval;
+            update_next_event(next_event, self.remote_wal_gc_not_before);
+            return;
+        };
+
+        let target_lsn = safe_horizon_lsn.max(state.cfile_remote_wal_gc_lsn);
+        if target_lsn > state.cfile_remote_wal_gc_lsn {
+            if let Err(e) = self.tli.set_remote_wal_gc_lsn(target_lsn).await {
+                warn!(%target_lsn, "failed to persist remote WAL GC watermark: {e:?}");
+                self.remote_wal_gc_not_before = Instant::now() + self.conf.remote_wal_gc_interval;
+                update_next_event(next_event, self.remote_wal_gc_not_before);
+                return;
+            }
+        }
+
+        if target_lsn == Lsn::INVALID
+            || !crate::remove_wal::all_members_acknowledged_gc(state, target_lsn, self.conf.my_id)
+        {
+            self.remote_wal_gc_not_before = Instant::now() + self.conf.remote_wal_gc_interval;
+            update_next_event(next_event, self.remote_wal_gc_not_before);
+            return;
+        }
+
+        let ttid = self.tli.ttid;
+        let wal_seg_size = self.wal_seg_size;
+        let cancel = self.tli.cancel.clone();
+        self.remote_wal_gc_not_before = Instant::now() + self.conf.remote_wal_gc_interval;
+        self.remote_wal_gc_task = Some(tokio::spawn(async move {
+            wal_backup::delete_wal_segments_up_to(
+                &storage,
+                &ttid,
+                wal_seg_size,
+                target_lsn,
+                cancel,
+            )
+            .await?;
+            Ok(target_lsn)
+        }));
+    }
+
     /// Update the state after partial WAL backup task finished.
     fn update_partial_backup_end(&mut self, res: Result<Option<PartialRemoteSegment>, JoinError>) {
         match res {
@@ -814,6 +920,7 @@ pub enum Status {
     UpdateControlFile,
     UpdateWalRemoval,
     UpdatePartialBackup,
+    UpdateRemoteWalGc,
     EvictTimeline,
     Wait,
     HandleMessage,

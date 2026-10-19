@@ -81,6 +81,7 @@ download_runtime_files() {
 
     download_file "deployment/deploy_docker/deploy.sh" "${DEPLOY_DIR}/deploy.sh"
     download_file "deployment/deploy_docker/deploy.env" "${ENV_FILE}"
+    download_file "deployment/deploy_docker/object_storage.env.example" "${DEPLOY_DIR}/object_storage.env.example"
     download_file "docker-compose/docker-compose.yml" "${COMPOSE_DIR}/docker-compose.yml"
     download_file "docker-compose/bin/docker_local" "${COMPOSE_DIR}/bin/docker_local"
     download_file "docker-compose/bin/docker_local.py" "${COMPOSE_DIR}/bin/docker_local.py"
@@ -103,6 +104,7 @@ set_runtime_permissions() {
 
     chmod 0644 \
         "${ENV_FILE}" \
+        "${DEPLOY_DIR}/object_storage.env.example" \
         "${COMPOSE_DIR}/docker-compose.yml" \
         "${COMPOSE_DIR}/pageserver_config/identity.toml" \
         "${COMPOSE_DIR}/pageserver_config/pageserver.toml" \
