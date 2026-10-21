@@ -34,18 +34,66 @@ use utils::lsn::Lsn;
 
 const RELMAP_SIZE_OPEN_GAUSS: usize = 4096;
 
-/// openGauss/PostgreSQL relfilenode OIDs for critical catalog relations.
-/// When !full_backup, we include ALL blocks (not just block0) of these catalogs
-/// to avoid stale pg_class/pg_type/pg_attribute after compute restart.
-const PG_CLASS_RELNODE: u32 = 14828;
-const PG_TYPE_RELNODE: u32 = 14709;
-const PG_ATTRIBUTE_RELNODE: u32 = 14802;
+// Logical catalog OIDs are stable; their physical file numbers are not.
+const LOCAL_CATALOGS: &[(u32, &str)] = &[
+    (1259, "pg_class"),
+    (1247, "pg_type"),
+    (1249, "pg_attribute"),
+    (2662, "pg_class_oid_index"),
+    (2663, "pg_class_relname_nsp_index"),
+    (9981, "pg_class_tblspc_relfilenode_index"),
+];
 
-/// pg_class index relfilenodes - CRITICAL for catalog lookups!
-/// Without these indexes, openGauss cannot find user tables after restart.
-const PG_CLASS_OID_INDEX_RELNODE: u32 = 14830;
-const PG_CLASS_RELNAME_NSP_INDEX_RELNODE: u32 = 14831;
-const PG_CLASS_TBLSPC_RELFILENODE_INDEX_RELNODE: u32 = 14832;
+/// Decode the native-endian relation map written by PostgreSQL/openGauss.
+/// PG 14/15 use 512 bytes, PG 16/17 use 524, and openGauss uses 4096.
+fn mapped_catalogs(img: &[u8]) -> anyhow::Result<Vec<(u32, &'static str, u32)>> {
+    anyhow::ensure!(
+        matches!(img.len(), 512 | 524 | RELMAP_SIZE_OPEN_GAUSS),
+        "invalid pg_filenode.map size: {}",
+        img.len()
+    );
+    let word = |offset| u32::from_ne_bytes(img[offset..offset + 4].try_into().unwrap());
+    let magic = word(0);
+    let capacity = match (magic, img.len()) {
+        (0x592717, 512) => 62,
+        (0x592717, 524) => 64,
+        (0x592718, RELMAP_SIZE_OPEN_GAUSS) => 510,
+        _ => anyhow::bail!(
+            "invalid pg_filenode.map magic/size: {magic:#x}/{}",
+            img.len()
+        ),
+    };
+    let count = word(4) as usize;
+    anyhow::ensure!(
+        count <= capacity,
+        "invalid pg_filenode.map mapping count: {count}"
+    );
+    let mut mappings = std::collections::HashMap::new();
+    for index in 0..count {
+        let oid = word(8 + index * 8);
+        let filenode = word(12 + index * 8);
+        anyhow::ensure!(
+            oid != 0 && filenode != 0,
+            "invalid zero OID/filenode in pg_filenode.map"
+        );
+        anyhow::ensure!(
+            mappings.insert(oid, filenode).is_none(),
+            "duplicate OID {oid} in pg_filenode.map"
+        );
+    }
+    let mut catalogs = Vec::new();
+    for &(oid, name) in LOCAL_CATALOGS {
+        // This index is openGauss-specific and is absent in PostgreSQL maps.
+        if oid == 9981 && magic != 0x592718 && !mappings.contains_key(&oid) {
+            continue;
+        }
+        let filenode = *mappings
+            .get(&oid)
+            .with_context(|| format!("pg_filenode.map has no mapping for {name} (OID {oid})"))?;
+        catalogs.push((oid, name, filenode));
+    }
+    Ok(catalogs)
+}
 
 use crate::context::RequestContext;
 use crate::pgdatadir_mapping::Version;
@@ -177,9 +225,7 @@ where
         (full_backup={full_backup}, replica={replica}, gzip={gzip_level:?})",
     );
     if full_backup {
-        info!(
-            "[BASEBACKUP_REL] basebackup INCLUDES relation pages (pg_class, user tables, etc.)"
-        );
+        info!("[BASEBACKUP_REL] basebackup INCLUDES relation pages (pg_class, user tables, etc.)");
     } else {
         info!(
             "[BASEBACKUP_REL] basebackup does NOT include relation pages (pg_class, user tables); \
@@ -322,10 +368,10 @@ where
                     )));
                 }
                 // NOTE: We no longer modify CLOG data here. The previous fix that replaced
-                // all 0x00 bytes with 0x55 caused PANIC errors ("cannot abort transaction, 
+                // all 0x00 bytes with 0x55 caused PANIC errors ("cannot abort transaction,
                 // it was already committed") because new in-progress transactions were
                 // incorrectly marked as committed.
-                // 
+                //
                 // The real fix was changing the CLOG directory name from pg_xact to pg_clog
                 // for openGauss compatibility (see slru_dir_name() and slru_segment_filename()).
             }
@@ -504,7 +550,8 @@ where
         let dbdirs = self.timeline.list_dbdirs(self.lsn, self.ctx).await?;
         info!(
             "[BASEBACKUP_DEBUG] list_dbdirs returned {} entries at lsn={}",
-            dbdirs.len(), self.lsn
+            dbdirs.len(),
+            self.lsn
         );
         for ((spcnode, dbnode), has_relmap_file) in &dbdirs {
             info!(
@@ -512,93 +559,28 @@ where
                 spcnode, dbnode, has_relmap_file
             );
         }
-        for ((spcnode, dbnode), has_relmap_file) in dbdirs
-        {
-            self.add_dbdir(spcnode, dbnode, has_relmap_file).await?;
+        for ((spcnode, dbnode), has_relmap_file) in dbdirs {
+            let relmap_img = self.add_dbdir(spcnode, dbnode, has_relmap_file).await?;
             dbdir_cnt += 1;
-            // CRITICAL FIX: Include ALL blocks of pg_class, pg_type, and pg_attribute
-            // in basebackup for openGauss. Without this, compute node cannot see
-            // user-created tables after restart because:
-            // 1. These system catalogs use relmap (relfilenode=0)
-            // 2. Non-full basebackup doesn't include their data files
-            // 3. walredo may fail to reconstruct them correctly with many WAL records
-            //
-            // We use add_rel() instead of add_rel_block0() to include ALL blocks,
-            // which ensures pg_relation_size returns correct size.
-            //
-            // IMPORTANT: Only do this for database-specific directories (dbnode > 0).
-            // The global directory (dbnode=0, spcnode=1664) does NOT contain pg_class,
-            // pg_type, or pg_attribute - these tables only exist in each database's
-            // local catalog.
-            if !self.full_backup && has_relmap_file && dbnode != 0 {
-                let pg_class_rel = RelTag {
-                    forknum: MAIN_FORKNUM,
-                    spcnode,
-                    dbnode,
-                    relnode: PG_CLASS_RELNODE,
-                };
-                let pg_type_rel = RelTag {
-                    forknum: MAIN_FORKNUM,
-                    spcnode,
-                    dbnode,
-                    relnode: PG_TYPE_RELNODE,
-                };
-                let pg_attribute_rel = RelTag {
-                    forknum: MAIN_FORKNUM,
-                    spcnode,
-                    dbnode,
-                    relnode: PG_ATTRIBUTE_RELNODE,
-                };
-                // Include all blocks of pg_class
-                match self.add_rel(pg_class_rel, pg_class_rel).await {
-                    Ok(()) => info!("basebackup: added pg_class ALL blocks for dbnode={}, spcnode={}", dbnode, spcnode),
-                    Err(e) => warn!("basebackup: add pg_class failed (dbnode={}, spcnode={}): {:?}", dbnode, spcnode, e),
-                }
-                // Include all blocks of pg_type
-                match self.add_rel(pg_type_rel, pg_type_rel).await {
-                    Ok(()) => info!("basebackup: added pg_type ALL blocks for dbnode={}, spcnode={}", dbnode, spcnode),
-                    Err(e) => warn!("basebackup: add pg_type failed (dbnode={}, spcnode={}): {:?}", dbnode, spcnode, e),
-                }
-                // Include all blocks of pg_attribute
-                match self.add_rel(pg_attribute_rel, pg_attribute_rel).await {
-                    Ok(()) => info!("basebackup: added pg_attribute ALL blocks for dbnode={}, spcnode={}", dbnode, spcnode),
-                    Err(e) => warn!("basebackup: add pg_attribute failed (dbnode={}, spcnode={}): {:?}", dbnode, spcnode, e),
-                }
-                
-                // CRITICAL: Include pg_class indexes - without these, openGauss cannot
-                // find user tables via catalog lookups after restart!
-                let pg_class_oid_index = RelTag {
-                    forknum: MAIN_FORKNUM,
-                    spcnode,
-                    dbnode,
-                    relnode: PG_CLASS_OID_INDEX_RELNODE,
-                };
-                let pg_class_relname_nsp_index = RelTag {
-                    forknum: MAIN_FORKNUM,
-                    spcnode,
-                    dbnode,
-                    relnode: PG_CLASS_RELNAME_NSP_INDEX_RELNODE,
-                };
-                let pg_class_tblspc_relfilenode_index = RelTag {
-                    forknum: MAIN_FORKNUM,
-                    spcnode,
-                    dbnode,
-                    relnode: PG_CLASS_TBLSPC_RELFILENODE_INDEX_RELNODE,
-                };
-                // Include all blocks of pg_class_oid_index
-                match self.add_rel(pg_class_oid_index, pg_class_oid_index).await {
-                    Ok(()) => info!("basebackup: added pg_class_oid_index ALL blocks for dbnode={}, spcnode={}", dbnode, spcnode),
-                    Err(e) => warn!("basebackup: add pg_class_oid_index failed (dbnode={}, spcnode={}): {:?}", dbnode, spcnode, e),
-                }
-                // Include all blocks of pg_class_relname_nsp_index
-                match self.add_rel(pg_class_relname_nsp_index, pg_class_relname_nsp_index).await {
-                    Ok(()) => info!("basebackup: added pg_class_relname_nsp_index ALL blocks for dbnode={}, spcnode={}", dbnode, spcnode),
-                    Err(e) => warn!("basebackup: add pg_class_relname_nsp_index failed (dbnode={}, spcnode={}): {:?}", dbnode, spcnode, e),
-                }
-                // Include all blocks of pg_class_tblspc_relfilenode_index
-                match self.add_rel(pg_class_tblspc_relfilenode_index, pg_class_tblspc_relfilenode_index).await {
-                    Ok(()) => info!("basebackup: added pg_class_tblspc_relfilenode_index ALL blocks for dbnode={}, spcnode={}", dbnode, spcnode),
-                    Err(e) => warn!("basebackup: add pg_class_tblspc_relfilenode_index failed (dbnode={}, spcnode={}): {:?}", dbnode, spcnode, e),
+            // Hydrate local catalogs and their indexes using the exact map image
+            // included in this backup, at self.lsn (also for historical branches).
+            // Global maps do not contain these database-local relations.
+            if !self.full_backup && dbnode != 0 {
+                if let Some(img) = relmap_img {
+                    let catalogs = mapped_catalogs(&img).with_context(|| {
+                        format!("resolve basebackup catalogs for dbnode={dbnode}, spcnode={spcnode}, lsn={}", self.lsn)
+                    })?;
+                    for (oid, name, relnode) in catalogs {
+                        let rel = RelTag {
+                            forknum: MAIN_FORKNUM,
+                            spcnode,
+                            dbnode,
+                            relnode,
+                        };
+                        self.add_rel(rel, rel).await?;
+                        info!(oid, relnode, dbnode, spcnode, lsn = %self.lsn,
+                            "basebackup: added {name} ALL blocks from pg_filenode.map");
+                    }
                 }
             }
             // If full backup is requested, include all relation files.
@@ -609,7 +591,9 @@ where
                 .await?;
             info!(
                 "[BASEBACKUP_DEBUG] list_rels for spcnode={}, dbnode={} returned {} rels",
-                spcnode, dbnode, rels.len()
+                spcnode,
+                dbnode,
+                rels.len()
             );
             for &rel in rels.iter() {
                 rel_cnt += 1;
@@ -756,14 +740,6 @@ where
             .get_rel_size(src, Version::at(self.lsn), self.ctx)
             .await?;
 
-        // Debug logging for pg_class (relnode=14828) and pg_attribute (relnode=14802)
-        if src.relnode == PG_CLASS_RELNODE || src.relnode == PG_ATTRIBUTE_RELNODE {
-            info!(
-                "[BASEBACKUP_SYSCAT] add_rel: relnode={}, dbnode={}, spcnode={}, nblocks={}, lsn={:?}",
-                src.relnode, src.dbnode, src.spcnode, nblocks, self.lsn
-            );
-        }
-
         // If the relation is empty, create an empty file
         if nblocks == 0 {
             let file_name = dst.to_segfile_name(0);
@@ -789,70 +765,7 @@ where
                     // But this code path is not on the critical path for most basebackups (?).
                     .get(rel_block_to_key(src, blknum), self.lsn, self.ctx)
                     .await?;
-                
-                // Debug logging for pg_class and pg_attribute
-                if (src.relnode == PG_CLASS_RELNODE || src.relnode == PG_ATTRIBUTE_RELNODE) 
-                    && blknum == 0 && img.len() >= 24 {
-                    let table_name = if src.relnode == PG_CLASS_RELNODE { "pg_class" } else { "pg_attribute" };
-                    let pd_lower = u16::from_le_bytes([img[12], img[13]]);
-                    let pd_upper = u16::from_le_bytes([img[14], img[15]]);
-                    let page_lsn = u64::from_le_bytes([img[0], img[1], img[2], img[3], img[4], img[5], img[6], img[7]]);
-                    let num_items = (pd_lower as usize - 24) / 4;
-                    info!(
-                        "[BASEBACKUP_SYSCAT_PAGE] {}: dbnode={}, blkno=0, page_lsn={:X}/{:X}, pd_lower={}, pd_upper={}, num_items={}, request_lsn={:?}",
-                        table_name, src.dbnode, (page_lsn >> 32) as u32, (page_lsn & 0xFFFFFFFF) as u32, pd_lower, pd_upper, num_items, self.lsn
-                    );
-                }
-                
-                // Debug logging for pg_class block 0 detailed
-                if src.relnode == PG_CLASS_RELNODE && blknum == 0 && img.len() >= 24 {
-                    // Parse page header to check pd_lower/pd_upper
-                    let pd_lower = u16::from_le_bytes([img[12], img[13]]);
-                    let pd_upper = u16::from_le_bytes([img[14], img[15]]);
-                    let pd_special = u16::from_le_bytes([img[16], img[17]]);
-                    let pd_pagesize_version = u16::from_le_bytes([img[18], img[19]]);
-                    // LSN is stored in the first 8 bytes
-                    let page_lsn = u64::from_le_bytes([img[0], img[1], img[2], img[3], img[4], img[5], img[6], img[7]]);
-                    
-                    // Calculate number of items (row pointers)
-                    // PageHeaderData is 24 bytes in PostgreSQL, ItemIdData is 4 bytes
-                    let num_items = (pd_lower as usize - 24) / 4;
-                    
-                    info!(
-                        "[BASEBACKUP_PGCLASS_BLOCK0] relnode=14828, dbnode={}, blkno=0, page_lsn={:X}/{:X}, pd_lower={}, pd_upper={}, pd_special={}, page_size_ver=0x{:04X}, num_items={}, request_lsn={:?}",
-                        src.dbnode, (page_lsn >> 32) as u32, (page_lsn & 0xFFFFFFFF) as u32, pd_lower, pd_upper, pd_special, pd_pagesize_version, num_items, self.lsn
-                    );
-                    
-                    // Log all item pointers to understand pg_class content
-                    // ItemIdData format: lp_off:15 bits, lp_flags:2 bits, lp_len:15 bits
-                    let mut valid_items = 0;
-                    for i in 0..num_items {
-                        let offset = 24 + i * 4;
-                        if offset + 4 <= img.len() {
-                            let lp_data = u32::from_le_bytes([img[offset], img[offset+1], img[offset+2], img[offset+3]]);
-                            // PostgreSQL/openGauss ItemIdData: lp_off (15 bits), lp_flags (2 bits), lp_len (15 bits)
-                            let lp_off = (lp_data & 0x7FFF) as u16;  // bits 0-14
-                            let lp_flags = ((lp_data >> 15) & 0x3) as u8;  // bits 15-16
-                            let lp_len = ((lp_data >> 17) & 0x7FFF) as u16;  // bits 17-31
-                            
-                            // Only log first 5 and any valid items (lp_flags != 0 or lp_len > 0)
-                            if i < 5 || (lp_flags > 0 && lp_len > 0) {
-                                info!(
-                                    "[BASEBACKUP_PGCLASS_ITEM] dbnode={}, item[{}]: lp_off={}, lp_flags={}, lp_len={}, raw=0x{:08X}",
-                                    src.dbnode, i, lp_off, lp_flags, lp_len, lp_data
-                                );
-                            }
-                            if lp_flags > 0 && lp_len > 0 {
-                                valid_items += 1;
-                            }
-                        }
-                    }
-                    info!(
-                        "[BASEBACKUP_PGCLASS_SUMMARY] dbnode={}, total_items={}, valid_items={}",
-                        src.dbnode, num_items, valid_items
-                    );
-                }
-                
+
                 segment_data.extend_from_slice(&img[..]);
             }
 
@@ -873,10 +786,7 @@ where
     /// Add only block 0 of a relation (used for catalog relations when full_backup=false so compute gets correct pg_class/pg_type after restart).
     async fn add_rel_block0(&mut self, rel: RelTag) -> Result<(), BasebackupError> {
         let key = rel_block_to_key(rel, 0);
-        let img = self
-            .timeline
-            .get(key, self.lsn, self.ctx)
-            .await?;
+        let img = self.timeline.get(key, self.lsn, self.ctx).await?;
         let file_name = rel.to_segfile_name(0);
         let header = new_tar_header(&file_name, img.len() as u64)?;
         self.ar
@@ -897,7 +807,7 @@ where
         spcnode: u32,
         dbnode: u32,
         has_relmap_file: bool,
-    ) -> Result<(), BasebackupError> {
+    ) -> Result<Option<Bytes>, BasebackupError> {
         let relmap_img = if has_relmap_file {
             let img = self
                 .timeline
@@ -928,7 +838,7 @@ where
 
             info!("timeline.pg_version {}", self.timeline.pg_version);
 
-            if let Some(img) = relmap_img {
+            if let Some(img) = &relmap_img {
                 // filenode map for global tablespace
                 let header = new_tar_header("global/pg_filenode.map", img.len() as u64)?;
                 self.ar
@@ -956,7 +866,7 @@ where
                     .await?
                     .is_empty()
             {
-                return Ok(());
+                return Ok(None);
             }
             // openGauss compatibility: openGauss may use non-standard spcnode OIDs
             // (e.g. 16384/16385 for pg_default tablespace) during bulk loads.
@@ -977,7 +887,7 @@ where
                 .await
                 .map_err(|e| BasebackupError::Client(e, "add_dbdir,base"))?;
 
-            if let Some(img) = relmap_img {
+            if let Some(img) = &relmap_img {
                 let dst_path = format!("base/{dbnode}/PG_VERSION");
 
                 let pg_version_str = self.timeline.pg_version.versionfile_string();
@@ -995,7 +905,7 @@ where
                     .map_err(|e| BasebackupError::Client(e, "add_dbdir,base/pg_filenode.map"))?;
             }
         };
-        Ok(())
+        Ok(relmap_img)
     }
 
     //

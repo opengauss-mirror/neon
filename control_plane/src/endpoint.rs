@@ -468,7 +468,7 @@ impl Display for EndpointStatus {
 #[derive(Default, Clone, Copy, clap::ValueEnum)]
 pub enum EndpointTerminateMode {
     #[default]
-    /// Use gs_ctl stop -m fast
+    /// Use /terminate?mode=immediate and wait for compute_ctl to exit
     Fast,
     /// Use gs_ctl stop -m immediate
     Immediate,
@@ -1474,10 +1474,11 @@ impl Endpoint {
         mode: EndpointTerminateMode,
         destroy: bool,
     ) -> Result<TerminateResponse> {
-        // gs_ctl stop is fast but doesn't allow us to collect LSN. /terminate is
-        // slow, and test runs time out. Solution: special mode "immediate-terminate"
-        // which uses /terminate
-        let response = if let EndpointTerminateMode::ImmediateTerminate = mode {
+        // HTTP immediate performs fast database shutdown and cleanup, then lets
+        // compute_ctl exit after the short termination-response grace period.
+        let response = if let EndpointTerminateMode::Fast
+        | EndpointTerminateMode::ImmediateTerminate = mode
+        {
             let ip = self.external_http_address.ip();
             let port = self.external_http_address.port();
             let url = format!("http://{ip}:{port}/terminate?mode=immediate");
@@ -1491,15 +1492,9 @@ impl Endpoint {
             TerminateResponse { lsn: None }
         };
 
-        // Also wait for the compute_ctl process to die. It might have some
-        // cleanup work to do after postgres stops, like syncing safekeepers,
-        // etc.
-        //
-        // If destroying or stop mode is immediate, send it SIGTERM before
-        // waiting. Sometimes we do *not* want this cleanup: tests intentionally
-        // do stop when majority of safekeepers is down, so sync-safekeepers
-        // would hang otherwise. This could be a separate flag though.
-        let send_sigterm = destroy || !matches!(mode, EndpointTerminateMode::Fast);
+        // HTTP termination exits on its own. Only direct gs_ctl immediate stop
+        // needs SIGTERM because it bypasses compute_ctl's termination state.
+        let send_sigterm = matches!(mode, EndpointTerminateMode::Immediate);
         self.wait_for_compute_ctl_to_exit(send_sigterm)?;
         if destroy {
             println!(
