@@ -78,6 +78,8 @@ pub const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
 pub const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
 pub const XLOG_XACT_COMMIT_COMPACT: u8 = 0x60;
 pub const XLOG_XACT_ABORT_WITH_XID: u8 = 0x70;
+// openGauss emits shared invalidation messages as standalone RM_XACT records.
+pub const XLOG_XACT_INVALIDATIONS: u8 = 0x80;
 
 // From standbydefs.h
 pub const XLOG_RUNNING_XACTS: u8 = 0x10;
