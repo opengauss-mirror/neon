@@ -729,6 +729,12 @@ impl MetadataRecord {
         decoded: &DecodedWALRecord,
         lsn: Lsn,
     ) -> anyhow::Result<Option<MetadataRecord>> {
+        // openGauss writes shared invalidation messages as standalone RM_XACT
+        // records. They do not contain a commit header or page changes, so
+        // consume them without interpreting 0x80 as a masked COMMIT opcode.
+        if decoded.xl_info & pg_constants::XLOG_XACT_INVALIDATIONS != 0 {
+            return Ok(None);
+        }
         let info = decoded.xl_info & pg_constants::XLOG_XACT_OPMASK;
         let origin_id = decoded.origin_id;
         let xl_xid = decoded.xl_xid;
@@ -941,5 +947,35 @@ impl MetadataRecord {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_open_gauss_xact_invalidations() {
+        // XLOG_XACT_INVALIDATIONS contains a short data header, an int32
+        // message count, and shared invalidation messages. It is not a
+        // regular commit record and must not be parsed as one.
+        let mut record = vec![0u8; 70];
+        record[0..4].copy_from_slice(&70u32.to_le_bytes());
+        record[8..16].copy_from_slice(&13597u64.to_le_bytes());
+        record[24] = pg_constants::XLOG_XACT_INVALIDATIONS;
+        record[25] = pg_constants::RM_XACT_ID;
+        record[32] = pg_constants::XLR_BLOCK_ID_DATA_SHORT;
+        record[33] = 36;
+        record[34..38].copy_from_slice(&2i32.to_le_bytes());
+
+        let interpreted = InterpretedWalRecord::from_bytes_filtered(
+            Bytes::from(record),
+            &[],
+            Lsn(0x282d_c00),
+            PgMajorVersion::PG14,
+        )
+        .expect("openGauss invalidation WAL should be ignored");
+
+        assert!(interpreted.is_empty());
     }
 }
