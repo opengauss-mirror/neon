@@ -14,6 +14,7 @@ OBJS = \
 	neon.o \
 	neon_lwlsncache.o \
 	neon_pgversioncompat.o \
+	neon_replica.o \
 	neon_perf_counters.o \
 	neon_utils.o \
 	neon_walreader.o \

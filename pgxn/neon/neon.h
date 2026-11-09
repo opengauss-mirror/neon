@@ -79,7 +79,13 @@ extern uint32		WAIT_EVENT_NEON_WAL_DL;
 extern "C" {
 #endif
 
+#if defined(PGXC) && HAVE_DECL_STRLCPY
+/* openGauss may detect strlcpy on a newer libc than the extension build image. */
+extern size_t strlcpy(char *dst, const char *src, size_t siz);
+#endif
+
 extern void pg_init_libpagestore(void);
+extern void pg_init_replica(void);
 extern void pg_init_walproposer(void);
 extern void walprop_register_bgworker(void);
 

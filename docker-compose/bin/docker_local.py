@@ -1763,13 +1763,14 @@ def stop_endpoint(endpoint_id, quiet=False, mode="fast"):
     endpoint = api("GET", f"/v1/endpoint/{endpoint_id}")
     service = endpoint["service_name"]
     last_lsn = None
-    try:
-        last_lsn = compose_endpoint(endpoint_id, "exec", "-T", service, "gsql",
-                                    "-d", "postgres", "-U", "cloud_admin", "-p", "55433",
-                                    "-h", "127.0.0.1", "-tAc",
-                                    "SELECT pg_current_xlog_location()", capture=True, check=False)
-    except Exception:
-        last_lsn = None
+    if endpoint_is_primary(endpoint):
+        try:
+            last_lsn = compose_endpoint(endpoint_id, "exec", "-T", service, "gsql",
+                                        "-d", "postgres", "-U", "cloud_admin", "-p", "55433",
+                                        "-h", "127.0.0.1", "-tAc",
+                                        "SELECT pg_current_xlog_location()", capture=True, check=False)
+        except Exception:
+            last_lsn = None
     if mode == "immediate":
         compose_endpoint(endpoint_id, "kill", service, check=False)
     else:

@@ -192,7 +192,24 @@ bin/docker_local endpoint status main
 bin/docker_local endpoint destroy main
 ```
 
-再建一个只读/分支 endpoint 示例：
+创建持续跟随主节点的只读备机（需要包含只读备机功能的新版镜像及启动脚本）：
+
+```bash
+PRIMARY_INFO=$(bin/docker_local endpoint status main)
+TENANT_ID=$(printf '%s\n' "$PRIMARY_INFO" | jq -er '.tenant_id')
+TIMELINE_ID=$(printf '%s\n' "$PRIMARY_INFO" | jq -er '.timeline_id')
+
+bin/docker_local endpoint create reader1 \
+  --tenant-id "$TENANT_ID" --timeline-id "$TIMELINE_ID" \
+  --hot-standby --pg-port 55440 --http-port 3082
+bin/docker_local endpoint start reader1
+```
+
+备机与主节点使用相同 tenant/timeline。`--hot-standby` 后面不加 `true`，
+也不需要创建新分支。镜像要求、连接检查见
+[openGauss 只读备机说明](../docs/opengauss-read-replica.md#docker-启动)。
+
+再建一个可写分支 endpoint 示例：
 
 ```bash
 bin/docker_local timeline branch --branch-name feature --ancestor-branch-name main
