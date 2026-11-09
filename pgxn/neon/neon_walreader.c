@@ -25,6 +25,7 @@
 
 #include "libpq/libpq-fe.h"
 
+#include "neon.h"
 #include "neon_walreader.h"
 #include "walproposer.h"
 

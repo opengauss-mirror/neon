@@ -196,8 +196,13 @@ sql_literal() {
     printf "'%s'" "${value}"
 }
 
+compute_is_primary() {
+    jq -e '(.spec.mode // "Primary") == "Primary"' "${CONFIG_FILE}" >/dev/null
+}
+
 ensure_branch_merge_user() {
-    if [[ "${BRANCH_MERGE_USER_ENABLED:-true}" == "false" ]]; then
+    # Replica users and passwords are inherited from primary WAL replay.
+    if ! compute_is_primary || [[ "${BRANCH_MERGE_USER_ENABLED:-true}" == "false" ]]; then
       return
     fi
 
@@ -493,9 +498,11 @@ for _ in $(seq 1 120); do
     ensure_branch_merge_user
     write_endpoint_record "Running"
 
-    current_lsn=$("${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -tAc 'SELECT pg_current_xlog_location()' | tr -d '[:space:]')
-    if [[ -n "${current_lsn}" ]]; then
-      wait_lsn_on_pageservers "${tenant_id}" "${timeline_id}" "${current_lsn}"
+    if compute_is_primary; then
+      current_lsn=$("${GSQL}" -d postgres -U cloud_admin -p 55433 -h 127.0.0.1 -tAc 'SELECT pg_current_xlog_location()' | tr -d '[:space:]')
+      if [[ -n "${current_lsn}" ]]; then
+        wait_lsn_on_pageservers "${tenant_id}" "${timeline_id}" "${current_lsn}"
+      fi
     fi
     break
   fi

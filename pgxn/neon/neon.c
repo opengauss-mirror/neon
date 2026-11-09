@@ -565,6 +565,7 @@ _PG_init(void)
 	pg_init_communicator();
 
 	Custom_XLogReaderRoutines = NeonOnDemandXLogReaderRoutines;
+	pg_init_replica();
 
 	// InitUnstableExtensionsSupport();	//插件检查 忽略
 	// InitLogicalReplicationMonitor();	//逻辑复制 忽略

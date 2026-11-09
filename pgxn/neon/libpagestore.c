@@ -88,8 +88,7 @@ static int	neon_compute_mode = 0;
 
 /*
  * Check if this compute node is running in Neon replica mode.
- * In replica mode, we should use UINT64_MAX as request_lsn to get the latest
- * pages from pageserver, since we don't consume WAL to update replay_lsn.
+ * Replicas consume committed WAL and request pages at their replay LSN.
  */
 bool
 neon_is_replica_mode(void)

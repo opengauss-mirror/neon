@@ -485,8 +485,12 @@ neon_init(void)
 		elog(ERROR, "MyNeonCounters points past end of array");
 #endif
 
-	old_redo_read_buffer_filter = redo_read_buffer_filter;
-	redo_read_buffer_filter = neon_redo_read_buffer_filter;
+	/* openGauss calls smgr_init in every thread, but the hook is global. */
+	if (redo_read_buffer_filter != neon_redo_read_buffer_filter)
+	{
+		old_redo_read_buffer_filter = redo_read_buffer_filter;
+		redo_read_buffer_filter = neon_redo_read_buffer_filter;
+	}
 
 	if (debug_compare_local)
 	{
@@ -541,13 +545,8 @@ neon_get_request_lsns(NRelFileInfo rinfo, ForkNumber forknum, BlockNumber blkno,
 		Assert(last_written_lsns[i] != InvalidXLogRecPtr);
 	}
 
-	/*
-	 * NEON REPLICA MODE: In Neon replica mode, we don't consume WAL from
-	 * safekeepers to update replay_lsn. Instead, we request the latest pages
-	 * from pageserver using UINT64_MAX, similar to primary mode.
-	 * This ensures the replica sees all committed changes from the primary.
-	 */
-	if (RecoveryInProgress() && !neon_is_replica_mode())
+	/* Standbys read the consistent page version at their replay position. */
+	if (RecoveryInProgress())
 	{
 		/*---
 		 * In broad strokes, a replica always requests the page at the current
@@ -810,6 +809,13 @@ neon_exists(SMgrRelation reln, ForkNumber forkNum, BlockNumber blockNum)
 static void
 neon_create(SMgrRelation reln, ForkNumber forkNum, bool isRedo)
 {
+	/* openGauss redo opens relations without a relcache/persistence hint.
+	 * WAL-logged forks belong to shared persistent storage (including an
+	 * unlogged relation's durable INIT fork).
+	 */
+	if (isRedo && reln->smgr_relpersistence == 0)
+		reln->smgr_relpersistence = RELPERSISTENCE_PERMANENT;
+
 	switch (reln->smgr_relpersistence)
 	{
 		case 0:
@@ -1450,16 +1456,10 @@ neon_read(SMgrRelation reln, ForkNumber forkNum, BlockNumber blkno, void *buffer
 
 	neon_get_request_lsns(InfoFromSMgrRel(reln), forkNum, blkno, &request_lsns, 1);
 
-	/*
-	 * Try prefetch cache.
-	 * 
-	 * NEON REPLICA: Skip prefetch cache for Neon replicas to ensure we always
-	 * get the latest pages from pageserver. Prefetched pages may become stale
-	 * when the primary writes new data.
-	 */
+	/* WAL replay keeps cached pages coherent on read replicas as well. */
 	present = 0;
 	bufferp = buffer;
-	if (!neon_is_replica_mode() && communicator_prefetch_lookupv(InfoFromSMgrRel(reln), forkNum, blkno, &request_lsns, 1, &bufferp, &present))
+	if (communicator_prefetch_lookupv(InfoFromSMgrRel(reln), forkNum, blkno, &request_lsns, 1, &bufferp, &present))
 	{
 		/* Prefetch hit */
 		if (debug_compare_local >= DEBUG_COMPARE_LOCAL_PREFETCH)
@@ -1472,14 +1472,8 @@ neon_read(SMgrRelation reln, ForkNumber forkNum, BlockNumber blkno, void *buffer
 		}
 	}
 
-	/*
-	 * Try to read from local file cache.
-	 * 
-	 * NEON REPLICA: Skip LFC for Neon replicas to ensure we always get the
-	 * latest pages from pageserver. Without WAL-based buffer invalidation,
-	 * cached pages may become stale when the primary writes new data.
-	 */
-	if (!neon_is_replica_mode() && lfc_read(InfoFromSMgrRel(reln), forkNum, blkno, buffer))
+	/* Try to read from local file cache. */
+	if (lfc_read(InfoFromSMgrRel(reln), forkNum, blkno, buffer))
 	{
 		MyNeonCounters->file_cache_hits_total++;
 

@@ -79,6 +79,26 @@ bash openGauss-branching-deploy/deploy.sh x86 --skip-pull
 
 默认使用宿主机本地目录作为Pageserver的远端存储，保持原有部署方式不变。需要使用S3兼容对象存储时，先按照“对象存储部署”章节补充配置，再执行相同的 `deploy.sh`命令。
 
+### 使用指定镜像
+
+需要使用某个测试或发布镜像时，先拉取交付说明中指定的镜像标签，再设置为原有部署脚本使用的本地标签：
+
+```bash
+IMAGE_TAG='<镜像标签>'
+REGISTRY='swr.cn-north-4.myhuaweicloud.com/kunpeng-ai'
+
+docker pull "${REGISTRY}/og_storage:${IMAGE_TAG}"
+docker pull "${REGISTRY}/og_compute:${IMAGE_TAG}"
+docker tag "${REGISTRY}/og_storage:${IMAGE_TAG}" og_storage:latest
+docker tag "${REGISTRY}/og_compute:${IMAGE_TAG}" og_compute:latest
+
+bash openGauss-branching-deploy/deploy.sh arm --skip-pull
+```
+
+镜像标签由交付版本决定，部署目录和命令保持一致。`--skip-pull` 会使用上面设置的本地镜像。
+离线导入镜像时同样先设置为这两个本地标签，再执行原有部署命令。
+主节点、只读节点以及存储服务应使用同一次发布中匹配的计算和存储镜像。
+
 ## 对象存储部署
 
 对象存储模式用于将Pageserver的Layer和远端元数据，以及Safekeeper的完整WAL和Partial WAL写入S3兼容对象存储。MinIO、AWS S3以及提供S3兼容接口的对象存储均使用同一套配置方式。
@@ -262,6 +282,57 @@ cd openGauss-branching-deploy
 ```
 
 更多详细命令见 [`docker-compose/README.md`](../../docker-compose/README.md)。
+
+## 创建只读备机
+
+主节点部署完成后，继续使用原有 `docker_local` 命令创建只读 endpoint。
+交付文件应包含新版 `compute/shell/compute.sh` 和 `docker-compose/bin/docker_local.py`。
+`install.sh` 已通过原有下载流程获取这两个文件；应从包含本功能的代码版本安装。
+已有部署更新时应保留其 `deploy.env`、对象存储凭据和 `.neon` 数据目录。
+宿主机的 `compute.sh` 会挂载到容器内，因此更新镜像时也要同步更新该脚本。
+
+以下假设读写 endpoint 名为 `main`，在部署目录执行：
+
+```bash
+cd openGauss-branching-deploy
+
+PRIMARY_INFO=$(./docker-compose/bin/docker_local endpoint status main)
+TENANT_ID=$(printf '%s\n' "$PRIMARY_INFO" | jq -er '.tenant_id')
+TIMELINE_ID=$(printf '%s\n' "$PRIMARY_INFO" | jq -er '.timeline_id')
+
+./docker-compose/bin/docker_local endpoint create reader1 \
+  --tenant-id "$TENANT_ID" --timeline-id "$TIMELINE_ID" \
+  --hot-standby --pg-port 55440 --http-port 3082
+./docker-compose/bin/docker_local endpoint start reader1
+./docker-compose/bin/docker_local endpoint status reader1
+```
+
+备机与主机使用相同 tenant/timeline，持续接收主机提交的数据。
+`--hot-standby` 后面不加 `true`。以 `endpoint status reader1` 返回的 `host_pg_port`
+为实际数据库端口；如果指定端口被占用，工具会自动选择其他端口。
+
+在安装了 `gsql` 的客户端，使用主机上已有的数据库账号和密码连接备机：
+
+```bash
+gsql -h 127.0.0.1 -p 55440 -U branch_merge -d postgres
+```
+
+以上地址用于部署宿主机；其他客户端填写部署宿主机地址。检查恢复状态：
+
+```sql
+SELECT pg_is_in_recovery();  -- t
+SHOW transaction_read_only;  -- on
+```
+
+在主节点写入并提交数据后，在备机查询对应表验证同步。复制为异步。
+停止、重新启动备机仍使用原有命令：
+
+```bash
+./docker-compose/bin/docker_local endpoint stop reader1
+./docker-compose/bin/docker_local endpoint start reader1
+```
+
+功能原理、回放进度和回归检查见 [只读备机说明](../../docs/opengauss-read-replica.md)。
 
 ## 访问服务
 

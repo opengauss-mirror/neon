@@ -16,6 +16,7 @@
 #include "utils/guc.h"
 //#include "utils/wait_event.h"
 
+#include "neon.h"
 #include "logical_replication_monitor.h"
 
 #define LS_MONITOR_CHECK_INTERVAL 10000 /* ms */

@@ -191,6 +191,12 @@ pub fn write_postgres_conf(
         ComputeMode::Replica => {
             // hot_standby is 'on' by default, but let's be explicit
             writeln!(file, "hot_standby=on")?;
+            if is_opengauss {
+                // The Neon startup WAL source and redo hooks run in the startup
+                // thread. Parallel recovery uses different page readers.
+                writeln!(file, "recovery_max_workers=1")?;
+                writeln!(file, "recovery_parse_workers=1")?;
+            }
         }
     }
 
